@@ -63,13 +63,16 @@ SaaS-платформа складского учёта. `warehouse` — пер�
 - Сканер/камера проверяются только по HTTPS (`npm run dev:https` + телефон в той же Wi-Fi,
   либо на проде). Push на iOS — только на установленной PWA на проде.
 
-## Прод (планируется, ещё не развёрнут)
-- Сервер **sklad-prod-01** (104.171.136.35), путь `/opt/skladyx`, свой compose `name: skladyx`,
-  app на `127.0.0.1:3003`, db без внешнего порта. Reverse-proxy + SSL + DNS — **отдельным этапом**
-  (сейчас не выпускаем сертификаты и не меняем DNS).
+## Прод (развёрнут)
+- Работает: **https://rostagro.skladyx.ru/warehouse**. Сервер **sklad-prod-01** (104.171.136.35),
+  путь `/opt/skladyx`, compose `name: skladyx`, app на `127.0.0.1:3003`, db без внешнего порта.
+- DNS делегирован, HTTPS выпущен (Let's Encrypt); nginx работает как **reverse proxy** →
+  `127.0.0.1:3003` (с настройками под SSE `/api/realtime`).
 - `.env` на сервере — свои `DB_PASSWORD`, `AUTH_SECRET`, VAPID-ключи (не из других проектов).
 - Деплой: rsync исходников (без `node_modules`/`.next`/`.env`) → `docker compose up -d --build app`;
   миграции применяет entrypoint. volumes `skladyx_db_data` / `skladyx_uploads`.
+- Бэкапы настроены (cron 03:20 UTC, `/opt/backups/{postgres,uploads}`, retention 14д) —
+  детали и восстановление в `docs/RESTORE.md`.
 
 ## Изоляция от старого проекта
 compose `skladyx` · БД/пользователь `skladyx` · контейнеры `skladyx-dev-db` · volumes
