@@ -11,16 +11,16 @@
 - Обновить verify-скрипты под /warehouse.
 - Не менять бизнес-логику сотрудников на этом этапе.
 
-## Этап 2. Первый prod-деплой
+## Этап 2. Первый prod-деплой — ✅ Выполнено (2026-07-15)
 
 Цель: поднять первый рабочий контур РостАгро.
 
-- Деплой в /opt/skladyx.
-- Домен: rostagro.skladyx.ru.
-- Рабочий URL: https://rostagro.skladyx.ru/warehouse.
-- Nginx reverse proxy на app container.
-- PostgreSQL внутри docker compose без внешнего порта.
-- Проверить login, warehouse, основные складские сценарии.
+- [x] Деплой в /opt/skladyx.
+- [x] Домен: rostagro.skladyx.ru.
+- [x] Рабочий URL: https://rostagro.skladyx.ru/warehouse.
+- [x] Nginx reverse proxy на app container (127.0.0.1:3003, заглушка отключена).
+- [x] PostgreSQL внутри docker compose без внешнего порта.
+- [x] Проверены login, warehouse, основные складские сценарии (login-smoke + внешние curl).
 
 ## Этап 3. Бэкапы и восстановление
 
