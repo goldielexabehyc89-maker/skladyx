@@ -72,22 +72,22 @@ npx tsx --tsconfig scripts/tsconfig.verify.json scripts/verify-stock.ts  # яд�
 
 ## Прод
 
+Развёрнут и работает: **https://rostagro.skladyx.ru/warehouse**.
+
 Сервер **sklad-prod-01** (104.171.136.35), путь `/opt/skladyx`, свой `docker-compose.yml`
-(db без внешнего порта, app на `127.0.0.1:3003`). Целевой URL: `https://rostagro.skladyx.ru/warehouse`.
+(db без внешнего порта, app на `127.0.0.1:3003`).
 
-Инфраструктура домена уже готова:
-- **DNS `rostagro.skladyx.ru` делегирован** и указывает на сервёр.
-- **HTTPS-сертификат уже выпущен** (Let's Encrypt).
-- Сейчас на домене стоит **nginx-заглушка** — приложение ещё не подключено к reverse-proxy.
-
-Осталось для запуска: развернуть compose-стек в `/opt/skladyx`, переключить nginx с заглушки
-на `proxy_pass` → `127.0.0.1:3003`, проверить login/warehouse. `.env` на сервере — свои
-`DB_PASSWORD`, `AUTH_SECRET`, VAPID-ключи (не из других проектов).
+- **DNS `rostagro.skladyx.ru` делегирован**, **HTTPS выпущен** (Let's Encrypt).
+- **nginx-заглушка отключена**; nginx работает как **reverse proxy** → `127.0.0.1:3003`
+  (с настройками под SSE `/api/realtime`: `proxy_buffering off`, длинные таймауты).
+- `.env` на сервере — свои `DB_PASSWORD`, `AUTH_SECRET`, VAPID-ключи (не из других проектов).
 
 Выкатка: rsync исходников (без `node_modules`/`.next`/`.env`) → `docker compose up -d --build app`;
-миграции применяет entrypoint. Первичный seed — однократно `SEED_ON_START=true` с
-`SEED_ADMIN_EMAIL`/`SEED_ADMIN_PASSWORD`. Бэкапы: `pg_dump` из контейнера db + tar volume
-`skladyx_uploads`.
+миграции применяет entrypoint.
+
+**Бэкапы** настроены отдельно (см. [docs/RESTORE.md](docs/RESTORE.md)): ежедневный cron
+**03:20 UTC** (`/etc/cron.d/skladyx-backup`) снимает `pg_dump -Fc` в **`/opt/backups/postgres`**
+и `tar.gz` тома uploads в **`/opt/backups/uploads`**, retention 14 дней.
 
 ## Изоляция от старого проекта
 

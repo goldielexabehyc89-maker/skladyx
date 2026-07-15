@@ -135,5 +135,11 @@ sleep 6
 docker exec -i skladyx-restore-test pg_restore -U skladyx -d skladyx --no-owner < "$DUMP"
 docker exec -i skladyx-restore-test psql -U skladyx -d skladyx -tA -c \
   'select count(*) from "Company";'
-docker rm -f skladyx-restore-test        # удалить временный контейнер (том анонимный, уйдёт с ним)
+docker rm -fv skladyx-restore-test       # удалить временный контейнер вместе с его anonymous volume
 ```
+
+> Флаг `-v` в `docker rm -fv` удаляет **anonymous volume**, который образ
+> `postgres:16-alpine` создаёт под `/var/lib/postgresql/data`. Без `-v` контейнер
+> удаляется, а этот том остаётся «висеть» (dangling) и копит мусор. `-v` трогает
+> только анонимный том временного контейнера — **именованные prod-тома**
+> (`skladyx_skladyx_db_data`, `skladyx_skladyx_uploads`) он не затрагивает.

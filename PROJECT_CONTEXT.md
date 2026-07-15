@@ -44,6 +44,8 @@ IP: 104.171.136.35
 Path: /opt/skladyx  
 Первый домен: rostagro.skladyx.ru
 
+Бэкапы: cron 03:20 UTC, /opt/backups/{postgres,uploads}, retention 14 дней, восстановление описано в docs/RESTORE.md.
+
 ## Проверка каждого изменения
 
 Перед принятием изменений проверять:

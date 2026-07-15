@@ -22,15 +22,18 @@
 - [x] PostgreSQL внутри docker compose без внешнего порта.
 - [x] Проверены login, warehouse, основные складские сценарии (login-smoke + внешние curl).
 
-## Этап 3. Бэкапы и восстановление
+## Этап 3. Бэкапы и восстановление — ✅ Выполнено (2026-07-15)
 
 Цель: сделать проект безопасным для эксплуатации.
 
-- Автобэкап PostgreSQL.
-- Бэкап uploads.
-- Проверка restore на отдельной базе/контуре.
-- Документ восстановления.
-- Retention policy.
+- [x] Автобэкап PostgreSQL (`pg_dump -Fc`, cron 03:20 UTC → `/opt/backups/postgres`).
+- [x] Бэкап uploads (`tar.gz` тома → `/opt/backups/uploads`).
+- [x] Проверка restore на отдельной базе/контуре (temp-контейнер: 35 таблиц, Company, 14 миграций).
+- [x] Документ восстановления — `docs/RESTORE.md`.
+- [x] Retention policy — 14 дней.
+
+Будущий hardening (не блокер этапа): off-site копия бэкапов (вынос в S3 / на другой хост)
+и алерты при ошибке бэкапа.
 
 ## Этап 4. Multi-tenant security
 
