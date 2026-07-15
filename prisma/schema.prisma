@@ -1,0 +1,734 @@
+// SkladyX — модуль «Склад» (warehouse).
+// Мультитенантность с первого дня: companyId на всех доменных таблицах,
+// весь доступ — через scoped() (src/lib/tenant.ts). Остатки: append-only
+// StockMovement + материализованный StockBalance для партионных товаров;
+// у поштучных местоположение живёт на самой единице (ItemUnit).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------- Enums ----------
+
+enum Role {
+  ADMIN
+  STOREKEEPER // кладовщик: заказы поставщикам (просмотр) + приемка; права будут расширяться
+  EMPLOYEE
+}
+
+enum TrackingType {
+  LOT // партионный: материалы, учёт количеством в партии
+  UNIT // поштучный: инструмент, у каждой единицы свой QR и судьба
+}
+
+enum QrType {
+  LOT
+  UNIT
+  CELL
+  EMPLOYEE
+  PICKLIST
+}
+
+enum ReceiptStatus {
+  DRAFT
+  POSTED
+}
+
+enum SupplierOrderStatus {
+  DRAFT // таблица редактируется
+  ORDERED // сохранён, позициям присвоены id (дата+номер), ждём товар
+  RECEIVED // принят на склад (создана приемка)
+  CANCELLED
+}
+
+enum TransferStatus {
+  DRAFT
+  POSTED
+}
+
+enum WriteOffStatus {
+  DRAFT
+  POSTED
+}
+
+// Тип документа сборки: заявка сотруднику или перемещение на склад —
+// нумеруются независимо, поэтому уникальность номера в пределах типа.
+enum PickListKind {
+  PICK
+  TRANSFER
+}
+
+enum PickListStatus {
+  NEW
+  PICKING
+  PICKED
+  STAGED
+  ISSUED
+  CANCELLED
+}
+
+enum IssueStatus {
+  PENDING // выдано, ждёт подтверждения сотрудником
+  CONFIRMED
+  CANCELLED // отменена админом: товар возвращён туда, откуда был выдан
+}
+
+enum IssueSource {
+  DIRECT
+  PICKLIST
+}
+
+enum InventoryStatus {
+  IN_PROGRESS
+  REVIEW
+  POSTED
+  CANCELLED
+}
+
+enum UnitStatus {
+  IN_STOCK
+  PICKED // зарезервирована в сборке заявки
+  ISSUE_PENDING // выдана, ждёт подтверждения сотрудником
+  ISSUED // числится за сотрудником (будущий модуль добавит USED/RETURNED)
+  WRITTEN_OFF
+}
+
+enum MovementDocType {
+  RECEIPT
+  CELL_ASSIGN
+  TRANSFER
+  WRITEOFF
+  PICKLIST
+  ISSUE
+  ISSUE_CONFIRM
+  INVENTORY
+}
+
+// ---------- Компания, пользователи, авторизация ----------
+
+model Company {
+  id        String   @id @default(cuid())
+  name      String
+  slug      String   @unique
+  // { directIssueEnabled, issueConfirmationRequired, labelFormat } — zod-схема в src/lib/settings.ts
+  settings  Json     @default("{}")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  users             User[]
+  warehouses        Warehouse[]
+  items             Item[]
+  uoms              Uom[]
+  suppliers         Supplier[]
+  supplierOrders    SupplierOrder[]
+  receipts          Receipt[]
+  transfers         Transfer[]
+  writeOffs         WriteOff[]
+  pickLists         PickList[]
+  issues            Issue[]
+  inventories       Inventory[]
+  events            Event[]
+  qrCodes           QrCode[]
+  pushSubscriptions PushSubscription[]
+}
+
+model User {
+  id           String   @id @default(cuid())
+  companyId    String
+  // логин — телефон (+7XXXXXXXXXX); email — legacy-вход для старых учёток
+  phone        String?  @unique
+  email        String?  @unique
+  passwordHash String? // null — пароль не задан, вход только по одноразовой ссылке
+  name         String
+  role         Role     @default(EMPLOYEE)
+  isActive     Boolean  @default(true)
+  // доступ к складам: true — все склады; иначе только перечисленные в warehouseLinks
+  allWarehouses Boolean @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  company        Company         @relation(fields: [companyId], references: [id])
+  authTokens     AuthToken[]
+  warehouseLinks UserWarehouse[]
+
+  @@index([companyId])
+}
+
+// Привязка пользователя к складам (когда allWarehouses = false).
+model UserWarehouse {
+  userId      String
+  warehouseId String
+
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  warehouse Warehouse @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+
+  @@id([userId, warehouseId])
+  @@index([warehouseId])
+}
+
+model AuthToken {
+  id        String    @id @default(cuid())
+  userId    String
+  token     String    @unique
+  purpose   String // "set-password"
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model PushSubscription {
+  id        String   @id @default(cuid())
+  companyId String
+  userId    String
+  endpoint  String   @unique
+  p256dh    String
+  auth      String
+  createdAt DateTime @default(now())
+
+  company Company @relation(fields: [companyId], references: [id])
+
+  @@index([companyId])
+  @@index([userId])
+}
+
+// Журнал событий («Лента»). key — идемпотентность через upsert по [companyId, key].
+model Event {
+  id        String   @id @default(cuid())
+  companyId String
+  type      String // receipt_posted | transfer_posted | writeoff_posted | picklist_* | issue_* | inventory_* | user_* | cell_assigned ...
+  key       String?
+  title     String
+  body      String
+  url       String?
+  actorId   String? // кто совершил действие
+  meta      Json?
+  createdAt DateTime @default(now())
+
+  company Company @relation(fields: [companyId], references: [id])
+
+  @@unique([companyId, key])
+  @@index([companyId, createdAt(sort: Desc)])
+  @@index([companyId, type, createdAt(sort: Desc)])
+}
+
+// ---------- QR ----------
+
+// Единая таблица QR-кодов. В QR кодируется URL {APP_URL}/q/<code>.
+model QrCode {
+  id        String   @id @default(cuid())
+  companyId String
+  code      String   @unique // 10 символов, алфавит Крокфорда (без неоднозначных знаков)
+  type      QrType
+  refId     String // id партии / единицы / ячейки / пользователя / заявки
+  createdAt DateTime @default(now())
+
+  company Company @relation(fields: [companyId], references: [id])
+
+  @@unique([type, refId])
+  @@index([companyId])
+}
+
+// ---------- Склады, ячейки, номенклатура ----------
+
+model Warehouse {
+  id        String   @id @default(cuid())
+  companyId String
+  name      String
+  address   String?
+  isActive  Boolean  @default(true)
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+
+  company   Company         @relation(fields: [companyId], references: [id])
+  cells     Cell[]
+  userLinks UserWarehouse[]
+
+  @@index([companyId])
+}
+
+model Cell {
+  id          String  @id @default(cuid())
+  companyId   String
+  warehouseId String
+  code        String // "А-01-02"
+  isStaging   Boolean @default(false) // ячейка зоны выдачи собранных заявок
+  isActive    Boolean @default(true)
+
+  warehouse Warehouse @relation(fields: [warehouseId], references: [id])
+
+  @@unique([warehouseId, code])
+  @@index([companyId])
+}
+
+model Uom {
+  id            String  @id @default(cuid())
+  companyId     String
+  name          String // шт, м, кг, м², м³, упак, л
+  allowFraction Boolean @default(true)
+
+  company Company @relation(fields: [companyId], references: [id])
+  items   Item[]
+
+  @@unique([companyId, name])
+}
+
+model Item {
+  id        String       @id @default(cuid())
+  companyId String
+  name      String
+  sku       String?
+  uomId     String
+  tracking  TrackingType
+  isActive  Boolean      @default(true)
+  createdAt DateTime     @default(now())
+
+  company Company @relation(fields: [companyId], references: [id])
+  uom     Uom     @relation(fields: [uomId], references: [id])
+
+  @@unique([companyId, sku])
+  @@index([companyId, name])
+}
+
+// Сквозные номера документов в рамках компании.
+model Counter {
+  companyId String
+  docType   String
+  value     Int    @default(0)
+
+  @@id([companyId, docType])
+}
+
+// ---------- Поставщики и заказы поставщикам ----------
+
+model Supplier {
+  id        String   @id @default(cuid())
+  companyId String
+  name      String
+  phone     String?
+  note      String?
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  company Company         @relation(fields: [companyId], references: [id])
+  orders  SupplierOrder[]
+
+  @@unique([companyId, name])
+  @@index([companyId])
+}
+
+model SupplierOrder {
+  id          String              @id @default(cuid())
+  companyId   String
+  number      Int
+  supplierId  String
+  warehouseId String
+  status      SupplierOrderStatus @default(DRAFT)
+  receiptId   String?             @unique // приемка, созданная кнопкой «Принять на склад»
+  note        String?
+  createdById String
+  createdAt   DateTime            @default(now())
+  orderedAt   DateTime?
+  receivedAt  DateTime?
+
+  company  Company             @relation(fields: [companyId], references: [id])
+  supplier Supplier            @relation(fields: [supplierId], references: [id])
+  lines    SupplierOrderLine[]
+
+  @@unique([companyId, number])
+  @@index([companyId, status, createdAt(sort: Desc)])
+}
+
+model SupplierOrderLine {
+  id          String   @id @default(cuid())
+  companyId   String
+  orderId     String
+  itemId      String
+  qty         Decimal  @db.Decimal(14, 3)
+  price       Decimal? @db.Decimal(14, 2)
+  // id позиции «дата-№заказа-№строки» (6072026-12-1): номера заказов монотонные и не
+  // переиспользуются, поэтому id не задваивается ни при каких условиях (в т.ч. удалении).
+  // Присваивается при сохранении заказа, при приёмке становится QR-кодом партии;
+  // у поштучных единиц — с суффиксом (6072026-12-1-2).
+  lineCode    String?  @unique
+  // принятое количество (приемка идёт сканированием позиция за позицией)
+  receivedQty Decimal  @default(0) @db.Decimal(14, 3)
+  createdAt   DateTime @default(now())
+
+  order SupplierOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+}
+
+// ---------- Приемка ----------
+
+model Receipt {
+  id          String        @id @default(cuid())
+  companyId   String
+  number      Int
+  warehouseId String
+  status      ReceiptStatus @default(DRAFT)
+  postedAt    DateTime?
+  supplier    String?
+  note        String?
+  createdById String
+  createdAt   DateTime      @default(now())
+
+  company Company       @relation(fields: [companyId], references: [id])
+  lines   ReceiptLine[]
+
+  @@unique([companyId, number])
+  @@index([companyId, status, createdAt(sort: Desc)])
+}
+
+model ReceiptLine {
+  id          String   @id @default(cuid())
+  companyId   String
+  receiptId   String
+  itemId      String
+  qty         Decimal  @db.Decimal(14, 3)
+  price       Decimal? @db.Decimal(14, 2) // закупочная за единицу
+  cellId      String? // куда положили при приемке (можно назначить позже сканом)
+  orderLineId String?  @unique // позиция заказа поставщику (приемка сканированием)
+
+  receipt Receipt @relation(fields: [receiptId], references: [id], onDelete: Cascade)
+
+  @@index([receiptId])
+}
+
+// Партия = позиция приемки партионного товара.
+model Lot {
+  id            String   @id @default(cuid())
+  companyId     String
+  itemId        String
+  receiptLineId String   @unique
+  qtyReceived   Decimal  @db.Decimal(14, 3)
+  price         Decimal? @db.Decimal(14, 2) // снимок из позиции — основа стоимостной оценки
+  createdAt     DateTime @default(now())
+
+  @@index([companyId, itemId])
+}
+
+// Единица поштучного товара — сама себе остаток (местоположение и статус на ней).
+model ItemUnit {
+  id            String     @id @default(cuid())
+  companyId     String
+  itemId        String
+  receiptLineId String
+  serial        Int // № в позиции приемки
+  price         Decimal?   @db.Decimal(14, 2)
+  status        UnitStatus @default(IN_STOCK)
+  warehouseId   String?
+  cellId        String?
+  employeeId    String?
+  pickListId    String? // резерв в сборке заявки
+  issueId       String?
+  createdAt     DateTime   @default(now())
+
+  @@index([companyId, itemId, status])
+  @@index([companyId, employeeId])
+  @@index([companyId, cellId])
+  @@index([pickListId])
+  @@index([receiptLineId])
+}
+
+// ---------- Остатки ----------
+
+// Материализованные остатки ПАРТИОННЫХ товаров.
+// locKey: "C:<cellId>" | "W:<warehouseId>" (без ячейки) | "E:<userId>" (за сотрудником)
+//         | "EP:<userId>" (выдано, ждёт подтверждения). Будущие модули: "S:<siteId>" и т.д.
+model StockBalance {
+  id          String  @id @default(cuid())
+  companyId   String
+  itemId      String
+  lotId       String
+  locKey      String
+  warehouseId String? // денормализация для выборок
+  cellId      String?
+  employeeId  String?
+  qty         Decimal @db.Decimal(14, 3)
+
+  @@unique([lotId, locKey])
+  @@index([companyId, itemId])
+  @@index([companyId, warehouseId, cellId])
+  @@index([companyId, employeeId])
+}
+
+// Append-only журнал движений. Пустая сторона = «внешний мир» (приемка/списание).
+model StockMovement {
+  id              String          @id @default(cuid())
+  companyId       String
+  docType         MovementDocType
+  docId           String
+  itemId          String
+  lotId           String?
+  unitId          String?
+  qty             Decimal         @db.Decimal(14, 3)
+  fromWarehouseId String?
+  fromCellId      String?
+  fromEmployeeId  String?
+  fromPending     Boolean         @default(false) // сторона "EP:" — ждёт подтверждения
+  toWarehouseId   String?
+  toCellId        String?
+  toEmployeeId    String?
+  toPending       Boolean         @default(false)
+  createdById     String
+  createdAt       DateTime        @default(now())
+
+  @@index([companyId, createdAt(sort: Desc)])
+  @@index([companyId, itemId])
+  @@index([lotId])
+  @@index([unitId])
+  @@index([docType, docId])
+}
+
+// ---------- Файлы ----------
+
+model Attachment {
+  id           String   @id @default(cuid())
+  companyId    String
+  ownerType    String // "receipt" | "receipt_line" | будущие
+  ownerId      String
+  fileName     String
+  mime         String
+  size         Int
+  storedPath   String
+  uploadedById String
+  createdAt    DateTime @default(now())
+
+  @@index([ownerType, ownerId])
+  @@index([companyId])
+}
+
+// ---------- Перемещение ----------
+
+model Transfer {
+  id              String         @id @default(cuid())
+  companyId       String
+  number          Int
+  fromWarehouseId String
+  toWarehouseId   String
+  status          TransferStatus @default(DRAFT)
+  postedAt        DateTime?
+  createdById     String
+  createdAt       DateTime       @default(now())
+
+  company Company        @relation(fields: [companyId], references: [id])
+  lines   TransferLine[]
+
+  @@unique([companyId, number])
+  @@index([companyId, status])
+}
+
+model TransferLine {
+  id         String  @id @default(cuid())
+  companyId  String
+  transferId String
+  itemId     String
+  lotId      String?
+  unitId     String?
+  qty        Decimal @db.Decimal(14, 3)
+  toCellId   String?
+
+  transfer Transfer @relation(fields: [transferId], references: [id], onDelete: Cascade)
+
+  @@index([transferId])
+}
+
+// ---------- Списание ----------
+
+model WriteOff {
+  id          String         @id @default(cuid())
+  companyId   String
+  number      Int
+  warehouseId String? // списание со склада...
+  employeeId  String? // ...или с сотрудника (будущее «использование»)
+  reason      String // причина обязательна
+  status      WriteOffStatus @default(DRAFT)
+  postedAt    DateTime?
+  createdById String
+  createdAt   DateTime       @default(now())
+
+  company Company        @relation(fields: [companyId], references: [id])
+  lines   WriteOffLine[]
+
+  @@unique([companyId, number])
+  @@index([companyId, status])
+}
+
+model WriteOffLine {
+  id         String  @id @default(cuid())
+  companyId  String
+  writeOffId String
+  itemId     String
+  lotId      String?
+  unitId     String?
+  qty        Decimal @db.Decimal(14, 3)
+
+  writeOff WriteOff @relation(fields: [writeOffId], references: [id], onDelete: Cascade)
+
+  @@index([writeOffId])
+}
+
+// ---------- Заявка на сбор ----------
+
+// Заявка на сбор (targetEmployeeId) ИЛИ перемещение на склад (targetWarehouseId):
+// одинаковый жизненный цикл и сканирование, заполнено ровно одно из полей.
+model PickList {
+  id                String         @id @default(cuid())
+  companyId         String
+  kind              PickListKind   @default(PICK)
+  number            Int
+  warehouseId       String? // склад, с которого собирают (обязателен на уровне приложения)
+  targetEmployeeId  String? // кому выдать (заявка на сбор)
+  targetWarehouseId String? // на какой склад переместить (перемещение)
+  status           PickListStatus @default(NEW)
+  stagingCellId    String? // текущая ячейка выдачи при сборке (последняя назначенная)
+  note             String?
+  createdById      String
+  pickedById       String?
+  createdAt        DateTime       @default(now())
+  savedAt          DateTime? // документ сохранён админом: виден кладовщикам, ушёл пуш
+  pickedAt         DateTime?
+  stagedAt         DateTime?
+  issuedAt         DateTime?
+
+  company Company        @relation(fields: [companyId], references: [id])
+  lines   PickLine[]
+  cells   PickListCell[]
+
+  @@unique([companyId, kind, number])
+  @@index([companyId, status])
+}
+
+model PickLine {
+  id           String   @id @default(cuid())
+  companyId    String
+  pickListId   String
+  itemId       String
+  // конкретный остаток, выбранный при создании: партия в ячейке или единица
+  lotId        String?
+  unitId       String?
+  cellId       String?
+  qtyRequested Decimal  @db.Decimal(14, 3)
+  qtyPicked    Decimal  @default(0) @db.Decimal(14, 3)
+
+  pickList     PickList          @relation(fields: [pickListId], references: [id], onDelete: Cascade)
+  fulfillments PickFulfillment[]
+
+  @@index([pickListId])
+}
+
+// Чем именно закрыта позиция заявки (скан за сканом).
+model PickFulfillment {
+  id              String   @id @default(cuid())
+  companyId       String
+  pickLineId      String
+  lotId           String?
+  unitId          String?
+  qty             Decimal  @db.Decimal(14, 3)
+  fromWarehouseId String
+  fromCellId      String?
+  toCellId        String? // ячейка зоны выдачи, куда переместили при сборке
+  scannedById     String
+  createdAt       DateTime @default(now())
+
+  pickLine PickLine @relation(fields: [pickLineId], references: [id], onDelete: Cascade)
+
+  @@index([pickLineId])
+}
+
+// Ячейки зоны выдачи, назначенные заявке при сборке. Текущая (куда идут сканы)
+// хранится в PickList.stagingCellId; заменить её можно, пока в неё ничего не положено.
+model PickListCell {
+  id         String   @id @default(cuid())
+  companyId  String
+  pickListId String
+  cellId     String
+  createdAt  DateTime @default(now())
+
+  pickList PickList @relation(fields: [pickListId], references: [id], onDelete: Cascade)
+
+  @@unique([pickListId, cellId])
+  @@index([pickListId])
+}
+
+// ---------- Выдача сотруднику ----------
+
+model Issue {
+  id          String      @id @default(cuid())
+  companyId   String
+  number      Int
+  employeeId  String
+  source      IssueSource
+  pickListId  String?     @unique
+  status      IssueStatus
+  issuedById  String
+  issuedAt    DateTime    @default(now())
+  confirmedAt DateTime?
+
+  company Company     @relation(fields: [companyId], references: [id])
+  lines   IssueLine[]
+
+  @@unique([companyId, number])
+  @@index([companyId, employeeId])
+  @@index([companyId, status])
+}
+
+model IssueLine {
+  id        String   @id @default(cuid())
+  companyId String
+  issueId   String
+  itemId    String
+  lotId     String?
+  unitId    String?
+  qty       Decimal  @db.Decimal(14, 3)
+  price     Decimal? @db.Decimal(14, 2) // снимок для стоимостной оценки
+
+  issue Issue @relation(fields: [issueId], references: [id], onDelete: Cascade)
+
+  @@index([issueId])
+}
+
+// ---------- Инвентаризация ----------
+
+model Inventory {
+  id          String          @id @default(cuid())
+  companyId   String
+  number      Int
+  warehouseId String
+  status      InventoryStatus @default(IN_PROGRESS)
+  postedAt    DateTime?
+  createdById String
+  createdAt   DateTime        @default(now())
+
+  company Company         @relation(fields: [companyId], references: [id])
+  lines   InventoryLine[]
+
+  @@unique([companyId, number])
+  @@index([companyId, status])
+}
+
+model InventoryLine {
+  id          String   @id @default(cuid())
+  companyId   String
+  inventoryId String
+  cellId      String?
+  itemId      String
+  lotId       String?
+  unitId      String?
+  expectedQty Decimal  @db.Decimal(14, 3)
+  countedQty  Decimal? @db.Decimal(14, 3) // null — ещё не считали
+
+  inventory Inventory @relation(fields: [inventoryId], references: [id], onDelete: Cascade)
+
+  @@index([inventoryId])
+}

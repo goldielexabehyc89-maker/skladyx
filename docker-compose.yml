@@ -1,0 +1,51 @@
+# Прод: rostagro.skladyx.ru (сервер sklad-prod-01, 104.171.136.35, путь /opt/skladyx).
+# Полная изоляция от других проектов: своё имя compose-проекта, свои volume,
+# порт приложения только на 127.0.0.1:3003 (снаружи reverse proxy + SSL — отдельно).
+name: skladyx
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: skladyx
+      POSTGRES_PASSWORD: "${DB_PASSWORD:?задайте DB_PASSWORD в .env}"
+      POSTGRES_DB: skladyx
+    volumes:
+      - skladyx_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U skladyx -d skladyx"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    # порт наружу не публикуем — доступ только из compose-сети
+
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: "postgresql://skladyx:${DB_PASSWORD}@db:5432/skladyx?schema=public"
+      AUTH_SECRET: "${AUTH_SECRET:?задайте AUTH_SECRET в .env}"
+      APP_URL: "${APP_URL:-https://rostagro.skladyx.ru}"
+      DEFAULT_ORG_SLUG: "${DEFAULT_ORG_SLUG:-rostagro}"
+      VAPID_PUBLIC: "${VAPID_PUBLIC:-}"
+      VAPID_PRIVATE: "${VAPID_PRIVATE:-}"
+      VAPID_SUBJECT: "${VAPID_SUBJECT:-}"
+      UPLOAD_DIR: /data/uploads
+      SEED_ON_START: "${SEED_ON_START:-false}"
+      SEED_COMPANY_NAME: "${SEED_COMPANY_NAME:-}"
+      SEED_COMPANY_SLUG: "${SEED_COMPANY_SLUG:-rostagro}"
+      SEED_ADMIN_EMAIL: "${SEED_ADMIN_EMAIL:-}"
+      SEED_ADMIN_NAME: "${SEED_ADMIN_NAME:-}"
+      SEED_ADMIN_PASSWORD: "${SEED_ADMIN_PASSWORD:-}"
+      NODE_ENV: production
+    volumes:
+      - skladyx_uploads:/data/uploads
+    ports:
+      - "127.0.0.1:3003:3000"
+
+volumes:
+  skladyx_db_data:
+  skladyx_uploads:

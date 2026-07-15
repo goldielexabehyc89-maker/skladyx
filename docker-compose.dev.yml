@@ -1,0 +1,24 @@
+# Локальная разработка: только Postgres.
+# Хост-порт 5435: изолирован от старого проекта (building-dev на 5434) и локального PG (5432).
+# name обязателен: путь проекта кириллический, docker не может вывести имя сам.
+name: skladyx-dev
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: skladyx-dev-db
+    environment:
+      POSTGRES_USER: skladyx
+      POSTGRES_PASSWORD: skladyx
+      POSTGRES_DB: skladyx
+    ports:
+      - "127.0.0.1:5435:5432"
+    volumes:
+      - skladyx_dev_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U skladyx"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  skladyx_dev_db:
