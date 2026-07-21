@@ -46,6 +46,10 @@ Path: /opt/skladyx
 
 Бэкапы: cron 03:20 UTC, /opt/backups/{postgres,uploads}, retention 14 дней, восстановление описано в docs/RESTORE.md.
 
+Контуры: prod (rostagro.skladyx.ru, /opt/skladyx, 127.0.0.1:3003) и staging (staging-rostagro.skladyx.ru, /opt/skladyx-staging, 127.0.0.1:3013), отдельные БД/volumes/.env/секреты.
+Правило: изменения идут код → staging → prod.
+Staging-домен staging-<org>.skladyx.ru используется как технический контур и не меняет SaaS-схему <org-slug>.skladyx.ru/<module>.
+
 ## Проверка каждого изменения
 
 Перед принятием изменений проверять:
