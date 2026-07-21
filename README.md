@@ -82,8 +82,9 @@ npx tsx --tsconfig scripts/tsconfig.verify.json scripts/verify-stock.ts  # яд�
   (с настройками под SSE `/api/realtime`: `proxy_buffering off`, длинные таймауты).
 - `.env` на сервере — свои `DB_PASSWORD`, `AUTH_SECRET`, VAPID-ключи (не из других проектов).
 
-Выкатка: rsync исходников (без `node_modules`/`.next`/`.env`) → `docker compose up -d --build app`;
-миграции применяет entrypoint.
+**Выкатка — только через скрипт** (target зашит, есть guard-проверки и обязательный бэкап):
+`DEPLOY_ENV=prod CONFIRM_PROD_DEPLOY=rostagro ./scripts/prod/deploy-prod.sh`.
+Полная инструкция и запреты — [docs/DEPLOY.md](docs/DEPLOY.md). Миграции применяет entrypoint.
 
 **Бэкапы** настроены отдельно (см. [docs/RESTORE.md](docs/RESTORE.md)): ежедневный cron
 **03:20 UTC** (`/etc/cron.d/skladyx-backup`) снимает `pg_dump -Fc` в **`/opt/backups/postgres`**
@@ -105,8 +106,8 @@ npx tsx --tsconfig scripts/tsconfig.verify.json scripts/verify-stock.ts  # яд�
 | volumes | `skladyx_staging_db_data`, `skladyx_staging_uploads` |
 | nginx | `/etc/nginx/sites-available/staging-rostagro.skladyx.ru` → proxy `127.0.0.1:3013` (SSE-friendly) |
 
-Выкатка staging: rsync `main` (без `node_modules`/`.next`/`.env`) → `/opt/skladyx-staging` →
-`docker compose -f docker-compose.staging.yml up -d --build`. Свой `/opt/skladyx-staging/.env`
+**Выкатка staging — только через скрипт:** `./scripts/prod/deploy-staging.sh`
+(см. [docs/DEPLOY.md](docs/DEPLOY.md)). Свой `/opt/skladyx-staging/.env`
 (свои `DB_PASSWORD`/`AUTH_SECRET`/VAPID, не из prod). После первого seed — `SEED_ON_START=false`.
 
 ## Изоляция от старого проекта

@@ -69,8 +69,10 @@ SaaS-платформа складского учёта. `warehouse` — пер�
 - DNS делегирован, HTTPS выпущен (Let's Encrypt); nginx работает как **reverse proxy** →
   `127.0.0.1:3003` (с настройками под SSE `/api/realtime`).
 - `.env` на сервере — свои `DB_PASSWORD`, `AUTH_SECRET`, VAPID-ключи (не из других проектов).
-- Деплой: rsync исходников (без `node_modules`/`.next`/`.env`) → `docker compose up -d --build app`;
-  миграции применяет entrypoint. volumes `skladyx_db_data` / `skladyx_uploads`.
+- **Деплой только через скрипт** (target зашит, guard-проверки, обязательный бэкап):
+  `DEPLOY_ENV=prod CONFIRM_PROD_DEPLOY=rostagro ./scripts/prod/deploy-prod.sh`.
+  Инструкция и запреты — `docs/DEPLOY.md`. Миграции применяет entrypoint.
+  volumes `skladyx_db_data` / `skladyx_uploads`.
 - Бэкапы настроены (cron 03:20 UTC, `/opt/backups/{postgres,uploads}`, retention 14д) —
   детали и восстановление в `docs/RESTORE.md`.
 
@@ -80,7 +82,7 @@ SaaS-платформа складского учёта. `warehouse` — пер�
   полностью независим от prod: путь `/opt/skladyx-staging`, compose file `docker-compose.staging.yml`
   (project `skladyx-staging`), app на `127.0.0.1:3013`, db без внешнего порта, volumes
   `skladyx_staging_db_data` / `skladyx_staging_uploads`, свой `.env` (свои секреты, не prod).
-- Выкатка: rsync `main` → `/opt/skladyx-staging` → `docker compose -f docker-compose.staging.yml up -d --build`.
+- **Выкатка только через скрипт:** `./scripts/prod/deploy-staging.sh` (см. `docs/DEPLOY.md`).
 - Данные staging — только seed (org rostagro «РостАгро»); prod DB не копируем. После первого
   запуска в `/opt/skladyx-staging/.env` стоит `SEED_ON_START=false`.
 - nginx: `sites-available/staging-rostagro.skladyx.ru` → proxy `127.0.0.1:3013` (SSE-friendly), HTTPS certbot.

@@ -49,6 +49,7 @@ Path: /opt/skladyx
 Контуры: prod (rostagro.skladyx.ru, /opt/skladyx, 127.0.0.1:3003) и staging (staging-rostagro.skladyx.ru, /opt/skladyx-staging, 127.0.0.1:3013), отдельные БД/volumes/.env/секреты.
 Правило: изменения идут код → staging → prod.
 Staging-домен staging-<org>.skladyx.ru используется как технический контур и не меняет SaaS-схему <org-slug>.skladyx.ru/<module>.
+Деплой — только через скрипты scripts/prod/deploy-staging.sh и deploy-prod.sh, инструкция и запреты в docs/DEPLOY.md.
 
 ## Проверка каждого изменения
 
