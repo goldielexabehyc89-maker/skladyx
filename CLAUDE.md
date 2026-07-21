@@ -74,6 +74,17 @@ SaaS-платформа складского учёта. `warehouse` — пер�
 - Бэкапы настроены (cron 03:20 UTC, `/opt/backups/{postgres,uploads}`, retention 14д) —
   детали и восстановление в `docs/RESTORE.md`.
 
+## Staging (развёрнут)
+- **Правило разработки: любое изменение сначала на staging → проверка → потом prod.**
+- URL **https://staging-rostagro.skladyx.ru/warehouse**, тот же сервер sklad-prod-01,
+  полностью независим от prod: путь `/opt/skladyx-staging`, compose file `docker-compose.staging.yml`
+  (project `skladyx-staging`), app на `127.0.0.1:3013`, db без внешнего порта, volumes
+  `skladyx_staging_db_data` / `skladyx_staging_uploads`, свой `.env` (свои секреты, не prod).
+- Выкатка: rsync `main` → `/opt/skladyx-staging` → `docker compose -f docker-compose.staging.yml up -d --build`.
+- Данные staging — только seed (org rostagro «РостАгро»); prod DB не копируем. После первого
+  запуска в `/opt/skladyx-staging/.env` стоит `SEED_ON_START=false`.
+- nginx: `sites-available/staging-rostagro.skladyx.ru` → proxy `127.0.0.1:3013` (SSE-friendly), HTTPS certbot.
+
 ## Изоляция от старого проекта
 compose `skladyx` · БД/пользователь `skladyx` · контейнеры `skladyx-dev-db` · volumes
 `skladyx_db_data`/`skladyx_uploads`/`skladyx_dev_db` · порт app `127.0.0.1:3003` · dev-порт

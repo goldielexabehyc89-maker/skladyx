@@ -89,6 +89,26 @@ npx tsx --tsconfig scripts/tsconfig.verify.json scripts/verify-stock.ts  # яд�
 **03:20 UTC** (`/etc/cron.d/skladyx-backup`) снимает `pg_dump -Fc` в **`/opt/backups/postgres`**
 и `tar.gz` тома uploads в **`/opt/backups/uploads`**, retention 14 дней.
 
+## Staging
+
+Тестовый контур первой организации РостАгро, полностью независим от prod (свой compose,
+БД, volumes, порт, домен, секреты). **Правило: любое изменение сначала на staging → проверка
+→ потом prod.** Данные staging — только seed (prod DB не копируется).
+
+Работает: **https://staging-rostagro.skladyx.ru/warehouse** (HTTPS, Let's Encrypt).
+
+| Параметр | Значение |
+|---|---|
+| путь | `/opt/skladyx-staging` |
+| compose file | `docker-compose.staging.yml` (project `skladyx-staging`) |
+| app port | `127.0.0.1:3013` (db без внешнего порта) |
+| volumes | `skladyx_staging_db_data`, `skladyx_staging_uploads` |
+| nginx | `/etc/nginx/sites-available/staging-rostagro.skladyx.ru` → proxy `127.0.0.1:3013` (SSE-friendly) |
+
+Выкатка staging: rsync `main` (без `node_modules`/`.next`/`.env`) → `/opt/skladyx-staging` →
+`docker compose -f docker-compose.staging.yml up -d --build`. Свой `/opt/skladyx-staging/.env`
+(свои `DB_PASSWORD`/`AUTH_SECRET`/VAPID, не из prod). После первого seed — `SEED_ON_START=false`.
+
 ## Изоляция от старого проекта
 
 | Ресурс | Значение |
