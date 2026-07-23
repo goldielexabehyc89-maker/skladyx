@@ -21,6 +21,9 @@ PUBLIC_URL="https://rostagro.skladyx.ru"
 EXPECTED_APP_URL="https://rostagro.skladyx.ru"          # маркер контура в целевом .env
 BACKUP_SCRIPT="/opt/skladyx/scripts/prod/backup-all.sh"
 BACKUP_LOG="/opt/backups/backup.log"
+PG_BACKUP_DIR="/opt/backups/postgres"
+UP_BACKUP_DIR="/opt/backups/uploads"
+BACKUP_MAX_AGE_MIN=10          # дамп должен быть создан не раньше, чем N минут назад
 # ────────────────────────────────────────────────────────────────────────────
 
 SERVER_IP="${SKLADYX_SERVER_IP:-104.171.136.35}"
@@ -86,13 +89,50 @@ TARGET_APP_URL="$(ssh_ "grep -E '^APP_URL=' '${TARGET_PATH}/.env' | head -1 | cu
   die "маркер контура не совпал: в ${TARGET_PATH}/.env APP_URL='${TARGET_APP_URL}', ожидается '${EXPECTED_APP_URL}'. Похоже, это ДРУГОЙ контур — деплой отменён."
 say "маркер контура OK (APP_URL=${TARGET_APP_URL})"
 
-# ─── GUARD 8: свежий бэкап ПЕРЕД выкаткой (упал → деплой не идёт) ──────────
+# ─── GUARD 8: свежий бэкап ПЕРЕД выкаткой + доказательство его пригодности ─
+# Мало запустить backup-all.sh: нужно доказать, что PostgreSQL-дамп создан ИМЕННО
+# этим запуском и физически читается. backup-all.sh путь к дампу не возвращает
+# (пишет только человекочитаемый лог, куда пишет и cron), поэтому опознаём дамп
+# по маркеру времени: файл, созданный ПОЗЖЕ маркера = результат нашего запуска.
+BACKUP_MARKER="/tmp/skladyx-deploy-backup-marker.$$"
+
 say "снимаю свежий бэкап prod перед выкаткой: ${BACKUP_SCRIPT}"
-ssh_ "${BACKUP_SCRIPT} >> ${BACKUP_LOG} 2>&1" \
-  || die "бэкап упал — prod-деплой остановлен. Смотри ${BACKUP_LOG}"
-say "бэкап снят; последние файлы:"
-ssh_ "ls -t /opt/backups/postgres/*.dump 2>/dev/null | head -1 | xargs -r ls -lh"
-ssh_ "ls -t /opt/backups/uploads/*.tar.gz 2>/dev/null | head -1 | xargs -r ls -lh"
+ssh_ "touch '${BACKUP_MARKER}'" || die "не удалось создать маркер времени на сервере"
+if ! ssh_ "${BACKUP_SCRIPT} >> ${BACKUP_LOG} 2>&1"; then
+  ssh_ "rm -f '${BACKUP_MARKER}'" || true
+  die "бэкап упал — prod-деплой остановлен. Смотри ${BACKUP_LOG}"
+fi
+
+# 8.1 — дамп, созданный позже маркера (т.е. этим запуском)
+FRESH_DUMP="$(ssh_ "find '${PG_BACKUP_DIR}' -maxdepth 1 -type f -name 'skladyx-postgres-*.dump' -newer '${BACKUP_MARKER}' -print 2>/dev/null | sort | tail -1")"
+FRESH_UPLOAD="$(ssh_ "find '${UP_BACKUP_DIR}' -maxdepth 1 -type f -name 'skladyx-uploads-*.tar.gz' -newer '${BACKUP_MARKER}' -print 2>/dev/null | sort | tail -1")"
+ssh_ "rm -f '${BACKUP_MARKER}'" || true
+
+[ -n "$FRESH_DUMP" ] || \
+  die "backup-all.sh отработал, но НОВОГО дампа в ${PG_BACKUP_DIR} не появилось — деплой остановлен. Смотри ${BACKUP_LOG}"
+say "свежий дамп: ${FRESH_DUMP}"
+
+# 8.2 — файл существует и не пустой
+ssh_ "test -s '${FRESH_DUMP}'" \
+  || die "дамп ${FRESH_DUMP} отсутствует или пустой — деплой остановлен"
+
+# 8.3 — возраст дампа меньше ${BACKUP_MAX_AGE_MIN} минут
+ssh_ "find '${FRESH_DUMP}' -mmin -${BACKUP_MAX_AGE_MIN} | grep -q ." \
+  || die "дамп ${FRESH_DUMP} старше ${BACKUP_MAX_AGE_MIN} мин — он не от этого запуска, деплой остановлен"
+
+# 8.4 — дамп физически читается: pg_restore --list разбирает оглавление (БД не трогаем)
+TOC_LINES="$(ssh_ "set -o pipefail; cd '${TARGET_PATH}' && docker compose -f '${COMPOSE_FILE}' exec -T db pg_restore --list < '${FRESH_DUMP}' 2>/dev/null | wc -l")" \
+  || die "дамп ${FRESH_DUMP} НЕ читается (pg_restore --list завершился с ошибкой) — деплой остановлен"
+[ "${TOC_LINES:-0}" -gt 0 ] 2>/dev/null \
+  || die "оглавление дампа ${FRESH_DUMP} пустое — дамп непригоден, деплой остановлен"
+
+say "бэкап проверен: не пустой, свежее ${BACKUP_MAX_AGE_MIN} мин, оглавление читается (${TOC_LINES} записей)"
+ssh_ "ls -lh '${FRESH_DUMP}'"
+if [ -n "$FRESH_UPLOAD" ]; then
+  ssh_ "ls -lh '${FRESH_UPLOAD}'"
+else
+  say "ВНИМАНИЕ: свежий архив uploads не найден (backup-all.sh вернул успех) — проверь ${BACKUP_LOG}"
+fi
 
 # ─── ВЫКАТКА ───────────────────────────────────────────────────────────────
 say "rsync → ${SERVER_USER}@${SERVER_IP}:${TARGET_PATH}/ (--delete, .env исключён)"
