@@ -13,6 +13,10 @@ SaaS-платформа складского учёта. Первый модул
 > **Обязательный контекст (читать перед любой задачей):**
 > [PROJECT_CONTEXT.md](PROJECT_CONTEXT.md) — архитектура, URL-схема, tenant/security-модель,
 > принципы, prod · [ROADMAP.md](ROADMAP.md) — этапы развития.
+>
+> **Работа с живыми контурами:** [docs/OPERATIONS.md](docs/OPERATIONS.md) — правило
+> «repo ≠ production», чеклисты, проверка портов, статусы бэкапов, forward-only миграции ·
+> [docs/SERVER_INVENTORY.md](docs/SERVER_INVENTORY.md) — инвентарь по факту сервера.
 
 ## Стек
 

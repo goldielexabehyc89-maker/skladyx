@@ -4,6 +4,10 @@
 > [PROJECT_CONTEXT.md](PROJECT_CONTEXT.md) (архитектура, tenant/security-модель, принципы,
 > prod) и [ROADMAP.md](ROADMAP.md) (этапы). Если задача принимает новое архитектурное
 > решение — предложить правку PROJECT_CONTEXT.md / ROADMAP.md отдельным пунктом, не менять их молча.
+>
+> **Перед любой работой с prod/staging — [docs/OPERATIONS.md](docs/OPERATIONS.md).**
+> Ключевое правило: **репозиторий не является источником истины о продакшене** — состояние
+> сервера проверять на сервере. Инвентарь контуров — [docs/SERVER_INVENTORY.md](docs/SERVER_INVENTORY.md).
 
 SaaS-платформа складского учёта. `warehouse` — первый модуль (дальше `/crm`, `/finance`,
 `/admin`). Схема URL `<org-slug>.skladyx.ru/<module>`; первый адрес
