@@ -50,6 +50,7 @@ Path: /opt/skladyx
 Правило: изменения идут код → staging → prod.
 Staging-домен staging-<org>.skladyx.ru используется как технический контур и не меняет SaaS-схему <org-slug>.skladyx.ru/<module>.
 Деплой — только через скрипты scripts/prod/deploy-staging.sh и deploy-prod.sh, инструкция и запреты в docs/DEPLOY.md.
+Эксплуатационные правила и сверка repo↔сервер: docs/OPERATIONS.md; инвентарь контуров: docs/SERVER_INVENTORY.md.
 
 ## Проверка каждого изменения
 
