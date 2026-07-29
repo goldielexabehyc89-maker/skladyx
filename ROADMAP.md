@@ -39,13 +39,15 @@
 
 Цель: подготовить проект к нескольким организациям.
 
-- [x] 4A. Проект — docs/MULTITENANT_SECURITY_DESIGN.md (глобальный Account + Membership,
-      вход через поддомен, host == membership, немедленный отзыв, приглашения, аудит). Выполнено 2026-07-30.
-- [ ] 4B. Реализация малыми этапами S1–S6 (локально → staging → prod): новые таблицы+backfill →
-      dual-read → переключение авторизации → приглашения/членство → tenant-security тесты → cleanup.
+- [x] 4A. Проект — docs/MULTITENANT_SECURITY_DESIGN.md: per-tenant User, независимые учётные
+      записи организаций, UserRole, вход через поддомен, host→company, немедленный отзыв прав,
+      приглашения и security-аудит. Выполнено 2026-07-30.
+- [ ] 4B. Реализация малыми этапами S1–S6: UserRole + backfill + dual-write → dual-read ролей →
+      tenant-auth и tenant-scoped уникальность → приглашения/восстановление/аудит →
+      tenant-security тесты → cleanup User.role.
 
-Внутри 4B решаются: enforce host org == session company; проверка всех scoped-запросов; убрать
-возможный хардкод rostagro; роли и доступы между организациями; модель нескольких организаций.
+Внутри 4B решаются: enforce host org == session company; проверка scoped-запросов; отсутствие
+хардкода rostagro; роли и складские доступы в каждой организации; защита последнего администратора.
 
 ## Staging-контур — ✅ Выполнено (2026-07-21)
 
