@@ -42,16 +42,31 @@
 - [x] 4A. Проект — docs/MULTITENANT_SECURITY_DESIGN.md: per-tenant User, независимые учётные
       записи организаций, UserRole, вход через поддомен, host→company, немедленный отзыв прав,
       приглашения и security-аудит. Выполнено 2026-07-30.
-- [ ] 4B. Реализация малыми этапами S1–S6 (весь 4B ещё не завершён; авторизация до S2
-      остаётся на User.role):
-  - [x] S1. UserRole + backfill + dual-write ролей — выполнено 2026-07-30. Миграция
-        `20260730130000_user_role_s1`, коммит `ce42b39`. Проверено локально, на staging и на prod.
-        Авторизация пока по `User.role` (dual-read ролей — в S2).
-  - [ ] S2. Dual-read ролей.
-  - [ ] S3. Tenant-auth, host→company и tenant-scoped уникальность phone/email.
-  - [ ] S4. Приглашения, восстановление и аудит.
-  - [ ] S5. Tenant-security тесты.
-  - [ ] S6. Cleanup User.role.
+- [ ] 4B. Реализация малыми этапами S1–S6. S1–S3 работают на staging и prod.
+  Авторизация выполняется по tenant и свежим данным UserRole из БД.
+  Остаются S4–S6.
+
+  - [x] S1. UserRole + backfill + dual-write ролей — выполнено 2026-07-30.
+    Миграция `20260730130000_user_role_s1`, коммит `ce42b39`.
+    Проверено локально, на staging и prod.
+
+  - [x] S2. Dual-read ролей — выполнено 2026-07-30.
+    Флаг `ROLES_DUAL_READ`, коммит `a9c15f9`.
+    Проверено локально, на staging и prod в составе релиза S2+S3.
+
+  - [x] S3. Tenant-auth, host→company и tenant-scoped уникальность phone/email —
+    выполнено 2026-07-30.
+    Миграция `20260730170000_tenant_scoped_user_unique_s3`, коммит `1db3281`.
+    Проверено локально, на staging и prod.
+    На staging и prod включены `TENANT_AUTH=true` и `ROLES_DUAL_READ=true`.
+
+  - [ ] S4. Приглашения, восстановление и аудит. Отложено владельцем,
+    не блокирует разработку складской логики РостАгро.
+
+  - [ ] S5. Финальный набор tenant-security тестов.
+
+  - [ ] S6. Cleanup User.role. Отложено до стабилизации новой системы ролей,
+    не блокирует разработку складской логики РостАгро.
 
 Внутри 4B решаются: enforce host org == session company; проверка scoped-запросов; отсутствие
 хардкода rostagro; роли и складские доступы в каждой организации; защита последнего администратора.

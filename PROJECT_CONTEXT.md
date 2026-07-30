@@ -36,7 +36,9 @@ warehouse — складской модуль, перенесён из прое�
   в UserRole, доступ к складам — через allWarehouses + UserWarehouse. Вход выполняется через
   поддомен организации; host должен соответствовать session.companyId; активность и права
   проверяются по БД на каждом защищённом запросе для немедленного отзыва доступа.
-- Следующий этап multi-tenant security: enforce host org == session company.
+- Multi-tenant security S1–S3 включена на staging и prod: host→company, tenant-scoped
+  phone/email, роли UserRole и свежая авторизация из БД. Флаги `TENANT_AUTH=true` и
+  `ROLES_DUAL_READ=true`. S4 и S6 отложены и не блокируют реализацию складской логики РостАгро.
 - Не хардкодить РостАгро как единственную организацию.
 - Не хардкодить warehouse как единственный будущий раздел.
 - Новые разделы должны жить как модули: /warehouse, /crm, /finance и т.д.
