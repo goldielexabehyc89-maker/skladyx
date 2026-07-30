@@ -1,5 +1,6 @@
 import Link from "next/link";
 import { requireAdminPage } from "@/lib/auth";
+import { hasRole } from "@/lib/roles";
 import { scoped } from "@/lib/tenant";
 import { allowedWarehouses, warehouseAccess, whereWh } from "@/lib/warehouse-access";
 import { prisma } from "@/lib/db";
@@ -16,7 +17,7 @@ const STATUS_RU: Record<string, { label: string; tone: "orange" | "blue" | "gree
 
 export default async function SupplierOrdersPage() {
   const session = await requireAdminPage();
-  const isAdmin = session.role === "ADMIN";
+  const isAdmin = hasRole(session, "ADMIN");
   const s = scoped(session);
   const access = await warehouseAccess(session);
   const orders = await prisma.supplierOrder.findMany({

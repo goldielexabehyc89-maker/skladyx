@@ -1,5 +1,6 @@
 import Link from "next/link";
 import { requireUser } from "@/lib/auth";
+import { hasRole } from "@/lib/roles";
 import { scoped } from "@/lib/tenant";
 import { prisma } from "@/lib/db";
 import { PageTitle, EmptyState } from "@/components/ui";
@@ -30,7 +31,7 @@ export default async function FeedPage({
   const session = await requireUser();
   const s = scoped(session);
   const { type } = await searchParams;
-  const isAdmin = session.role === "ADMIN";
+  const isAdmin = hasRole(session, "ADMIN");
 
   const events = await prisma.event.findMany({
     where: {

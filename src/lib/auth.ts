@@ -4,9 +4,19 @@ import { redirect } from "next/navigation";
 import { prisma } from "@/lib/db";
 import { normalizePhone } from "@/lib/phone";
 import { getSession, setSession, clearSession, type SessionData, type Role } from "@/lib/session";
+import { sanitizeRoles } from "@/lib/jwt";
+import { hasRole, hasAnyRole } from "@/lib/roles";
 
 export async function hashPassword(plain: string): Promise<string> {
   return bcrypt.hash(plain, 10);
+}
+
+// S2 dual-read: набор ролей пользователя из UserRole (fallback [legacyRole]) для сессии.
+// Заполняется всегда при создании сессии, независимо от флага ROLES_DUAL_READ —
+// флаг лишь решает, использовать ли этот набор при проверках прав (см. @/lib/roles).
+export async function loadUserRoles(userId: string, legacyRole: Role): Promise<Role[]> {
+  const rows = await prisma.userRole.findMany({ where: { userId }, select: { role: true } });
+  return sanitizeRoles(rows.map((r) => r.role), legacyRole);
 }
 
 // Проверяет логин/пароль и создаёт сессию. Логин — телефон (+7…/8…/9…);
@@ -28,6 +38,7 @@ export async function login(identifier: string, password: string): Promise<Sessi
     login: user.phone ?? user.email ?? "",
     name: user.name,
     role: user.role as Role,
+    roles: await loadUserRoles(user.id, user.role as Role),
     companyId: user.companyId,
   };
   await setSession(data);
@@ -45,16 +56,17 @@ export async function requireUser(): Promise<SessionData> {
   return session;
 }
 
+// Решения о правах — через @/lib/roles (учитывает флаг ROLES_DUAL_READ и набор ролей).
 export async function requireAdmin(): Promise<SessionData> {
   const session = await requireUser();
-  if (session.role !== "ADMIN") throw new Error("FORBIDDEN");
+  if (!hasRole(session, "ADMIN")) throw new Error("FORBIDDEN");
   return session;
 }
 
 // Складской персонал: админ или кладовщик.
 export async function requireStaff(): Promise<SessionData> {
   const session = await requireUser();
-  if (session.role !== "ADMIN" && session.role !== "STOREKEEPER") throw new Error("FORBIDDEN");
+  if (!hasAnyRole(session, ["ADMIN", "STOREKEEPER"])) throw new Error("FORBIDDEN");
   return session;
 }
 
@@ -62,14 +74,14 @@ export async function requireStaff(): Promise<SessionData> {
 export async function requireAdminPage(): Promise<SessionData> {
   const session = await getSession();
   if (!session) redirect("/login");
-  if (session.role !== "ADMIN") redirect("/warehouse");
+  if (!hasRole(session, "ADMIN")) redirect("/warehouse");
   return session;
 }
 
 export async function requireStaffPage(): Promise<SessionData> {
   const session = await getSession();
   if (!session) redirect("/login");
-  if (session.role !== "ADMIN" && session.role !== "STOREKEEPER") redirect("/warehouse");
+  if (!hasAnyRole(session, ["ADMIN", "STOREKEEPER"])) redirect("/warehouse");
   return session;
 }
 

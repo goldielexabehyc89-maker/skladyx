@@ -1,6 +1,7 @@
 import { Undo2 } from "lucide-react";
 import { redirect } from "next/navigation";
 import { requireStaffPage } from "@/lib/auth";
+import { hasRole } from "@/lib/roles";
 import { scoped } from "@/lib/tenant";
 import { warehouseAccess, whereWh } from "@/lib/warehouse-access";
 import { prisma } from "@/lib/db";
@@ -14,7 +15,7 @@ export default async function IssuePage({ params }: { params: Promise<{ id: stri
   const s = scoped(session);
   const { id } = await params;
   const issue = await s.issue(id);
-  if (session.role !== "ADMIN") {
+  if (!hasRole(session, "ADMIN")) {
     // кладовщик — только выдачи по заявкам своих складов
     const access = await warehouseAccess(session);
     const ok = issue.pickListId
@@ -98,7 +99,7 @@ export default async function IssuePage({ params }: { params: Promise<{ id: stri
           <p className="mt-2 text-right text-sm font-semibold">Итого: {fmtRub(total)}</p>
         )}
       </Card>
-      {session.role === "ADMIN" && issue.status !== "CANCELLED" && (
+      {hasRole(session, "ADMIN") && issue.status !== "CANCELLED" && (
         <DeleteDocButton
           action={cancelIssueAction}
           hidden={{ issueId: issue.id }}

@@ -2,6 +2,7 @@
 
 import { prisma } from "@/lib/db";
 import { requireUser, requireAdmin } from "@/lib/auth";
+import { hasRole } from "@/lib/roles";
 import { scoped } from "@/lib/tenant";
 import { warehouseAccess, isWhAllowed } from "@/lib/warehouse-access";
 import { resolveQr, parseScannedCode } from "@/lib/qr";
@@ -207,7 +208,7 @@ export async function resolveScanAction(raw: string): Promise<ScanInfo> {
       type: "EMPLOYEE",
       title: user.name,
       lines: ["Бейдж сотрудника"],
-      url: session.role === "ADMIN" ? `/warehouse/employees/${user.id}` : undefined,
+      url: hasRole(session, "ADMIN") ? `/warehouse/employees/${user.id}` : undefined,
     };
   }
 

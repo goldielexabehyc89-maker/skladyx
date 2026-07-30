@@ -1,6 +1,7 @@
 import { Printer } from "lucide-react";
 import Link from "next/link";
 import { requireStaffPage } from "@/lib/auth";
+import { hasRole } from "@/lib/roles";
 import { scoped } from "@/lib/tenant";
 import { getAllowedWarehouse } from "@/lib/warehouse-access";
 import { prisma } from "@/lib/db";
@@ -255,7 +256,7 @@ export default async function ReceiptPage({ params }: { params: Promise<{ id: st
         </DownloadButton>
       )}
 
-      {session.role === "ADMIN" && order.receiptId && (
+      {hasRole(session, "ADMIN") && order.receiptId && (
         <DeleteDocButton
           action={deleteReceiptAction}
           hidden={{ orderId: order.id }}

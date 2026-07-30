@@ -1,6 +1,7 @@
 import "server-only";
 import webpush from "web-push";
 import { prisma } from "@/lib/db";
+import { rolesDualReadEnabled } from "@/lib/roles";
 
 let configured = false;
 function ensureVapid(): boolean {
@@ -63,12 +64,27 @@ export async function sendPushToWarehouseStorekeepers(
   warehouseId: string,
   payload: PushPayload,
 ) {
+  // S2 dual-read: кто считается кладовщиком.
+  //  flag off → legacy User.role = STOREKEEPER;
+  //  flag on  → есть строка UserRole=STOREKEEPER; если строк UserRole нет вовсе — fallback на User.role.
+  // Обязательные фильтры companyId/isActive/доступ к складу сохраняются в любом режиме.
+  const roleFilter = rolesDualReadEnabled()
+    ? {
+        OR: [
+          { userRoles: { some: { role: "STOREKEEPER" as const } } },
+          { AND: [{ userRoles: { none: {} } }, { role: "STOREKEEPER" as const }] },
+        ],
+      }
+    : { role: "STOREKEEPER" as const };
+
   const users = await prisma.user.findMany({
     where: {
       companyId,
-      role: "STOREKEEPER",
       isActive: true,
-      OR: [{ allWarehouses: true }, { warehouseLinks: { some: { warehouseId } } }],
+      AND: [
+        roleFilter,
+        { OR: [{ allWarehouses: true }, { warehouseLinks: { some: { warehouseId } } }] },
+      ],
     },
     select: { id: true },
   });

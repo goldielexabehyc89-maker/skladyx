@@ -1,6 +1,7 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { prisma } from "@/lib/db";
 import { getSession } from "@/lib/session";
+import { hasRole } from "@/lib/roles";
 import { resolveQr } from "@/lib/qr";
 
 // Публичный вход по QR (сканирование системной камерой телефона):
@@ -42,7 +43,7 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ code
       case "CELL":
         return `/warehouse/cells/${qr.refId}`;
       case "EMPLOYEE":
-        return session.role === "ADMIN" ? `/warehouse/employees/${qr.refId}` : "/warehouse";
+        return hasRole(session, "ADMIN") ? `/warehouse/employees/${qr.refId}` : "/warehouse";
       case "PICKLIST":
         return `/warehouse/picklists/${qr.refId}`;
     }

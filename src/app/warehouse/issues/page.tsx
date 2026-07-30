@@ -1,5 +1,6 @@
 import Link from "next/link";
 import { requireStaffPage } from "@/lib/auth";
+import { hasRole } from "@/lib/roles";
 import { scoped } from "@/lib/tenant";
 import { warehouseAccess, whereWh } from "@/lib/warehouse-access";
 import { prisma } from "@/lib/db";
@@ -19,7 +20,7 @@ const STATUS_RU = {
 export default async function IssuesPage() {
   const session = await requireStaffPage();
   const s = scoped(session);
-  const isAdmin = session.role === "ADMIN";
+  const isAdmin = hasRole(session, "ADMIN");
   const settings = await getSettings(s.companyId);
   let issues = await prisma.issue.findMany({
     where: { companyId: s.companyId },

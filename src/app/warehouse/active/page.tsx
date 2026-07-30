@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { clsx } from "clsx";
 import { requireStaffPage } from "@/lib/auth";
+import { hasRole } from "@/lib/roles";
 import { scoped } from "@/lib/tenant";
 import { warehouseAccess, whereWh, allowedWarehouses } from "@/lib/warehouse-access";
 import { prisma } from "@/lib/db";
@@ -89,7 +90,7 @@ export default async function ActivePage({
 }) {
   const session = await requireStaffPage();
   const s = scoped(session);
-  const isAdmin = session.role === "ADMIN";
+  const isAdmin = hasRole(session, "ADMIN");
   const access = await warehouseAccess(session);
   const sp = await searchParams;
   const typ: FilterValue = (FILTERS.some((f) => f.value === sp.type)

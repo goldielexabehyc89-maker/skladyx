@@ -4,6 +4,7 @@ import QRCode from "qrcode";
 import { PDFDocument, rgb, type PDFFont, type PDFPage, type PDFImage } from "pdf-lib";
 import fontkit from "@pdf-lib/fontkit";
 import { getSession } from "@/lib/session";
+import { hasAnyRole } from "@/lib/roles";
 import { getSettings } from "@/lib/settings";
 import { qrUrl } from "@/lib/qr";
 import { buildLabels, type Label } from "../build-labels";
@@ -17,7 +18,7 @@ const MM = 72 / 25.4; // мм → pt
 
 export async function GET(req: Request) {
   const session = await getSession();
-  if (!session || (session.role !== "ADMIN" && session.role !== "STOREKEEPER"))
+  if (!session || !hasAnyRole(session, ["ADMIN", "STOREKEEPER"]))
     return new Response("Доступ запрещён", { status: 403 });
 
   const url = new URL(req.url);

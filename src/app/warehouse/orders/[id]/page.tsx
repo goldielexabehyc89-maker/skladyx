@@ -1,5 +1,6 @@
 import Link from "next/link";
 import { requireAdminPage } from "@/lib/auth";
+import { hasRole } from "@/lib/roles";
 import { scoped } from "@/lib/tenant";
 import { getAllowedWarehouse } from "@/lib/warehouse-access";
 import { prisma } from "@/lib/db";
@@ -35,7 +36,7 @@ export default async function SupplierOrderPage({
   const [warehouse, allItems] = await Promise.all([getAllowedWarehouse(session, s.companyId, order.warehouseId), s.items()]);
   const itemById = new Map(allItems.map((i) => [i.id, i]));
   const activeItems = allItems.filter((i) => i.isActive);
-  const isAdmin = session.role === "ADMIN";
+  const isAdmin = hasRole(session, "ADMIN");
   // черновик редактирует только админ; кладовщик видит заказ и принимает его
   const editable = order.status === "DRAFT" && isAdmin;
   const isDraft = order.status === "DRAFT";

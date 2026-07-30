@@ -2,7 +2,7 @@
 
 import { redirect } from "next/navigation";
 import { prisma } from "@/lib/db";
-import { hashPassword } from "@/lib/auth";
+import { hashPassword, loadUserRoles } from "@/lib/auth";
 import { setSession, type Role } from "@/lib/session";
 import { validateToken } from "@/lib/password-reset";
 
@@ -41,6 +41,7 @@ export async function setPasswordAction(
     login: user.phone ?? user.email ?? "",
     name: user.name,
     role: user.role as Role,
+    roles: await loadUserRoles(user.id, user.role as Role),
     companyId: user.companyId,
   });
   redirect("/warehouse");

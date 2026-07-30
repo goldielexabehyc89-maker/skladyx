@@ -1,5 +1,6 @@
 import Link from "next/link";
 import { requireStaffPage } from "@/lib/auth";
+import { hasRole } from "@/lib/roles";
 import { scoped } from "@/lib/tenant";
 import { warehouseAccess, whereWh, allowedWarehouses } from "@/lib/warehouse-access";
 import { prisma } from "@/lib/db";
@@ -21,7 +22,7 @@ const STATUS_RU: Record<PickListStatus, { label: string; tone: "neutral" | "gree
 export default async function TransfersPage() {
   const session = await requireStaffPage();
   const s = scoped(session);
-  const isAdmin = session.role === "ADMIN";
+  const isAdmin = hasRole(session, "ADMIN");
   const access = await warehouseAccess(session);
   const transfers = await prisma.pickList.findMany({
     where: {

@@ -1,4 +1,5 @@
 import { getSession } from "@/lib/session";
+import { hasRole } from "@/lib/roles";
 import { warehouseAccess } from "@/lib/warehouse-access";
 import { subscribeRealtime, type RealtimeEvent } from "@/lib/realtime";
 
@@ -16,18 +17,19 @@ export async function GET(req: Request) {
   if (!session) return new Response("unauthorized", { status: 401 });
   const access = await warehouseAccess(session);
 
-  // видно ли событие этому пользователю
+  // видно ли событие этому пользователю (по effective roles, приоритет ADMIN > STOREKEEPER > EMPLOYEE)
   function visible(ev: RealtimeEvent): boolean {
     if (ev.companyId !== session!.companyId) return false;
-    if (session!.role === "ADMIN") return true;
-    if (session!.role === "EMPLOYEE") {
-      // сотрудник — только адресованные ему события (его выдачи/ТМЦ)
-      return !!ev.userIds?.includes(session!.userId);
+    if (hasRole(session!, "ADMIN")) return true;
+    if (hasRole(session!, "STOREKEEPER")) {
+      // кладовщик: события без складов — общие; со складами — только доступные.
+      // STOREKEEPER + EMPLOYEE не должен попасть в employee-ветку — эта проверка выше.
+      if (!ev.warehouseIds || ev.warehouseIds.length === 0) return true;
+      if (access.all) return true;
+      return ev.warehouseIds.some((id) => access.ids.includes(id));
     }
-    // кладовщик: события без складов — общие; со складами — только доступные
-    if (!ev.warehouseIds || ev.warehouseIds.length === 0) return true;
-    if (access.all) return true;
-    return ev.warehouseIds.some((id) => access.ids.includes(id));
+    // только сотрудник — только адресованные ему события (его выдачи/ТМЦ)
+    return !!ev.userIds?.includes(session!.userId);
   }
 
   const encoder = new TextEncoder();
