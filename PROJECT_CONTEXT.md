@@ -39,6 +39,10 @@ warehouse — складской модуль, перенесён из прое�
 - Multi-tenant security S1–S3 включена на staging и prod: host→company, tenant-scoped
   phone/email, роли UserRole и свежая авторизация из БД. Флаги `TENANT_AUTH=true` и
   `ROLES_DUAL_READ=true`. S4 и S6 отложены и не блокируют реализацию складской логики РостАгро.
+- Для РостАгро включена модель мультиролей и смен: роли хранятся в UserRole; рабочие роли
+  RECEIVER, LOADER, PICKER и CONTROLLER выбираются при начале WorkShift вместе со складом.
+  У пользователя может быть только одна незавершённая смена. ADMIN и OBSERVER не обязаны
+  начинать смену. Legacy-роли STOREKEEPER/EMPLOYEE временно сохранены до S6.
 - Не хардкодить РостАгро как единственную организацию.
 - Не хардкодить warehouse как единственный будущий раздел.
 - Новые разделы должны жить как модули: /warehouse, /crm, /finance и т.д.
