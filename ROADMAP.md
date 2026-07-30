@@ -42,9 +42,16 @@
 - [x] 4A. Проект — docs/MULTITENANT_SECURITY_DESIGN.md: per-tenant User, независимые учётные
       записи организаций, UserRole, вход через поддомен, host→company, немедленный отзыв прав,
       приглашения и security-аудит. Выполнено 2026-07-30.
-- [ ] 4B. Реализация малыми этапами S1–S6: UserRole + backfill + dual-write → dual-read ролей →
-      tenant-auth и tenant-scoped уникальность → приглашения/восстановление/аудит →
-      tenant-security тесты → cleanup User.role.
+- [ ] 4B. Реализация малыми этапами S1–S6 (весь 4B ещё не завершён; авторизация до S2
+      остаётся на User.role):
+  - [x] S1. UserRole + backfill + dual-write ролей — выполнено 2026-07-30. Миграция
+        `20260730130000_user_role_s1`, коммит `ce42b39`. Проверено локально, на staging и на prod.
+        Авторизация пока по `User.role` (dual-read ролей — в S2).
+  - [ ] S2. Dual-read ролей.
+  - [ ] S3. Tenant-auth, host→company и tenant-scoped уникальность phone/email.
+  - [ ] S4. Приглашения, восстановление и аудит.
+  - [ ] S5. Tenant-security тесты.
+  - [ ] S6. Cleanup User.role.
 
 Внутри 4B решаются: enforce host org == session company; проверка scoped-запросов; отсутствие
 хардкода rostagro; роли и складские доступы в каждой организации; защита последнего администратора.
