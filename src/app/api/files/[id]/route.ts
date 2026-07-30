@@ -1,11 +1,11 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/db";
-import { getSession } from "@/lib/session";
+import { currentSession } from "@/lib/tenant-auth";
 import { readStoredFile } from "@/lib/files";
 
-// Отдача файла с проверкой сессии и компании.
+// Отдача файла с проверкой сессии и компании (S3: свежая проверка host==company/isActive).
 export async function GET(_req: Request, { params }: { params: Promise<{ id: string }> }) {
-  const session = await getSession();
+  const session = await currentSession();
   if (!session) return NextResponse.json({ error: "UNAUTHORIZED" }, { status: 401 });
 
   const { id } = await params;

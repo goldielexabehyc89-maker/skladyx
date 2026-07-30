@@ -1,6 +1,6 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { prisma } from "@/lib/db";
-import { getSession } from "@/lib/session";
+import { currentSession } from "@/lib/tenant-auth";
 import { hasRole } from "@/lib/roles";
 import { resolveQr } from "@/lib/qr";
 
@@ -10,7 +10,7 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ code
   const { code } = await params;
   const url = req.nextUrl.clone();
 
-  const session = await getSession();
+  const session = await currentSession();
   if (!session) {
     url.pathname = "/login";
     url.search = `?next=${encodeURIComponent(`/q/${code}`)}`;

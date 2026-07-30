@@ -16,6 +16,8 @@ COMPOSE_FILE="docker-compose.staging.yml"
 APP_PORT="3013"
 PUBLIC_URL="https://staging-rostagro.skladyx.ru"
 EXPECTED_APP_URL="https://staging-rostagro.skladyx.ru"   # маркер контура в целевом .env
+# Host для локальных curl (иначе при TENANT_AUTH=true запрос без нужного Host отклоняется).
+HOST_HEADER="${EXPECTED_APP_URL#https://}"
 # ────────────────────────────────────────────────────────────────────────────
 
 SERVER_IP="${SKLADYX_SERVER_IP:-104.171.136.35}"
@@ -89,15 +91,15 @@ ssh_ "cd '${TARGET_PATH}' && docker compose -f '${COMPOSE_FILE}' up -d --build" 
 # ─── ПРОВЕРКИ ПОСЛЕ ДЕПЛОЯ ────────────────────────────────────────────────
 say "ждём готовности приложения…"
 for i in $(seq 1 40); do
-  code="$(ssh_ "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:${APP_PORT}/login" || echo 000)"
+  code="$(ssh_ "curl -s -o /dev/null -w '%{http_code}' -H 'Host: ${HOST_HEADER}' http://127.0.0.1:${APP_PORT}/login" || echo 000)"
   [ "$code" = "200" ] && { say "app готов (${i}×2s)"; break; }
   sleep 2
 done
 
-say "--- проверки на сервере (127.0.0.1:${APP_PORT}) ---"
-ssh_ "curl -s -o /dev/null -w '  /login     %{http_code}\n' http://127.0.0.1:${APP_PORT}/login"
-ssh_ "curl -s -o /dev/null -w '  /warehouse %{http_code} -> %{redirect_url}\n' http://127.0.0.1:${APP_PORT}/warehouse"
-ssh_ "curl -s -o /dev/null -w '  /app       %{http_code} -> %{redirect_url}\n' http://127.0.0.1:${APP_PORT}/app"
+say "--- проверки на сервере (127.0.0.1:${APP_PORT}, Host: ${HOST_HEADER}) ---"
+ssh_ "curl -s -o /dev/null -w '  /login     %{http_code}\n' -H 'Host: ${HOST_HEADER}' http://127.0.0.1:${APP_PORT}/login"
+ssh_ "curl -s -o /dev/null -w '  /warehouse %{http_code} -> %{redirect_url}\n' -H 'Host: ${HOST_HEADER}' http://127.0.0.1:${APP_PORT}/warehouse"
+ssh_ "curl -s -o /dev/null -w '  /app       %{http_code} -> %{redirect_url}\n' -H 'Host: ${HOST_HEADER}' http://127.0.0.1:${APP_PORT}/app"
 
 say "--- проверки снаружи (${PUBLIC_URL}) ---"
 curl -s -o /dev/null -w "  /login     %{http_code}\n" "${PUBLIC_URL}/login"

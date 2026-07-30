@@ -1,47 +1,65 @@
-// Резолвинг org-slug из host для SaaS-схемы <org-slug>.skladyx.ru/<module>.
+// Резолвинг org-slug из host для SaaS-схемы <org-slug>.<base-domain>/<module>.
 //
-// ВАЖНО (этап 1): это НЕ security boundary. Изоляция тенантов и вся безопасность
-// сейчас держатся ИСКЛЮЧИТЕЛЬНО на session.companyId + scoped() (src/lib/tenant.ts).
-// Эта функция — только точка расширения (для будущего роутинга/брендинга по домену)
-// и удобный источник дефолтного slug.
+// Чистый модуль (без prisma / server-only): используется и в server-коде, и в verify-скриптах.
+// Разрешение Company по slug и сверка host==session.companyId — в server-only @/lib/tenant-auth.
 //
-// СЛЕДУЮЩИЙ ЭТАП (не сделано здесь): enforce-проверка «org-slug из host == компания
-// из сессии»: резолвить Company по slug, сверять с session.companyId, отдавать 403
-// при несовпадении, а также решить про cookie domain для поддоменов и уникальность
-// User.phone/email в разрезе компании.
+// Поведение (S3):
+//  - <org>.<base>                       → <org>
+//  - <prefix><org>.<base> (HOST_ORG_PREFIX) → <org>   (staging-<org> на staging)
+//  - неизвестный slug                    → Company не найдётся (обрабатывает tenant-auth)
+//  - apex/www/чужой домен/голый host/IP  → production: отказ (fail-closed); development: DEFAULT_ORG_SLUG
+//  - localhost                           → только development: DEFAULT_ORG_SLUG
 
-const DEFAULT_ORG_SLUG = "rostagro";
+export type HostResolveResult = { slug: string } | { slug: null; error: string };
 
-/** Хосты, для которых поддомен не является org-slug (dev/локалка/прямой IP). */
+export interface HostResolveOpts {
+  baseDomain: string; // напр. skladyx.ru
+  prefix: string; // '' в prod; 'staging-' на staging
+  defaultSlug: string; // применяется ТОЛЬКО в development
+  isProd: boolean;
+}
+
+/** Хосты, где поддомен не является org-slug (dev/локалка/прямой IP). */
 function isBareHost(hostname: string): boolean {
   if (!hostname) return true;
   if (hostname === "localhost" || hostname.endsWith(".localhost")) return true;
-  // IPv4/IPv6-литерал — не домен с поддоменом-организацией.
-  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(hostname)) return true;
-  if (hostname.includes(":") && !hostname.includes(".")) return true;
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(hostname)) return true; // IPv4-литерал
+  if (hostname.includes(":") && !hostname.includes(".")) return true; // IPv6-литерал
   return false;
 }
 
-/**
- * Достаёт org-slug из host (`rostagro.skladyx.ru` → `rostagro`).
- * Фоллбэк — DEFAULT_ORG_SLUG env, затем встроенный дефолт `rostagro`.
- *
- * @param host значение заголовка Host / X-Forwarded-Host (может быть с портом).
- */
-export function getOrgSlugFromHost(host?: string | null): string {
-  const fallback = process.env.DEFAULT_ORG_SLUG || DEFAULT_ORG_SLUG;
-  if (!host) return fallback;
+export function resolveOrgSlug(host: string | null | undefined, opts: HostResolveOpts): HostResolveResult {
+  const { baseDomain, prefix, defaultSlug, isProd } = opts;
+  // fail-closed в production; мягкий дефолт в development
+  const fallback = (): HostResolveResult =>
+    isProd ? { slug: null, error: "Организация не найдена" } : { slug: defaultSlug };
 
-  const hostname = host.split(":")[0].trim().toLowerCase();
-  if (isBareHost(hostname)) return fallback;
+  const hostname = (host ?? "").split(":")[0].trim().toLowerCase();
+  if (isBareHost(hostname)) return fallback();
 
-  const labels = hostname.split(".");
-  // Нужен реальный поддомен: <org>.<domain>.<tld> → минимум 3 лейбла.
-  if (labels.length < 3) return fallback;
+  const suffix = "." + baseDomain.toLowerCase();
+  if (!hostname.endsWith(suffix)) return fallback(); // apex, www на apex, чужой домен
 
-  const sub = labels[0];
-  if (!sub || sub === "www") return fallback;
-  return sub;
+  let sub = hostname.slice(0, -suffix.length); // 'rostagro' | 'staging-rostagro' | 'www' | 'a.b'
+  if (!sub || sub === "www") return fallback();
+  if (sub.includes(".")) return fallback(); // многоуровневый поддомен — не наша схема
+
+  if (prefix) {
+    // На контуре с префиксом принимаем только host этого контура.
+    if (!sub.startsWith(prefix)) return fallback();
+    sub = sub.slice(prefix.length);
+  }
+
+  if (!/^[a-z0-9-]+$/.test(sub)) return fallback();
+  return { slug: sub };
 }
 
-export { DEFAULT_ORG_SLUG };
+/** Резолвит slug из host по переменным окружения контура. */
+export function orgSlugFromHost(host: string | null | undefined): HostResolveResult {
+  return resolveOrgSlug(host, {
+    baseDomain: process.env.TENANT_BASE_DOMAIN || "skladyx.ru",
+    prefix: process.env.HOST_ORG_PREFIX || "",
+    defaultSlug: process.env.DEFAULT_ORG_SLUG || "rostagro",
+    isProd: process.env.NODE_ENV === "production",
+  });
+}

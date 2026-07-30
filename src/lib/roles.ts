@@ -13,15 +13,22 @@ import type { Role, SessionData } from "@/lib/jwt";
 // Приоритет ролей для переходной навигации и одиночных решений: ADMIN > STOREKEEPER > EMPLOYEE.
 const ROLE_PRIORITY: readonly Role[] = ["ADMIN", "STOREKEEPER", "EMPLOYEE"];
 
-// Серверный runtime-флаг (НЕ NEXT_PUBLIC): читается на каждом решении, чтобы выключение
-// флага сразу возвращало legacy-поведение без пересборки.
+// Серверные runtime-флаги (НЕ NEXT_PUBLIC): читаются на каждом решении, чтобы выключение
+// флага сразу возвращало прежнее поведение без пересборки.
 export function rolesDualReadEnabled(): boolean {
   return process.env.ROLES_DUAL_READ === "true";
 }
+export function tenantAuthEnabled(): boolean {
+  return process.env.TENANT_AUTH === "true";
+}
 
-// Эффективный набор ролей с учётом флага.
+// Эффективный набор ролей.
+// При TENANT_AUTH=true роли всегда берутся из session.roles (их наполняет свежая
+// проверка из БД в @/lib/tenant-auth) — независимо от ROLES_DUAL_READ.
+// При TENANT_AUTH=false: ROLES_DUAL_READ=true → session.roles; иначе legacy [session.role].
 export function effectiveRoles(session: SessionData): Role[] {
-  if (!rolesDualReadEnabled()) return [session.role];
+  const useRoleSet = tenantAuthEnabled() || rolesDualReadEnabled();
+  if (!useRoleSet) return [session.role];
   return session.roles && session.roles.length > 0 ? session.roles : [session.role];
 }
 

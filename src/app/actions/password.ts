@@ -5,6 +5,8 @@ import { prisma } from "@/lib/db";
 import { hashPassword, loadUserRoles } from "@/lib/auth";
 import { setSession, type Role } from "@/lib/session";
 import { validateToken } from "@/lib/password-reset";
+import { tenantAuthEnabled } from "@/lib/roles";
+import { resolveHostCompany } from "@/lib/tenant-auth";
 
 export interface SetPasswordState {
   error?: string;
@@ -27,6 +29,14 @@ export async function setPasswordAction(
 
   const user = await prisma.user.findUnique({ where: { id: t.userId } });
   if (!user) return { error: "Пользователь не найден" };
+
+  // S3 tenant-safe: ссылку можно открыть только на host организации пользователя.
+  if (tenantAuthEnabled()) {
+    const { company } = await resolveHostCompany();
+    if (!company || company.id !== user.companyId) {
+      return { error: "Ссылка недействительна для этой организации" };
+    }
+  }
 
   await prisma.$transaction([
     prisma.user.update({

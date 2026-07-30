@@ -1,12 +1,12 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/db";
-import { getSession } from "@/lib/session";
+import { currentSession } from "@/lib/tenant-auth";
 import { hasRole } from "@/lib/roles";
 import { saveUpload } from "@/lib/files";
 
 // Загрузка файла (multipart): у server actions лимит тела, поэтому route handler.
 export async function POST(req: Request) {
-  const session = await getSession();
+  const session = await currentSession();
   if (!session) return NextResponse.json({ error: "UNAUTHORIZED" }, { status: 401 });
   if (!hasRole(session, "ADMIN")) return NextResponse.json({ error: "FORBIDDEN" }, { status: 403 });
 

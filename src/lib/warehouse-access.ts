@@ -15,9 +15,11 @@ export interface WhAccess {
 export async function warehouseAccess(session: SessionData): Promise<WhAccess> {
   const u = await prisma.user.findFirst({
     where: { id: session.userId, companyId: session.companyId },
-    select: { allWarehouses: true, warehouseLinks: { select: { warehouseId: true } } },
+    select: { isActive: true, allWarehouses: true, warehouseLinks: { select: { warehouseId: true } } },
   });
-  if (!u || u.allWarehouses) return { all: true, ids: [] };
+  // S3: отсутствующий/заблокированный пользователь НЕ получает доступ ко всем складам — только отказ.
+  if (!u || !u.isActive) return { all: false, ids: [] };
+  if (u.allWarehouses) return { all: true, ids: [] };
   return { all: false, ids: u.warehouseLinks.map((l) => l.warehouseId) };
 }
 

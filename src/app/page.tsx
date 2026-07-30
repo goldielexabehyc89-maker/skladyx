@@ -1,7 +1,8 @@
 import { redirect } from "next/navigation";
-import { getSession } from "@/lib/session";
+import { currentSession } from "@/lib/tenant-auth";
 
 export default async function RootPage() {
-  const session = await getSession();
+  // S3: свежая проверка — при host mismatch/блокировке ведём на /login
+  const session = await currentSession();
   redirect(session ? "/warehouse" : "/login");
 }

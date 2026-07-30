@@ -1,11 +1,16 @@
-import { getSession } from "@/lib/session";
-import { hasRole } from "@/lib/roles";
-import { warehouseAccess } from "@/lib/warehouse-access";
+import { prisma } from "@/lib/db";
+import { currentSession } from "@/lib/tenant-auth";
+import { effectiveRoles, tenantAuthEnabled } from "@/lib/roles";
+import { sanitizeRoles, type Role } from "@/lib/jwt";
+import { warehouseAccess, type WhAccess } from "@/lib/warehouse-access";
 import { subscribeRealtime, type RealtimeEvent } from "@/lib/realtime";
 
 // SSE-поток онлайн-обновлений для авторизованной части /warehouse.
-// Клиент получает только факт изменения (тип/сущность/склады) и сам
-// перечитывает данные; фильтрация — по компании, роли и доступным складам.
+// Клиент получает только факт изменения (тип/сущность/склады) и сам перечитывает данные;
+// фильтрация — по компании, ролям и доступным складам.
+// S3: при TENANT_AUTH открытие проходит свежую проверку (host==company, isActive, роли),
+// а на каждом heartbeat заново читаются isActive/роли/склады из БД — блокировка или смена
+// ролей закрывает поток / меняет фильтр не позже следующего heartbeat (без релогина).
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -13,22 +18,26 @@ export const runtime = "nodejs";
 const HEARTBEAT_MS = 20_000;
 
 export async function GET(req: Request) {
-  const session = await getSession();
+  const session = await currentSession();
   if (!session) return new Response("unauthorized", { status: 401 });
-  const access = await warehouseAccess(session);
 
-  // видно ли событие этому пользователю (по effective roles, приоритет ADMIN > STOREKEEPER > EMPLOYEE)
+  const tenant = tenantAuthEnabled();
+  const companyId = session.companyId; // фиксирован для соединения (host не меняется)
+
+  // Снимок авторизации; при TENANT_AUTH обновляется на heartbeat.
+  let roles: Role[] = effectiveRoles(session);
+  let access: WhAccess = await warehouseAccess(session);
+
+  // видно ли событие этому пользователю (приоритет ADMIN > STOREKEEPER > EMPLOYEE)
   function visible(ev: RealtimeEvent): boolean {
-    if (ev.companyId !== session!.companyId) return false;
-    if (hasRole(session!, "ADMIN")) return true;
-    if (hasRole(session!, "STOREKEEPER")) {
-      // кладовщик: события без складов — общие; со складами — только доступные.
-      // STOREKEEPER + EMPLOYEE не должен попасть в employee-ветку — эта проверка выше.
+    if (ev.companyId !== companyId) return false;
+    if (roles.includes("ADMIN")) return true;
+    if (roles.includes("STOREKEEPER")) {
       if (!ev.warehouseIds || ev.warehouseIds.length === 0) return true;
       if (access.all) return true;
       return ev.warehouseIds.some((id) => access.ids.includes(id));
     }
-    // только сотрудник — только адресованные ему события (его выдачи/ТМЦ)
+    // только сотрудник — только адресованные ему события
     return !!ev.userIds?.includes(session!.userId);
   }
 
@@ -45,13 +54,11 @@ export async function GET(req: Request) {
         }
       };
 
-      // рекомендация браузеру по паузе reconnect + первое событие-приветствие
       write(`retry: 3000\n\n`);
       write(`data: {"type":"hello","createdAt":"${new Date().toISOString()}"}\n\n`);
 
       const unsubscribe = subscribeRealtime((ev) => {
         if (!visible(ev)) return;
-        // не выдаём клиенту чужие поля (userIds/companyId не нужны на клиенте)
         const payload = {
           type: ev.type,
           entity: ev.entity,
@@ -63,7 +70,36 @@ export async function GET(req: Request) {
         write(`data: ${JSON.stringify(payload)}\n\n`);
       });
 
-      const heartbeat = setInterval(() => write(`: ping\n\n`), HEARTBEAT_MS);
+      // S3: свежая перепроверка на heartbeat. host/company фиксированы за соединение,
+      // поэтому здесь достаточно перечитать по (userId, companyId) — без headers().
+      async function refreshAuthz(): Promise<boolean> {
+        const u = await prisma.user.findFirst({
+          where: { id: session!.userId, companyId },
+          select: {
+            isActive: true,
+            role: true,
+            allWarehouses: true,
+            userRoles: { select: { role: true } },
+            warehouseLinks: { select: { warehouseId: true } },
+          },
+        });
+        if (!u || !u.isActive) return false; // заблокирован/удалён → закрыть поток
+        roles = sanitizeRoles(u.userRoles.map((r) => r.role), u.role as Role);
+        access = u.allWarehouses
+          ? { all: true, ids: [] }
+          : { all: false, ids: u.warehouseLinks.map((l) => l.warehouseId) };
+        return true;
+      }
+
+      const heartbeat = setInterval(() => {
+        if (!tenant) {
+          write(`: ping\n\n`);
+          return;
+        }
+        refreshAuthz()
+          .then((okAuth) => (okAuth ? write(`: ping\n\n`) : cleanup()))
+          .catch(() => cleanup());
+      }, HEARTBEAT_MS);
 
       function cleanup() {
         if (closed) return;
@@ -84,7 +120,6 @@ export async function GET(req: Request) {
       "Content-Type": "text/event-stream; charset=utf-8",
       "Cache-Control": "no-cache, no-transform",
       Connection: "keep-alive",
-      // отключаем буферизацию у реверс-прокси
       "X-Accel-Buffering": "no",
     },
   });

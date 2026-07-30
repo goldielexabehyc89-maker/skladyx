@@ -13,8 +13,11 @@ export async function loginAction(_prev: LoginState, formData: FormData): Promis
   const next = String(formData.get("next") ?? "");
   if (!identifier || !password) return { error: "Введите телефон и пароль" };
 
-  const session = await doLogin(identifier, password);
-  if (!session) return { error: "Неверный телефон или пароль" };
+  const result = await doLogin(identifier, password);
+  if (!result.ok) {
+    // не раскрываем наличие пользователя в другой организации — общий ответ по учётке
+    return { error: result.error === "no-org" ? "Организация не найдена" : "Неверный телефон или пароль" };
+  }
 
   redirect(next.startsWith("/") ? next : "/warehouse");
 }

@@ -20,6 +20,9 @@ const userSchema = z.object({
   role: z.enum(["ADMIN", "STOREKEEPER", "EMPLOYEE"]),
 });
 
+// Организацию нельзя оставить без активного администратора (см. защиту в updateUserAction).
+class LastAdminError extends Error {}
+
 // Разбор привязки к складам из формы: чекбокс «Все склады» + список складов.
 async function parseWarehouses(
   companyId: string,
@@ -65,7 +68,8 @@ export async function createUserAction(
   const wh = await parseWarehouses(s.companyId, formData);
   if (wh.error) return { error: wh.error };
 
-  const exists = await prisma.user.findUnique({ where: { phone } });
+  // S3: телефон уникален в пределах организации
+  const exists = await prisma.user.findFirst({ where: { companyId: s.companyId, phone } });
   if (exists) return { error: "Пользователь с таким телефоном уже есть" };
 
   const user = await prisma.$transaction(async (tx) => {
@@ -98,7 +102,7 @@ export async function createUserAction(
     actorId: session.userId,
   });
   revalidatePath("/warehouse/employees");
-  return { link: passwordLink(token) };
+  return { link: await passwordLink(token) };
 }
 
 export async function updateUserAction(
@@ -125,32 +129,55 @@ export async function updateUserAction(
   if (phoneRaw) {
     phone = normalizePhone(phoneRaw);
     if (!phone) return { error: "Некорректный телефон — введите с +7, с 8 или сразу с 9" };
-    const dup = await prisma.user.findFirst({ where: { phone, id: { not: id } } });
+    const dup = await prisma.user.findFirst({ where: { companyId: s.companyId, phone, id: { not: id } } });
     if (dup) return { error: "Этот телефон занят другим пользователем" };
   }
 
   const wh = await parseWarehouses(s.companyId, formData);
   if (wh.error) return { error: wh.error };
 
-  await prisma.$transaction(async (tx) => {
-    await tx.user.update({
-      where: { id },
-      data: { name, role, isActive, phone, allWarehouses: wh.allWarehouses! },
-    });
-    await tx.userWarehouse.deleteMany({ where: { userId: id } });
-    if (!wh.allWarehouses && wh.ids!.length) {
-      await tx.userWarehouse.createMany({
-        data: wh.ids!.map((warehouseId) => ({ userId: id, warehouseId })),
+  try {
+    await prisma.$transaction(async (tx) => {
+      // S3: защита последнего активного ADMIN, конкурентно-безопасно.
+      // Advisory-xact-lock сериализует операции по ОРГАНИЗАЦИИ, поэтому две параллельные
+      // попытки снять ADMIN у разных админов не пройдут обе (вторая увидит уже 0 других).
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext('skladyx:lastadmin'), hashtext(${s.companyId}))`;
+      const willBeActiveAdmin = isActive && role === "ADMIN";
+      if (!willBeActiveAdmin) {
+        const otherActiveAdmins = await tx.user.count({
+          where: {
+            companyId: s.companyId,
+            isActive: true,
+            id: { not: id },
+            userRoles: { some: { role: "ADMIN" } },
+          },
+        });
+        if (otherActiveAdmins === 0) throw new LastAdminError();
+      }
+
+      await tx.user.update({
+        where: { id },
+        data: { name, role, isActive, phone, allWarehouses: wh.allWarehouses! },
       });
-    }
-    // S1 shadow dual-write: синхронизировать UserRole с новой (единственной) ролью
-    await tx.userRole.deleteMany({ where: { userId: id, role: { not: role } } });
-    await tx.userRole.upsert({
-      where: { userId_role: { userId: id, role } },
-      create: { userId: id, role },
-      update: {},
+      await tx.userWarehouse.deleteMany({ where: { userId: id } });
+      if (!wh.allWarehouses && wh.ids!.length) {
+        await tx.userWarehouse.createMany({
+          data: wh.ids!.map((warehouseId) => ({ userId: id, warehouseId })),
+        });
+      }
+      // S1 shadow dual-write: синхронизировать UserRole с новой (единственной) ролью
+      await tx.userRole.deleteMany({ where: { userId: id, role: { not: role } } });
+      await tx.userRole.upsert({
+        where: { userId_role: { userId: id, role } },
+        create: { userId: id, role },
+        update: {},
+      });
     });
-  });
+  } catch (e) {
+    if (e instanceof LastAdminError)
+      return { error: "Нельзя оставить организацию без активного администратора" };
+    throw e;
+  }
   revalidatePath("/warehouse/employees");
   revalidatePath(`/warehouse/employees/${id}`);
   return {};
@@ -162,7 +189,7 @@ export async function issuePasswordLinkAction(userId: string): Promise<UserFormS
   const s = scoped(session);
   const user = await s.user(userId);
   const token = await createPasswordToken(user.id);
-  return { link: passwordLink(token) };
+  return { link: await passwordLink(token) };
 }
 
 // Перевыпуск QR-бейджа (старый код перестаёт действовать).

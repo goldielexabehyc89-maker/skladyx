@@ -1,11 +1,13 @@
-import { getSession } from "@/lib/session";
+import { redirect } from "next/navigation";
 import { navRole } from "@/lib/roles";
+import { currentSession } from "@/lib/tenant-auth";
 import { AppNav } from "@/components/app-nav";
 import { AppRealtimeProvider } from "@/components/app-realtime";
 
 export default async function AppLayout({ children }: { children: React.ReactNode }) {
-  const session = await getSession();
-  if (!session) return null; // middleware не пустит сюда без сессии
+  // S3: свежая проверка (host==company, isActive, роли). null — нет сессии/mismatch/блокировка.
+  const session = await currentSession();
+  if (!session) redirect("/login");
 
   // На десктопе сайдбар фиксирован, контент прокручивается в <main> — тогда
   // закреплённый (sticky) заголовок страниц-списков прилипает надёжно.

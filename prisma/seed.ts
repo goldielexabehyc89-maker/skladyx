@@ -32,7 +32,10 @@ async function main() {
     create: { name: companyName, slug: companySlug, settings: {} },
   });
 
-  const existingAdmin = await prisma.user.findUnique({ where: { email: adminEmail } });
+  // S3: поиск в пределах организации (phone/email больше не глобально-уникальны)
+  const existingAdmin = await prisma.user.findFirst({
+    where: { companyId: company.id, email: adminEmail },
+  });
   if (!existingAdmin) {
     await prisma.user.create({
       data: {
