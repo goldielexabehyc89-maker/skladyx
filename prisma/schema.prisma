@@ -172,8 +172,9 @@ model User {
   @@index([companyId])
 }
 
-// Этап 4B/S1: мультироли пользователя (теневая копия; авторизация ещё по User.role).
-// role/доступ пока читаются из User.role — UserRole наполняется backfill + dual-write.
+// Мультироли пользователя. При TENANT_AUTH=true авторизация читает свежие UserRole из БД на
+// каждый защищённый запрос (S3); User.role оставлен как compatibility-поле до cleanup (S6).
+// Этап 5: сюда входят рабочие роли РостАгро (RECEIVER/LOADER/PICKER/CONTROLLER/OBSERVER).
 // См. docs/MULTITENANT_SECURITY_DESIGN.md.
 model UserRole {
   id     String @id @default(cuid())

@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { requireStaffPage } from "@/lib/auth";
+import { requireWarehouseViewerPage } from "@/lib/auth";
 import { scoped } from "@/lib/tenant";
 import { allowedWarehouses, warehouseAccess, isWhAllowed } from "@/lib/warehouse-access";
 import { prisma } from "@/lib/db";
@@ -18,7 +18,7 @@ export default async function StockPage({
 }: {
   searchParams: Promise<{ warehouse?: string; zone?: string; problem?: string; grouped?: string; q?: string; page?: string }>;
 }) {
-  const session = await requireStaffPage();
+  const session = await requireWarehouseViewerPage();
   const s = scoped(session);
   const sp = await searchParams;
   const access = await warehouseAccess(session);

@@ -69,7 +69,7 @@ async function submit(cookie: string, path: string, marker: string, values: [str
 let companyId = "";
 let demoId = "";
 let w1 = "", w2 = "";
-const IDS = ["s5_worker", "s5_admin", "s5_keeper", "s5_emp", "s5_probe", "s5_d_a1", "s5_d_a2", "s5_d_user"];
+const IDS = ["s5_worker", "s5_admin", "s5_keeper", "s5_emp", "s5_probe", "s5_observer", "s5_adminwork", "s5_d_a1", "s5_d_a2", "s5_d_user"];
 async function mkUser(id: string, cid: string, phone: string, roles: Role[], compat: Role, allWh: boolean, whIds: string[] = []) {
   await prisma.user.deleteMany({ where: { id } });
   await prisma.user.create({
@@ -108,6 +108,8 @@ async function provision() {
   await mkUser("s5_admin", companyId, "+79995551002", ["ADMIN"], "ADMIN", true);
   await mkUser("s5_keeper", companyId, "+79995551003", ["STOREKEEPER"], "STOREKEEPER", true);
   await mkUser("s5_emp", companyId, "+79995551004", ["EMPLOYEE"], "EMPLOYEE", true);
+  await mkUser("s5_observer", companyId, "+79995551005", ["OBSERVER"], "OBSERVER", true);
+  await mkUser("s5_adminwork", companyId, "+79995551006", ["ADMIN", "RECEIVER"], "ADMIN", true);
   // demo: 2 админа (last-admin concurrency) + пользователь со сменой (tenant isolation)
   const demo = await prisma.company.upsert({ where: { slug: "demo" }, update: {}, create: { name: "Demo", slug: "demo", settings: {} } });
   demoId = demo.id;
@@ -202,6 +204,32 @@ async function main() {
   ok("legacy employee: вход", (await login("+79995551004")).includes("skx_session="));
   const empCookie = await login("+79995551004");
   ok("employee: /warehouse → 307 (роутинг работает)", [302, 307].includes((await req("GET", "/warehouse", { cookie: empCookie })).status));
+
+  console.log("9) навигация и read-only доступ (коррекция P1/P2)");
+  const loc = (r: Resp) => (r.headers["location"] as string) || "";
+  // OBSERVER: /warehouse → stock без цикла; stock/history доступны; операции/админ — нет
+  const obs = await login("+79995551005");
+  const obsHome = await req("GET", "/warehouse", { cookie: obs });
+  ok("OBSERVER: /warehouse → /warehouse/stock (без цикла)", [302, 307].includes(obsHome.status) && /\/warehouse\/stock/.test(loc(obsHome)));
+  ok("OBSERVER: /warehouse/stock = 200", (await req("GET", "/warehouse/stock", { cookie: obs })).status === 200);
+  ok("OBSERVER: /warehouse/history = 200", (await req("GET", "/warehouse/history", { cookie: obs })).status === 200);
+  ok("OBSERVER: /warehouse/orders НЕ 200 (админ)", (await req("GET", "/warehouse/orders", { cookie: obs })).status !== 200);
+  ok("OBSERVER: /warehouse/receipts НЕ 200 (операции)", (await req("GET", "/warehouse/receipts", { cookie: obs })).status !== 200);
+  // рабочая роль: stock доступен, старые операции STOREKEEPER — нет
+  const wk2 = await login("+79995551001");
+  ok("рабочий: /warehouse/stock = 200", (await req("GET", "/warehouse/stock", { cookie: wk2 })).status === 200);
+  ok("рабочий: /warehouse/receipts НЕ 200 (старые операции)", (await req("GET", "/warehouse/receipts", { cookie: wk2 })).status !== 200);
+  ok("рабочий: /warehouse/transfers НЕ 200", (await req("GET", "/warehouse/transfers", { cookie: wk2 })).status !== 200);
+  // ADMIN + рабочая роль: пункт «Смена» в навигации
+  const aw = await login("+79995551006");
+  const awPage = await req("GET", "/warehouse/active", { cookie: aw });
+  ok("ADMIN+RECEIVER: «Смена» в навигации", awPage.status === 200 && awPage.body.includes('href="/warehouse/shift"'));
+  // ADMIN без рабочей роли: не принуждается к смене и не видит «Смена»
+  const ad2 = await login("+79995551002");
+  const adHome = await req("GET", "/warehouse", { cookie: ad2 });
+  ok("ADMIN без роли: /warehouse → active (не shift)", /\/warehouse\/active/.test(loc(adHome)));
+  const adPage = await req("GET", "/warehouse/active", { cookie: ad2 });
+  ok("ADMIN без роли: «Смена» НЕ показывается", adPage.status === 200 && !adPage.body.includes('href="/warehouse/shift"'));
 }
 
 main()

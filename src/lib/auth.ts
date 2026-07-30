@@ -5,7 +5,7 @@ import { prisma } from "@/lib/db";
 import { normalizePhone } from "@/lib/phone";
 import { setSession, clearSession, type SessionData, type Role } from "@/lib/session";
 import { sanitizeRoles } from "@/lib/jwt";
-import { hasRole, hasAnyRole, tenantAuthEnabled } from "@/lib/roles";
+import { hasRole, hasAnyRole, tenantAuthEnabled, isWarehouseViewer } from "@/lib/roles";
 import { currentSession, resolveHostCompany } from "@/lib/tenant-auth";
 
 export async function hashPassword(plain: string): Promise<string> {
@@ -100,5 +100,14 @@ export async function requireStaffPage(): Promise<SessionData> {
   const session = await currentSession();
   if (!session) redirect("/login");
   if (!hasAnyRole(session, ["ADMIN", "STOREKEEPER"])) redirect("/warehouse");
+  return session;
+}
+
+// Read-only просмотр (остатки/история): ADMIN/STOREKEEPER + новые роли + OBSERVER.
+// НЕ давать операционных прав — использовать только на read-only страницах.
+export async function requireWarehouseViewerPage(): Promise<SessionData> {
+  const session = await currentSession();
+  if (!session) redirect("/login");
+  if (!isWarehouseViewer(session)) redirect("/warehouse");
   return session;
 }

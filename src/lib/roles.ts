@@ -62,9 +62,24 @@ export function hasAnyRole(session: SessionData, roles: readonly Role[]): boolea
   return roles.some((r) => eff.includes(r));
 }
 
-// Складской персонал: админ или кладовщик.
+// Складской персонал: админ или кладовщик (старые операционные страницы).
 export function isStaff(session: SessionData): boolean {
   return hasAnyRole(session, ["ADMIN", "STOREKEEPER"]);
+}
+
+// Read-only просмотр склада (остатки/история): все роли, кроме чистого EMPLOYEE.
+// НЕ даёт операционных прав — только чтение (см. requireWarehouseViewerPage).
+export const VIEWER_ROLES: readonly Role[] = [
+  "ADMIN",
+  "STOREKEEPER",
+  "RECEIVER",
+  "LOADER",
+  "PICKER",
+  "CONTROLLER",
+  "OBSERVER",
+];
+export function isWarehouseViewer(session: SessionData): boolean {
+  return hasAnyRole(session, VIEWER_ROLES);
 }
 
 // Переходная навигационная роль: наивысшая по приоритету из эффективного набора.
