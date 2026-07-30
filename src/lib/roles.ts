@@ -46,6 +46,11 @@ export function tenantAuthEnabled(): boolean {
 export function workflowTasksEnabled(): boolean {
   return process.env.WORKFLOW_TASKS_ENABLED === "true";
 }
+// Этап 5/Пакет 3: зоны и уровни ячеек. false — карточка склада работает в прежнем режиме
+// (плоский список ячеек + переключатель «зона выдачи»); true — секции зон, уровни, смена зоны.
+export function warehouseZonesEnabled(): boolean {
+  return process.env.WAREHOUSE_ZONES_ENABLED === "true";
+}
 
 // Эффективный набор ролей.
 // При TENANT_AUTH=true роли всегда берутся из session.roles (их наполняет свежая

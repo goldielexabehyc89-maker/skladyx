@@ -128,6 +128,7 @@ model Company {
 
   users             User[]
   warehouses        Warehouse[]
+  warehouseZones    WarehouseZone[]
   items             Item[]
   uoms              Uom[]
   suppliers         Supplier[]
@@ -411,6 +412,7 @@ model Warehouse {
 
   company       Company         @relation(fields: [companyId], references: [id])
   cells         Cell[]
+  zones         WarehouseZone[]
   userLinks     UserWarehouse[]
   workShifts    WorkShift[]
   workflowTasks WorkflowTask[]
@@ -418,18 +420,60 @@ model Warehouse {
   @@index([companyId])
 }
 
+// Этап 5/Пакет 3: гибрид зон. Системный ZoneKind (стабильная логика) + настраиваемые
+// зоны организации (code/name). Виртуальные зоны (RECEIVING/CONTROL/DISCREPANCY) —
+// «одна большая ячейка», без физических Cell. Физические (STORAGE/COOLING/ISSUE/BUFFER)
+// содержат ячейки. BUFFER — физическая ячейка, а не виртуальная зона.
+enum ZoneKind {
+  RECEIVING
+  STORAGE
+  COOLING
+  CONTROL
+  ISSUE
+  DISCREPANCY
+  BUFFER
+}
+
+model WarehouseZone {
+  id          String   @id @default(cuid())
+  companyId   String
+  warehouseId String
+  code        String
+  name        String
+  kind        ZoneKind
+  isActive    Boolean  @default(true)
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+
+  company   Company   @relation(fields: [companyId], references: [id])
+  warehouse Warehouse @relation(fields: [warehouseId], references: [id])
+  cells     Cell[]
+
+  @@unique([warehouseId, code])
+  @@index([companyId])
+  @@index([warehouseId])
+  @@index([kind])
+}
+
 model Cell {
   id          String  @id @default(cuid())
   companyId   String
   warehouseId String
   code        String // "А-01-02"
-  isStaging   Boolean @default(false) // ячейка зоны выдачи собранных заявок
+  // Пакет 3: зона + уровень. zoneId/level nullable на период миграции; для новых
+  // физических ячеек зона обязательна (проверка в actions), у STORAGE — уровень >= 1.
+  // isStaging пока не удаляем: синхронизируется с зоной ISSUE (обратная совместимость).
+  zoneId      String?
+  level       Int? // уровень стеллажа: 1 — нижний; для STORAGE обязателен
+  isStaging   Boolean @default(false) // ячейка зоны выдачи собранных заявок (= зона ISSUE)
   isActive    Boolean @default(true)
 
-  warehouse Warehouse @relation(fields: [warehouseId], references: [id])
+  warehouse Warehouse      @relation(fields: [warehouseId], references: [id])
+  zone      WarehouseZone? @relation(fields: [zoneId], references: [id])
 
   @@unique([warehouseId, code])
   @@index([companyId])
+  @@index([zoneId])
 }
 
 model Uom {

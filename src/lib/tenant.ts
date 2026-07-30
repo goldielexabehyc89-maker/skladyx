@@ -65,6 +65,14 @@ export function scoped(session: SessionData) {
       });
     },
 
+    // Этап 5/Пакет 3: зоны склада (в порядке отображения).
+    zones(warehouseId: string) {
+      return prisma.warehouseZone.findMany({
+        where: { companyId, warehouseId },
+        orderBy: [{ sortOrder: "asc" }, { createdAt: "asc" }],
+      });
+    },
+
     async cell(cellId: string) {
       const c = await prisma.cell.findFirst({ where: { id: cellId, companyId } });
       if (!c) throw new CompanyForbiddenError();

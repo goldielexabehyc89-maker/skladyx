@@ -10,6 +10,17 @@ import { warehouseAccess, isWhAllowed } from "@/lib/warehouse-access";
 import { logEvent } from "@/lib/events";
 import { broadcastRealtime } from "@/lib/realtime";
 import { createQrIn } from "@/lib/qr";
+import { warehouseZonesEnabled } from "@/lib/roles";
+import {
+  ensureStandardZones,
+  createCellsInZone,
+  changeCellZone,
+  renameZone,
+  addPhysicalZone,
+  cellErrorMessage,
+} from "@/lib/cells";
+import { isPhysicalZoneKind } from "@/lib/zones";
+import type { ZoneKind } from "@prisma/client";
 
 export interface FormState {
   error?: string;
@@ -38,6 +49,8 @@ export async function createWarehouseAction(
   const warehouse = await prisma.warehouse.create({
     data: { companyId: s.companyId, name: parsed.data.name, address: parsed.data.address },
   });
+  // Пакет 3: у каждого склада есть стандартные зоны (данные консистентны независимо от флага UI).
+  await ensureStandardZones(s.companyId, warehouse.id);
   await logEvent({
     companyId: s.companyId,
     type: "warehouse_created",
@@ -113,26 +126,38 @@ export async function createCellsAction(_prev: FormState, formData: FormData): P
   if (to < from) return { error: "Конец диапазона меньше начала" };
   if (to - from + 1 > 500) return { error: "Не больше 500 ячеек за раз" };
 
-  const isStaging = formData.get("isStaging") === "on";
   const pad = String(to).length > 2 ? String(to).length : 2;
   const codes: string[] = [];
   for (let i = from; i <= to; i++) codes.push(`${prefix}${String(i).padStart(pad, "0")}`);
 
-  const created = await prisma.$transaction(async (tx) => {
-    let count = 0;
-    for (const code of codes) {
-      const exists = await tx.cell.findUnique({
-        where: { warehouseId_code: { warehouseId, code } },
-      });
-      if (exists) continue;
-      const cell = await tx.cell.create({
-        data: { companyId: s.companyId, warehouseId, code, isStaging },
-      });
-      await createQrIn(tx, { companyId: s.companyId, type: "CELL", refId: cell.id });
-      count++;
+  let created = 0;
+  if (warehouseZonesEnabled()) {
+    // Пакет 3: ячейки создаются в выбранной физической зоне; для STORAGE обязателен уровень.
+    const zoneId = String(formData.get("zoneId") ?? "");
+    if (!zoneId) return { error: "Выберите зону для ячеек" };
+    const levelRaw = String(formData.get("level") ?? "").trim();
+    const level = levelRaw ? Number(levelRaw) : null;
+    if (levelRaw && (!Number.isInteger(level) || (level as number) < 1))
+      return { error: "Уровень должен быть целым числом ≥ 1" };
+    try {
+      created = await createCellsInZone({ companyId: s.companyId, warehouseId, zoneId, codes, level });
+    } catch (e) {
+      return { error: cellErrorMessage(e) };
     }
-    return count;
-  });
+  } else {
+    const isStaging = formData.get("isStaging") === "on";
+    created = await prisma.$transaction(async (tx) => {
+      let count = 0;
+      for (const code of codes) {
+        const exists = await tx.cell.findUnique({ where: { warehouseId_code: { warehouseId, code } } });
+        if (exists) continue;
+        const cell = await tx.cell.create({ data: { companyId: s.companyId, warehouseId, code, isStaging } });
+        await createQrIn(tx, { companyId: s.companyId, type: "CELL", refId: cell.id });
+        count++;
+      }
+      return count;
+    });
+  }
 
   if (created === 0) return { error: "Все ячейки диапазона уже существуют" };
   broadcastRealtime({
@@ -180,4 +205,68 @@ export async function toggleCellActiveAction(formData: FormData): Promise<void> 
     actorUserId: session.userId,
   });
   revalidatePath(`/warehouse/warehouses/${cell.warehouseId}`);
+}
+
+// ── Пакет 3: зоны ──
+
+// Перенести ячейку в другую физическую зону (замена «сделать зоной выдачи»).
+export async function changeCellZoneAction(_prev: FormState, formData: FormData): Promise<FormState> {
+  const session = await requireAdmin();
+  const s = scoped(session);
+  const cellId = String(formData.get("cellId") ?? "");
+  const zoneId = String(formData.get("zoneId") ?? "");
+  if (!zoneId) return { error: "Выберите зону" };
+  const levelRaw = String(formData.get("level") ?? "").trim();
+  const level = levelRaw ? Number(levelRaw) : null;
+  if (levelRaw && (!Number.isInteger(level) || (level as number) < 1))
+    return { error: "Уровень должен быть целым ≥ 1" };
+  const cell = await s.cell(cellId);
+  if (!isWhAllowed(await warehouseAccess(session), cell.warehouseId)) return { error: "Нет доступа к складу" };
+  try {
+    await changeCellZone({ companyId: s.companyId, cellId, zoneId, level });
+  } catch (e) {
+    return { error: cellErrorMessage(e) };
+  }
+  broadcastRealtime({
+    type: "cell.updated",
+    entity: "cell",
+    entityId: cellId,
+    companyId: s.companyId,
+    warehouseIds: [cell.warehouseId],
+    actorUserId: session.userId,
+  });
+  revalidatePath(`/warehouse/warehouses/${cell.warehouseId}`);
+  return {};
+}
+
+// Переименовать зону (названия зон настраиваются организацией). Плоское form-действие.
+export async function renameZoneAction(formData: FormData): Promise<void> {
+  const session = await requireAdmin();
+  const s = scoped(session);
+  const zoneId = String(formData.get("zoneId") ?? "");
+  const name = String(formData.get("name") ?? "").trim();
+  if (!name) return;
+  const zone = await prisma.warehouseZone.findFirst({ where: { id: zoneId, companyId: s.companyId } });
+  if (!zone) return;
+  if (!isWhAllowed(await warehouseAccess(session), zone.warehouseId)) return;
+  await renameZone(s.companyId, zoneId, name);
+  revalidatePath(`/warehouse/warehouses/${zone.warehouseId}`);
+}
+
+// Добавить дополнительную физическую зону (допускается несколько зон одного kind).
+export async function addZoneAction(_prev: FormState, formData: FormData): Promise<FormState> {
+  const session = await requireAdmin();
+  const s = scoped(session);
+  const warehouseId = String(formData.get("warehouseId") ?? "");
+  await s.warehouse(warehouseId);
+  if (!isWhAllowed(await warehouseAccess(session), warehouseId)) return { error: "Нет доступа к складу" };
+  const kind = String(formData.get("kind") ?? "") as ZoneKind;
+  if (!isPhysicalZoneKind(kind)) return { error: "Добавлять можно только физические зоны" };
+  try {
+    await addPhysicalZone({ companyId: s.companyId, warehouseId, kind, name: String(formData.get("name") ?? "") });
+  } catch (e) {
+    return { error: cellErrorMessage(e) };
+  }
+  revalidatePath(`/warehouse/warehouses/${warehouseId}`);
+  return {};
 }

@@ -4,6 +4,8 @@ import { redirect } from "next/navigation";
 import { requireStaffPage } from "@/lib/auth";
 import { scoped } from "@/lib/tenant";
 import { warehouseAccess, isWhAllowed } from "@/lib/warehouse-access";
+import { warehouseZonesEnabled } from "@/lib/roles";
+import { ZONE_KIND_TONE } from "@/lib/zones";
 import { prisma } from "@/lib/db";
 import { PageShell } from "@/components/page-shell";
 import { Badge, Card, CardTitle, DownloadButton, EmptyState, LinkButton } from "@/components/ui";
@@ -17,8 +19,9 @@ export default async function CellPage({ params }: { params: Promise<{ id: strin
   const { id } = await params;
   const cell = await prisma.cell.findFirst({
     where: { id, companyId: s.companyId },
-    include: { warehouse: true },
+    include: { warehouse: true, zone: true },
   });
+  const zonesOn = warehouseZonesEnabled();
   if (!cell) return <EmptyState>Ячейка не найдена.</EmptyState>;
   if (!isWhAllowed(await warehouseAccess(session), cell.warehouseId)) redirect("/warehouse");
 
@@ -122,9 +125,16 @@ export default async function CellPage({ params }: { params: Promise<{ id: strin
             <div className="mt-1.5 text-sm text-neutral-500">{cell.warehouse.name}</div>
           </div>
           <div className="flex flex-col items-end gap-1.5">
-            <Badge tone={cell.isStaging ? "blue" : "neutral"}>
-              {cell.isStaging ? "зона выдачи" : "ячейка хранения"}
-            </Badge>
+            {zonesOn && cell.zone ? (
+              <Badge tone={ZONE_KIND_TONE[cell.zone.kind]}>
+                {cell.zone.name}
+                {cell.level != null ? ` · ур. ${cell.level}` : ""}
+              </Badge>
+            ) : (
+              <Badge tone={cell.isStaging ? "blue" : "neutral"}>
+                {cell.isStaging ? "зона выдачи" : "ячейка хранения"}
+              </Badge>
+            )}
             {!cell.isActive && <Badge tone="red">отключена</Badge>}
           </div>
         </div>
