@@ -12,7 +12,7 @@ import { broadcastRealtime } from "@/lib/realtime";
 import { createQrIn } from "@/lib/qr";
 import { warehouseZonesEnabled } from "@/lib/roles";
 import {
-  ensureStandardZones,
+  createStandardZonesInTx,
   createCellsInZone,
   changeCellZone,
   renameZone,
@@ -46,11 +46,15 @@ export async function createWarehouseAction(
   if (!(await warehouseAccess(session)).all)
     return { error: "Создавать склады может только пользователь с доступом ко всем складам" };
 
-  const warehouse = await prisma.warehouse.create({
-    data: { companyId: s.companyId, name: parsed.data.name, address: parsed.data.address },
+  // Пакет 3: склад и 7 стандартных зон создаём в ОДНОЙ транзакции — при ошибке зон
+  // склад не должен остаться без зон (атомарность).
+  const warehouse = await prisma.$transaction(async (tx) => {
+    const w = await tx.warehouse.create({
+      data: { companyId: s.companyId, name: parsed.data.name, address: parsed.data.address },
+    });
+    await createStandardZonesInTx(tx, s.companyId, w.id);
+    return w;
   });
-  // Пакет 3: у каждого склада есть стандартные зоны (данные консистентны независимо от флага UI).
-  await ensureStandardZones(s.companyId, warehouse.id);
   await logEvent({
     companyId: s.companyId,
     type: "warehouse_created",
@@ -172,6 +176,9 @@ export async function createCellsAction(_prev: FormState, formData: FormData): P
 }
 
 export async function toggleCellStagingAction(formData: FormData): Promise<void> {
+  // Пакет 3: в режиме зон «зона выдачи» задаётся сменой зоны (changeCellZone), а не этим
+  // тумблером. No-op — защита от старой вкладки, открытой до включения флага.
+  if (warehouseZonesEnabled()) return;
   const session = await requireAdmin();
   const s = scoped(session);
   const cellId = String(formData.get("cellId") ?? "");

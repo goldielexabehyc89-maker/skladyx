@@ -23,6 +23,7 @@ export function ZoneCellTile({
     code: string;
     level: number | null;
     isActive: boolean;
+    zoneId: string | null;
     zoneName: string | null;
     zoneKind: ZoneKind | null;
   };
@@ -30,7 +31,11 @@ export function ZoneCellTile({
 }) {
   const [open, setOpen] = useState(false);
   const [state, action, pending] = useActionState<FormState, FormData>(changeCellZoneAction, {});
-  const [zoneId, setZoneId] = useState(zones[0]?.id ?? "");
+  // Выбор по умолчанию — фактическая зона ячейки (если она физическая и есть в списке),
+  // иначе первая доступная. Так форма открывается на настоящей зоне, а не на zones[0].
+  const initialZoneId =
+    cell.zoneId && zones.some((z) => z.id === cell.zoneId) ? cell.zoneId : (zones[0]?.id ?? "");
+  const [zoneId, setZoneId] = useState(initialZoneId);
   const selKind = zones.find((z) => z.id === zoneId)?.kind ?? null;
 
   return (

@@ -14,19 +14,27 @@ import {
 
 export class CellError extends Error {}
 
-// Создать стандартные зоны склада (идемпотентно). Для новых складов и как страховка.
-export async function ensureStandardZones(companyId: string, warehouseId: string): Promise<void> {
-  await prisma.$transaction(async (tx) => {
-    for (const z of STANDARD_ZONES) {
-      const exists = await tx.warehouseZone.findUnique({
-        where: { warehouseId_code: { warehouseId, code: z.code } },
+// Создать стандартные зоны склада в ПЕРЕДАННОЙ транзакции (идемпотентно).
+// Используется при атомарном создании склада (склад + 7 зон в одной транзакции).
+export async function createStandardZonesInTx(
+  tx: Prisma.TransactionClient,
+  companyId: string,
+  warehouseId: string,
+): Promise<void> {
+  for (const z of STANDARD_ZONES) {
+    const exists = await tx.warehouseZone.findUnique({
+      where: { warehouseId_code: { warehouseId, code: z.code } },
+    });
+    if (!exists)
+      await tx.warehouseZone.create({
+        data: { companyId, warehouseId, code: z.code, name: z.name, kind: z.kind, sortOrder: z.sortOrder },
       });
-      if (!exists)
-        await tx.warehouseZone.create({
-          data: { companyId, warehouseId, code: z.code, name: z.name, kind: z.kind, sortOrder: z.sortOrder },
-        });
-    }
-  });
+  }
+}
+
+// Создать стандартные зоны склада (идемпотентно, собственная транзакция).
+export async function ensureStandardZones(companyId: string, warehouseId: string): Promise<void> {
+  await prisma.$transaction((tx) => createStandardZonesInTx(tx, companyId, warehouseId));
 }
 
 // Массовое создание ячеек в физической зоне. Виртуальная зона запрещена; для STORAGE уровень >= 1.
@@ -72,6 +80,15 @@ export async function changeCellZone(input: {
   return prisma.$transaction(async (tx) => {
     const cell = await tx.cell.findFirst({ where: { id: input.cellId, companyId: input.companyId } });
     if (!cell) throw new CellError("Ячейка не найдена");
+    // Занятую ячейку переносить нельзя: сначала переместить товар через ядро остатков.
+    // Занята, если есть партионный остаток (StockBalance qty>0) ИЛИ поштучная единица (ItemUnit)
+    // с этим cellId (moveUnit обнуляет cellId при выходе — остаются только физически лежащие).
+    const [lotHere, unitHere] = await Promise.all([
+      tx.stockBalance.findFirst({ where: { cellId: cell.id, qty: { gt: 0 } }, select: { id: true } }),
+      tx.itemUnit.findFirst({ where: { cellId: cell.id }, select: { id: true } }),
+    ]);
+    if (lotHere || unitHere)
+      throw new CellError("Нельзя изменить зону занятой ячейки. Сначала переместите товар");
     const zone = await tx.warehouseZone.findFirst({
       where: { id: input.zoneId, companyId: input.companyId, warehouseId: cell.warehouseId },
     });

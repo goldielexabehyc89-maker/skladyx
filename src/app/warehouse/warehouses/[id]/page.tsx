@@ -87,6 +87,7 @@ export default async function WarehousePage({ params }: { params: Promise<{ id: 
                           code: c.code,
                           level: c.level,
                           isActive: c.isActive,
+                          zoneId: c.zoneId,
                           zoneName: z.name,
                           zoneKind: z.kind,
                         }}
@@ -112,7 +113,7 @@ export default async function WarehousePage({ params }: { params: Promise<{ id: 
                 {orphan.map((c) => (
                   <ZoneCellTile
                     key={c.id}
-                    cell={{ id: c.id, code: c.code, level: c.level, isActive: c.isActive, zoneName: null, zoneKind: null }}
+                    cell={{ id: c.id, code: c.code, level: c.level, isActive: c.isActive, zoneId: c.zoneId, zoneName: null, zoneKind: null }}
                     zones={physOpts}
                   />
                 ))}
