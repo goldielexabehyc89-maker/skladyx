@@ -6,7 +6,8 @@ import { prisma } from "@/lib/db";
 import { requireUser } from "@/lib/auth";
 import { scoped } from "@/lib/tenant";
 import { warehouseAccess, isWhAllowed } from "@/lib/warehouse-access";
-import { isWorkRole } from "@/lib/roles";
+import { isWorkRole, workflowTasksEnabled } from "@/lib/roles";
+import { rebalanceQueuedTasks } from "@/lib/workflow-tasks";
 import type { Role } from "@/lib/jwt";
 
 export interface ShiftState {
@@ -14,6 +15,7 @@ export interface ShiftState {
 }
 
 class ShiftConflict extends Error {}
+class ShiftBlockedByTask extends Error {}
 
 // Начать смену: выбрать ОДНУ рабочую роль + доступный склад. Условия:
 // пользователь активен; роль назначена в UserRole; роль ∈ {RECEIVER,LOADER,PICKER,CONTROLLER};
@@ -63,21 +65,54 @@ export async function startWorkShiftAction(_prev: ShiftState, formData: FormData
       return { error: "У вас уже есть активная смена" };
     throw e;
   }
+  // Пакет 2: раздать подходящие QUEUED-задачи новой смене.
+  if (workflowTasksEnabled()) await rebalanceQueuedTasks(s.companyId, { warehouseId, role });
   revalidatePath("/warehouse/shift");
+  revalidatePath("/warehouse/tasks");
   revalidatePath("/warehouse/employees");
   return {};
 }
 
-// Завершить текущую смену. Пакет 1: без проверки взятого товара и возврата задач
-// (модели задач ещё нет — это следующий пакет).
+// Завершить текущую смену. Пакет 2: назначенные, но не начатые задачи (ASSIGNED) вернуть
+// в очередь и перераспределить; IN_PROGRESS/HANDOFF_PENDING блокируют завершение — сначала
+// завершите задачу или передайте её.
 export async function endWorkShiftAction(_prev: ShiftState, _formData: FormData): Promise<ShiftState> {
   const session = await requireUser();
-  const res = await prisma.workShift.updateMany({
-    where: { userId: session.userId, companyId: session.companyId, endedAt: null },
-    data: { endedAt: new Date() },
+  const s = scoped(session);
+  const shift = await prisma.workShift.findFirst({
+    where: { userId: session.userId, companyId: s.companyId, endedAt: null },
   });
-  if (res.count === 0) return { error: "Активной смены нет" };
+  if (!shift) return { error: "Активной смены нет" };
+
+  if (!workflowTasksEnabled()) {
+    await prisma.workShift.update({ where: { id: shift.id }, data: { endedAt: new Date() } });
+    revalidatePath("/warehouse/shift");
+    revalidatePath("/warehouse/employees");
+    return {};
+  }
+
+  try {
+    await prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext('skladyx:tasks'), hashtext(${s.companyId}))`;
+      const blocking = await tx.workflowTask.count({
+        where: { assignedShiftId: shift.id, status: { in: ["IN_PROGRESS", "HANDOFF_PENDING"] } },
+      });
+      if (blocking > 0) throw new ShiftBlockedByTask();
+      await tx.workflowTask.updateMany({
+        where: { assignedShiftId: shift.id, status: "ASSIGNED" },
+        data: { status: "QUEUED", assignedUserId: null, assignedShiftId: null, assignedAt: null },
+      });
+      await tx.workShift.update({ where: { id: shift.id }, data: { endedAt: new Date() } });
+    });
+  } catch (e) {
+    if (e instanceof ShiftBlockedByTask)
+      return { error: "Есть задача в работе или ожидающая передачи. Завершите задачу или передайте её, затем закройте смену." };
+    throw e;
+  }
+  // перераспределить возвращённые задачи между оставшимися сменами
+  await rebalanceQueuedTasks(s.companyId, { warehouseId: shift.warehouseId, role: shift.role });
   revalidatePath("/warehouse/shift");
+  revalidatePath("/warehouse/tasks");
   revalidatePath("/warehouse/employees");
   return {};
 }

@@ -28,7 +28,20 @@ export type EventType =
   | "picklist_deleted"
   | "transfer_deleted"
   | "writeoff_deleted"
-  | "inventory_deleted";
+  | "inventory_deleted"
+  // Этап 5/Пакет 2: задачи очереди
+  | "task_created"
+  | "task_assigned"
+  | "task_started"
+  | "task_completed"
+  | "task_cancelled"
+  | "task_returned"
+  | "task_unblocked"
+  | "task_needs_attention"
+  | "task_skipped"
+  | "task_handoff_requested"
+  | "task_handoff_accepted"
+  | "task_handoff_rejected";
 
 // Карта «событие журнала → realtime-сущность и действие» для онлайн-обновлений.
 // stock: true — изменение затрагивает остатки, клиентам дополнительно уходит stock.updated.
@@ -54,6 +67,18 @@ const REALTIME_MAP: Record<EventType, { entity: RealtimeEntity; action: string; 
   transfer_deleted: { entity: "transfer", action: "deleted", stock: true },
   writeoff_deleted: { entity: "writeoff", action: "deleted", stock: true },
   inventory_deleted: { entity: "inventory", action: "deleted", stock: true },
+  task_created: { entity: "task", action: "created" },
+  task_assigned: { entity: "task", action: "updated" },
+  task_started: { entity: "task", action: "updated" },
+  task_completed: { entity: "task", action: "updated" },
+  task_cancelled: { entity: "task", action: "updated" },
+  task_returned: { entity: "task", action: "updated" },
+  task_unblocked: { entity: "task", action: "updated" },
+  task_needs_attention: { entity: "task", action: "updated" },
+  task_skipped: { entity: "task", action: "updated" },
+  task_handoff_requested: { entity: "task", action: "updated" },
+  task_handoff_accepted: { entity: "task", action: "updated" },
+  task_handoff_rejected: { entity: "task", action: "updated" },
 };
 
 export async function logEvent(args: {

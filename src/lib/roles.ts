@@ -42,6 +42,10 @@ export function rolesDualReadEnabled(): boolean {
 export function tenantAuthEnabled(): boolean {
   return process.env.TENANT_AUTH === "true";
 }
+// Этап 5/Пакет 2: очередь задач. false — пункт меню скрыт, действия очереди запрещены.
+export function workflowTasksEnabled(): boolean {
+  return process.env.WORKFLOW_TASKS_ENABLED === "true";
+}
 
 // Эффективный набор ролей.
 // При TENANT_AUTH=true роли всегда берутся из session.roles (их наполняет свежая

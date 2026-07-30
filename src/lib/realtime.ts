@@ -24,6 +24,7 @@ export type RealtimeEntity =
   | "item"
   | "warehouse"
   | "employee"
+  | "task"
   | "attention";
 
 export interface RealtimeEvent {

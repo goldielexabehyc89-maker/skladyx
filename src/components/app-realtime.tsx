@@ -47,6 +47,7 @@ function isRelevant(path: string, ev: RtEvent): boolean {
   if (path.startsWith("/warehouse/inventories")) return e === "inventory";
   if (path.startsWith("/warehouse/items")) return ["item", "stock"].includes(e);
   if (path.startsWith("/warehouse/employees")) return e === "employee";
+  if (path.startsWith("/warehouse/tasks")) return e === "task";
   if (path.startsWith("/warehouse/suppliers")) return false;
   if (path.startsWith("/warehouse/settings") || path.startsWith("/warehouse/more")) return false;
   return true;

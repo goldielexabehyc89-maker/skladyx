@@ -142,6 +142,7 @@ model Company {
   qrCodes           QrCode[]
   pushSubscriptions PushSubscription[]
   workShifts        WorkShift[]
+  workflowTasks     WorkflowTask[]
 }
 
 model User {
@@ -165,6 +166,7 @@ model User {
   warehouseLinks UserWarehouse[]
   userRoles      UserRole[]
   workShifts     WorkShift[]
+  assignedTasks  WorkflowTask[]  @relation("userTasks")
 
   // S3 per-tenant identity: телефон/email уникальны в пределах организации.
   @@unique([companyId, phone])
@@ -205,11 +207,117 @@ model WorkShift {
   user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
   warehouse Warehouse @relation(fields: [warehouseId], references: [id])
 
+  assignedTasks WorkflowTask[] @relation("shiftTasks")
+  handoffsFrom  TaskHandoff[]  @relation("handoffFrom")
+  handoffsTo    TaskHandoff[]  @relation("handoffTo")
+
   @@index([companyId])
   @@index([userId])
   @@index([warehouseId])
   @@index([role])
   @@index([endedAt])
+}
+
+// Этап 5/Пакет 2: очередь задач РостАгро. Задача не двигает остаток сама — это делают
+// будущие доменные обработчики (completeWorkflowTaskInTransaction). См. ROSTAGRO_MIGRATION_DESIGN §2.2.
+enum TaskPriority {
+  NORMAL
+  URGENT
+}
+
+enum TaskStatus {
+  BLOCKED // ждёт выполнения зависимостей
+  QUEUED // в очереди, не назначена
+  ASSIGNED // назначена сотруднику активной смены, ещё не начата
+  IN_PROGRESS // взята в работу (не более одной на пользователя — partial unique)
+  HANDOFF_PENDING // ожидает принятия передачи другой сменой
+  NEEDS_ATTENTION // невозможно выполнить, требует вмешательства
+  COMPLETED
+  CANCELLED
+}
+
+enum HandoffStatus {
+  PENDING
+  ACCEPTED
+  REJECTED
+  CANCELLED
+}
+
+model WorkflowTask {
+  id           String       @id @default(cuid())
+  companyId    String
+  warehouseId  String
+  type         String // строковый код из src/lib/workflow-task-types.ts
+  requiredRole Role
+  priority     TaskPriority @default(NORMAL)
+  status       TaskStatus   @default(QUEUED)
+  title        String
+  description  String?
+  actionUrl    String?
+  subjectType  String?
+  subjectId    String?
+  dedupeKey    String
+  loadUnits    Int          @default(1) // единиц нагрузки (>=1, CHECK в миграции)
+
+  assignedUserId  String?
+  assignedShiftId String?
+
+  createdAt   DateTime  @default(now())
+  assignedAt  DateTime?
+  startedAt   DateTime?
+  completedAt DateTime?
+  cancelledAt DateTime?
+  updatedAt   DateTime  @updatedAt
+
+  company       Company    @relation(fields: [companyId], references: [id])
+  warehouse     Warehouse  @relation(fields: [warehouseId], references: [id])
+  assignedUser  User?      @relation("userTasks", fields: [assignedUserId], references: [id])
+  assignedShift WorkShift? @relation("shiftTasks", fields: [assignedShiftId], references: [id])
+
+  dependencies TaskDependency[] @relation("taskDeps") // на что эта задача ссылается (зависит)
+  dependents   TaskDependency[] @relation("taskDependsOn") // кто зависит от этой задачи
+  handoffs     TaskHandoff[]
+
+  @@unique([companyId, dedupeKey])
+  @@index([companyId])
+  @@index([warehouseId])
+  @@index([status])
+  @@index([requiredRole])
+  @@index([assignedUserId])
+  @@index([assignedShiftId])
+}
+
+// Зависимости задач: задача BLOCKED → QUEUED, когда все её зависимости COMPLETED.
+model TaskDependency {
+  id              String @id @default(cuid())
+  taskId          String
+  dependsOnTaskId String
+
+  task      WorkflowTask @relation("taskDeps", fields: [taskId], references: [id], onDelete: Cascade)
+  dependsOn WorkflowTask @relation("taskDependsOn", fields: [dependsOnTaskId], references: [id], onDelete: Cascade)
+
+  @@unique([taskId, dependsOnTaskId])
+  @@index([dependsOnTaskId])
+}
+
+// Передача задачи между сменами (двойное подтверждение: запрос + принятие).
+// Только одна активная (PENDING) передача на задачу — partial unique в миграции.
+model TaskHandoff {
+  id          String        @id @default(cuid())
+  taskId      String
+  fromShiftId String
+  toShiftId   String
+  status      HandoffStatus @default(PENDING)
+  requestedAt DateTime      @default(now())
+  respondedAt DateTime?
+
+  task      WorkflowTask @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  fromShift WorkShift    @relation("handoffFrom", fields: [fromShiftId], references: [id])
+  toShift   WorkShift    @relation("handoffTo", fields: [toShiftId], references: [id])
+
+  @@index([taskId])
+  @@index([toShiftId])
+  @@index([status])
 }
 
 // Привязка пользователя к складам (когда allWarehouses = false).
@@ -301,10 +409,11 @@ model Warehouse {
   sortOrder Int      @default(0)
   createdAt DateTime @default(now())
 
-  company    Company         @relation(fields: [companyId], references: [id])
-  cells      Cell[]
-  userLinks  UserWarehouse[]
-  workShifts WorkShift[]
+  company       Company         @relation(fields: [companyId], references: [id])
+  cells         Cell[]
+  userLinks     UserWarehouse[]
+  workShifts    WorkShift[]
+  workflowTasks WorkflowTask[]
 
   @@index([companyId])
 }

@@ -16,6 +16,7 @@ import {
   History,
   Inbox,
   ListChecks,
+  ListTodo,
   Menu,
   Package,
   ScanLine,
@@ -65,18 +66,19 @@ const FEED: NavItem = { href: "/warehouse/feed", label: "Лента событи
 const SETTINGS: NavItem = { href: "/warehouse/settings", label: "Настройки", icon: Settings };
 const MY: NavItem = { href: "/warehouse/my", label: "Мои ТМЦ", icon: Briefcase };
 const SHIFT: NavItem = { href: "/warehouse/shift", label: "Смена", icon: Clock };
+const TASKS: NavItem = { href: "/warehouse/tasks", label: "Задачи", icon: ListTodo };
 
 const WORK_ROLES = ["RECEIVER", "LOADER", "PICKER", "CONTROLLER"] as const;
 
 // role — переходная навигационная роль (профиль меню); canStartShift — есть ли у пользователя
-// рабочая роль (тогда даже у ADMIN показываем «Смену»).
-function groupsFor(role: Role, canStartShift: boolean): NavGroup[] {
+// рабочая роль (тогда даже у ADMIN показываем «Смену»); tasksEnabled — флаг очереди задач.
+function groupsFor(role: Role, canStartShift: boolean, tasksEnabled: boolean): NavGroup[] {
   if (role === "ADMIN")
     return [
       { title: "Работа", items: [ACTIVE, SCAN, RECEIPTS, STAGING, ...(canStartShift ? [SHIFT] : [])] },
       { title: "Документы", items: [ORDERS, PICKLISTS, TRANSFERS, ISSUES, WRITEOFFS, INVENTORIES] },
       { title: "Справочники", items: [STOCK, ITEMS, WAREHOUSES, SUPPLIERS, EMPLOYEES] },
-      { title: "Контроль", items: [HISTORY, FEED, SETTINGS] },
+      { title: "Контроль", items: [...(tasksEnabled ? [TASKS] : []), HISTORY, FEED, SETTINGS] },
       { title: "Моё", items: [MY] },
     ];
   if (role === "STOREKEEPER")
@@ -87,10 +89,10 @@ function groupsFor(role: Role, canStartShift: boolean): NavGroup[] {
       { title: "Контроль", items: [HISTORY, FEED] },
       { title: "Моё", items: [MY] },
     ];
-  // Новые рабочие роли (Этап 5): смена + read-only просмотр. Складские операции — след. пакет.
+  // Новые рабочие роли (Этап 5): смена + задачи (за флагом) + read-only просмотр.
   if ((WORK_ROLES as readonly string[]).includes(role))
     return [
-      { title: "Работа", items: [SHIFT] },
+      { title: "Работа", items: [...(tasksEnabled ? [TASKS] : []), SHIFT] },
       { title: "Просмотр", items: [STOCK, HISTORY] },
       { title: "Моё", items: [MY, FEED] },
     ];
@@ -102,6 +104,7 @@ function groupsFor(role: Role, canStartShift: boolean): NavGroup[] {
 function NavContent({
   role,
   canStartShift,
+  tasksEnabled,
   name,
   collapsed,
   onNavigate,
@@ -109,13 +112,14 @@ function NavContent({
 }: {
   role: Role;
   canStartShift: boolean;
+  tasksEnabled: boolean;
   name: string;
   collapsed: boolean;
   onNavigate?: () => void;
   onToggleCollapse?: () => void;
 }) {
   const pathname = usePathname();
-  const groups = groupsFor(role, canStartShift);
+  const groups = groupsFor(role, canStartShift, tasksEnabled);
 
   const itemClass = (active: boolean) =>
     clsx(
@@ -203,7 +207,7 @@ function NavContent({
 }
 
 // Нижний таб-бар (только мобильный): главные разделы + «Ещё» с полным меню.
-function MobileTabBar({ role, onMore }: { role: Role; onMore: () => void }) {
+function MobileTabBar({ role, tasksEnabled, onMore }: { role: Role; tasksEnabled: boolean; onMore: () => void }) {
   const pathname = usePathname();
   const tabs: NavItem[] =
     role === "EMPLOYEE"
@@ -211,7 +215,9 @@ function MobileTabBar({ role, onMore }: { role: Role; onMore: () => void }) {
       : role === "OBSERVER"
         ? [STOCK, { ...HISTORY, label: "История" }, { ...FEED, label: "Лента" }]
         : (WORK_ROLES as readonly string[]).includes(role)
-          ? [SHIFT, STOCK, MY]
+          ? tasksEnabled
+            ? [TASKS, SHIFT, STOCK]
+            : [SHIFT, STOCK, MY]
           : [ACTIVE, { ...SCAN, label: "Сканер" }, STOCK];
 
   return (
@@ -250,7 +256,17 @@ function MobileTabBar({ role, onMore }: { role: Role; onMore: () => void }) {
   );
 }
 
-export function AppNav({ role, roles, name }: { role: Role; roles: Role[]; name: string }) {
+export function AppNav({
+  role,
+  roles,
+  name,
+  tasksEnabled,
+}: {
+  role: Role;
+  roles: Role[];
+  name: string;
+  tasksEnabled: boolean;
+}) {
   const [mobileOpen, setMobileOpen] = useState(false);
   const [collapsed, setCollapsed] = useState(false);
   // «Смена» показываем всем с рабочей ролью — включая ADMIN с дополнительной рабочей ролью.
@@ -268,6 +284,7 @@ export function AppNav({ role, roles, name }: { role: Role; roles: Role[]; name:
         <NavContent
           role={role}
           canStartShift={canStartShift}
+          tasksEnabled={tasksEnabled}
           name={name}
           collapsed={collapsed}
           onToggleCollapse={() => setCollapsed((v) => !v)}
@@ -291,7 +308,7 @@ export function AppNav({ role, roles, name }: { role: Role; roles: Role[]; name:
       </header>
 
       {/* Мобильный: нижний таб-бар */}
-      <MobileTabBar role={role} onMore={() => setMobileOpen(true)} />
+      <MobileTabBar role={role} tasksEnabled={tasksEnabled} onMore={() => setMobileOpen(true)} />
 
       {mobileOpen && (
         <div className="fixed inset-0 z-50 lg:hidden">
@@ -310,6 +327,7 @@ export function AppNav({ role, roles, name }: { role: Role; roles: Role[]; name:
             <NavContent
               role={role}
               canStartShift={canStartShift}
+              tasksEnabled={tasksEnabled}
               name={name}
               collapsed={false}
               onNavigate={() => setMobileOpen(false)}
