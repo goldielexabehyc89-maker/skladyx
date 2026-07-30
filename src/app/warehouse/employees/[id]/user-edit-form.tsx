@@ -3,6 +3,8 @@
 import { useActionState } from "react";
 import type { UserFormState } from "@/app/actions/users";
 import { Button, ChipSelect, Field } from "@/components/ui";
+import { ASSIGNABLE_ROLES, LEGACY_ROLES, roleOptions } from "@/lib/role-labels";
+import type { Role } from "@/lib/jwt";
 import { WarehousePicker } from "../warehouse-picker";
 
 export function UserEditForm({
@@ -14,7 +16,7 @@ export function UserEditForm({
   user: {
     id: string;
     name: string;
-    role: string;
+    roles: Role[];
     isActive: boolean;
     phone: string | null;
     allWarehouses: boolean;
@@ -23,6 +25,10 @@ export function UserEditForm({
   warehouses: { id: string; name: string }[];
 }) {
   const [state, formAction, pending] = useActionState(action, {} as UserFormState);
+
+  // Legacy-роли показываем как опции, только если они уже есть у пользователя (не терять молча).
+  const legacyOwned = LEGACY_ROLES.filter((r) => user.roles.includes(r));
+  const options = roleOptions([...ASSIGNABLE_ROLES, ...legacyOwned]);
 
   return (
     <form action={formAction} className="flex flex-col gap-3">
@@ -37,16 +43,10 @@ export function UserEditForm({
         placeholder="+7 985 180-16-50"
       />
       <fieldset className="flex flex-col gap-2">
-        <span className="text-sm font-medium text-[#555]">Роль</span>
-        <ChipSelect
-          name="role"
-          options={[
-            { value: "EMPLOYEE", label: "Сотрудник" },
-            { value: "STOREKEEPER", label: "Кладовщик" },
-            { value: "ADMIN", label: "Администратор" },
-          ]}
-          defaultValue={user.role}
-        />
+        <span className="text-sm font-medium text-[#555]">
+          Роли <span className="text-red-500">*</span>
+        </span>
+        <ChipSelect name="roles" multiple options={options} defaultValue={user.roles} />
       </fieldset>
       <label className="flex items-center gap-2 text-sm">
         <input type="checkbox" name="isActive" defaultChecked={user.isActive} className="h-5 w-5" />

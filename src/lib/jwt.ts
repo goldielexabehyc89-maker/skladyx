@@ -5,9 +5,26 @@ import { SignJWT, jwtVerify } from "jose";
 export const SESSION_COOKIE = "skx_session";
 export const SESSION_MAX_AGE = 60 * 60 * 24 * 7; // 7 дней
 
-export type Role = "ADMIN" | "STOREKEEPER" | "EMPLOYEE";
+export type Role =
+  | "ADMIN"
+  | "RECEIVER"
+  | "LOADER"
+  | "PICKER"
+  | "CONTROLLER"
+  | "OBSERVER"
+  | "STOREKEEPER"
+  | "EMPLOYEE";
 
-const VALID_ROLES: readonly Role[] = ["ADMIN", "STOREKEEPER", "EMPLOYEE"];
+const VALID_ROLES: readonly Role[] = [
+  "ADMIN",
+  "RECEIVER",
+  "LOADER",
+  "PICKER",
+  "CONTROLLER",
+  "OBSERVER",
+  "STOREKEEPER",
+  "EMPLOYEE",
+];
 
 // Приводит произвольные данные к валидному набору ролей: оставляет только
 // известные значения, убирает дубли; пустой/битый вход → [fallback] (legacy-роль).

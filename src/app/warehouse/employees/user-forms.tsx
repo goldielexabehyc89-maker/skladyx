@@ -8,6 +8,7 @@ import {
   type UserFormState,
 } from "@/app/actions/users";
 import { Button, ChipSelect, Field } from "@/components/ui";
+import { ASSIGNABLE_ROLES, roleOptions } from "@/lib/role-labels";
 import { WarehousePicker } from "./warehouse-picker";
 
 function CopyLink({ link }: { link: string }) {
@@ -47,16 +48,11 @@ export function NewUserForm({ warehouses }: { warehouses: { id: string; name: st
         placeholder="+7 985 180-16-50"
       />
       <fieldset className="flex flex-col gap-2">
-        <span className="text-sm font-medium text-[#555]">Роль</span>
-        <ChipSelect
-          name="role"
-          options={[
-            { value: "EMPLOYEE", label: "Сотрудник" },
-            { value: "STOREKEEPER", label: "Кладовщик" },
-            { value: "ADMIN", label: "Администратор" },
-          ]}
-          defaultValue="EMPLOYEE"
-        />
+        <span className="text-sm font-medium text-[#555]">
+          Роли <span className="text-red-500">*</span>
+        </span>
+        <ChipSelect name="roles" multiple options={roleOptions(ASSIGNABLE_ROLES)} defaultValue={[]} />
+        <span className="text-xs text-neutral-400">Можно выбрать несколько. Минимум одна роль.</span>
       </fieldset>
       <WarehousePicker warehouses={warehouses} initialAll={false} />
       {state.error && <p className="text-sm text-red-600">{state.error}</p>}

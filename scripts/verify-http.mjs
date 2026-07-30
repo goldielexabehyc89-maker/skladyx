@@ -316,7 +316,7 @@ async function main() {
     const res = await submitForm("/warehouse/employees/new", form, {
       name: "Иван Тестов",
       phone: "+7 900 111-22-33",
-      role: "EMPLOYEE",
+      roles: "EMPLOYEE",
       allWarehouses: "on",
     });
     // no-JS ответ — та же страница с состоянием формы (ссылка внутри)
@@ -339,7 +339,7 @@ async function main() {
     const res = await submitForm("/warehouse/employees/new", form, {
       name: "Пётр Кладовщиков",
       phone: "89001112244",
-      role: "STOREKEEPER",
+      roles: "STOREKEEPER",
       allWarehouses: "on",
     });
     const body = await res.text();

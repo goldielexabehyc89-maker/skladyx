@@ -10,8 +10,29 @@ import type { Role, SessionData } from "@/lib/jwt";
 // Здесь НЕТ запросов к БД: работаем только с уже готовой сессией (JWT). Проверка свежих
 // ролей/isActive на каждом запросе и немедленный отзыв — это S3, не S2.
 
-// Приоритет ролей для переходной навигации и одиночных решений: ADMIN > STOREKEEPER > EMPLOYEE.
-const ROLE_PRIORITY: readonly Role[] = ["ADMIN", "STOREKEEPER", "EMPLOYEE"];
+// Приоритет ролей (Этап 5): для навигации и для compatibility-поля User.role.
+// ADMIN > RECEIVER > LOADER > PICKER > CONTROLLER > OBSERVER > STOREKEEPER > EMPLOYEE.
+export const ROLE_PRIORITY: readonly Role[] = [
+  "ADMIN",
+  "RECEIVER",
+  "LOADER",
+  "PICKER",
+  "CONTROLLER",
+  "OBSERVER",
+  "STOREKEEPER",
+  "EMPLOYEE",
+];
+
+// Рабочие роли, для которых начинается смена (выбор ОДНОЙ роли + склад). ADMIN/OBSERVER — нет.
+export const WORK_ROLES: readonly Role[] = ["RECEIVER", "LOADER", "PICKER", "CONTROLLER"];
+export function isWorkRole(role: Role): boolean {
+  return WORK_ROLES.includes(role);
+}
+
+// Наивысшая по приоритету роль из набора (для compat User.role и навигации). null — пустой набор.
+export function highestRole(roles: readonly Role[]): Role | null {
+  return ROLE_PRIORITY.find((r) => roles.includes(r)) ?? null;
+}
 
 // Серверные runtime-флаги (НЕ NEXT_PUBLIC): читаются на каждом решении, чтобы выключение
 // флага сразу возвращало прежнее поведение без пересборки.

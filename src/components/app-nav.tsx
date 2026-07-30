@@ -10,6 +10,7 @@ import {
   Bell,
   Briefcase,
   ClipboardList,
+  Clock,
   Factory,
   Handshake,
   History,
@@ -63,6 +64,9 @@ const HISTORY: NavItem = { href: "/warehouse/history", label: "История", 
 const FEED: NavItem = { href: "/warehouse/feed", label: "Лента событий", icon: Bell };
 const SETTINGS: NavItem = { href: "/warehouse/settings", label: "Настройки", icon: Settings };
 const MY: NavItem = { href: "/warehouse/my", label: "Мои ТМЦ", icon: Briefcase };
+const SHIFT: NavItem = { href: "/warehouse/shift", label: "Смена", icon: Clock };
+
+const WORK_ROLES = ["RECEIVER", "LOADER", "PICKER", "CONTROLLER"] as const;
 
 function groupsFor(role: Role): NavGroup[] {
   if (role === "ADMIN")
@@ -79,6 +83,19 @@ function groupsFor(role: Role): NavGroup[] {
       { title: "Документы", items: [TRANSFERS, ISSUES] },
       { title: "Справочники", items: [STOCK] },
       { title: "Контроль", items: [HISTORY, FEED] },
+      { title: "Моё", items: [MY] },
+    ];
+  // Новые рабочие роли (Этап 5): смена + read-only остатки. Складские операции — след. пакет.
+  if ((WORK_ROLES as readonly string[]).includes(role))
+    return [
+      { title: "Работа", items: [SHIFT] },
+      { title: "Просмотр", items: [STOCK] },
+      { title: "Моё", items: [MY, FEED] },
+    ];
+  // Наблюдатель — только просмотр.
+  if (role === "OBSERVER")
+    return [
+      { title: "Просмотр", items: [STOCK, FEED] },
       { title: "Моё", items: [MY] },
     ];
   return [{ title: "Моё", items: [MY, FEED] }];
@@ -191,7 +208,11 @@ function MobileTabBar({ role, onMore }: { role: Role; onMore: () => void }) {
   const tabs: NavItem[] =
     role === "EMPLOYEE"
       ? [MY, { ...SCAN, label: "Сканер" }, { ...FEED, label: "Лента" }]
-      : [ACTIVE, { ...SCAN, label: "Сканер" }, STOCK];
+      : role === "OBSERVER"
+        ? [STOCK, { ...FEED, label: "Лента" }, MY]
+        : (WORK_ROLES as readonly string[]).includes(role)
+          ? [SHIFT, STOCK, MY]
+          : [ACTIVE, { ...SCAN, label: "Сканер" }, STOCK];
 
   return (
     <nav

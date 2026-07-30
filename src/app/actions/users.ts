@@ -1,7 +1,6 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
-import { z } from "zod";
 import { prisma } from "@/lib/db";
 import { requireAdmin } from "@/lib/auth";
 import { scoped } from "@/lib/tenant";
@@ -9,19 +8,28 @@ import { logEvent } from "@/lib/events";
 import { createQrIn } from "@/lib/qr";
 import { normalizePhone } from "@/lib/phone";
 import { createPasswordToken, passwordLink } from "@/lib/password-reset";
+import { highestRole } from "@/lib/roles";
+import { ROLE_ORDER, ROLE_LABEL } from "@/lib/role-labels";
+import type { Role } from "@/lib/jwt";
 
 export interface UserFormState {
   error?: string;
   link?: string; // одноразовая ссылка установки пароля — показать и скопировать
 }
 
-const userSchema = z.object({
-  name: z.string().trim().min(1, "Укажите имя"),
-  role: z.enum(["ADMIN", "STOREKEEPER", "EMPLOYEE"]),
-});
-
-// Организацию нельзя оставить без активного администратора (см. защиту в updateUserAction).
+// Организацию нельзя оставить без активного администратора (см. updateUserAction).
 class LastAdminError extends Error {}
+// Нельзя менять роль/склад/активность пользователя, пока у него открыта смена.
+class ShiftOpenError extends Error {}
+
+// Этап 5: у пользователя набор ролей (UserRole). Из формы приходит несколько значений `roles`.
+function parseRoles(formData: FormData): { error?: string; roles?: Role[] } {
+  const raw = formData.getAll("roles").map(String).filter(Boolean);
+  const valid = raw.filter((r): r is Role => (ROLE_ORDER as string[]).includes(r));
+  const roles = Array.from(new Set(valid));
+  if (roles.length === 0) return { error: "Выберите хотя бы одну роль" };
+  return { roles };
+}
 
 // Разбор привязки к складам из формы: чекбокс «Все склады» + список складов.
 async function parseWarehouses(
@@ -31,8 +39,7 @@ async function parseWarehouses(
   const all = formData.get("allWarehouses") === "on";
   if (all) return { allWarehouses: true, ids: [] };
   const ids = formData.getAll("wh").map((v) => String(v)).filter(Boolean);
-  if (ids.length === 0)
-    return { error: "Выберите склад(ы) или отметьте «Все склады»" };
+  if (ids.length === 0) return { error: "Выберите склад(ы) или отметьте «Все склады»" };
   const found = await prisma.warehouse.findMany({
     where: { companyId, id: { in: ids } },
     select: { id: true },
@@ -42,12 +49,6 @@ async function parseWarehouses(
   return { allWarehouses: false, ids: validIds };
 }
 
-const ROLE_RU: Record<string, string> = {
-  ADMIN: "админ",
-  STOREKEEPER: "кладовщик",
-  EMPLOYEE: "сотрудник",
-};
-
 // Создание сотрудника: логин — телефон, без пароля (вход по одноразовой ссылке) + QR-бейдж.
 export async function createUserAction(
   _prev: UserFormState,
@@ -56,11 +57,12 @@ export async function createUserAction(
   const session = await requireAdmin();
   const s = scoped(session);
 
-  const parsed = userSchema.safeParse({
-    name: formData.get("name"),
-    role: formData.get("role"),
-  });
-  if (!parsed.success) return { error: parsed.error.errors[0].message };
+  const name = String(formData.get("name") ?? "").trim();
+  if (!name) return { error: "Укажите имя" };
+  const parsedRoles = parseRoles(formData);
+  if (parsedRoles.error) return { error: parsedRoles.error };
+  const roles = parsedRoles.roles!;
+  const compat = highestRole(roles)!; // compatibility-поле User.role (детерминированно по приоритету)
 
   const phone = normalizePhone(String(formData.get("phone") ?? ""));
   if (!phone) return { error: "Некорректный телефон — введите с +7, с 8 или сразу с 9" };
@@ -77,15 +79,15 @@ export async function createUserAction(
       data: {
         companyId: s.companyId,
         phone,
-        name: parsed.data.name,
-        role: parsed.data.role,
+        name,
+        role: compat,
         passwordHash: null,
         allWarehouses: wh.allWarehouses!,
         warehouseLinks: wh.allWarehouses
           ? undefined
           : { create: wh.ids!.map((warehouseId) => ({ warehouseId })) },
-        // S1 shadow dual-write: роль в UserRole (авторизация ещё по User.role)
-        userRoles: { create: { role: parsed.data.role } },
+        // набор ролей одной транзакцией
+        userRoles: { create: roles.map((role) => ({ role })) },
       },
     });
     await createQrIn(tx, { companyId: s.companyId, type: "EMPLOYEE", refId: u.id });
@@ -97,7 +99,7 @@ export async function createUserAction(
     companyId: s.companyId,
     type: "user_created",
     title: "Добавлен сотрудник",
-    body: `${user.name} (${ROLE_RU[user.role] ?? user.role})`,
+    body: `${user.name} (${roles.map((r) => ROLE_LABEL[r]).join(", ")})`,
     url: `/warehouse/employees/${user.id}`,
     actorId: session.userId,
   });
@@ -115,13 +117,15 @@ export async function updateUserAction(
   const user = await s.user(id);
 
   const name = String(formData.get("name") ?? "").trim();
-  const role = String(formData.get("role") ?? "");
   if (!name) return { error: "Укажите имя" };
-  if (role !== "ADMIN" && role !== "STOREKEEPER" && role !== "EMPLOYEE")
-    return { error: "Некорректная роль" };
+  const parsedRoles = parseRoles(formData);
+  if (parsedRoles.error) return { error: parsedRoles.error };
+  const roles = parsedRoles.roles!;
+  const compat = highestRole(roles)!;
   const isActive = formData.get("isActive") === "on";
-  if (user.id === session.userId && (!isActive || role !== "ADMIN"))
-    return { error: "Нельзя отключить или понизить самого себя" };
+
+  if (user.id === session.userId && (!isActive || !roles.includes("ADMIN")))
+    return { error: "Нельзя отключить себя или снять с себя роль администратора" };
 
   // телефон: пустое поле — оставить как есть (для старых учёток с email-входом)
   const phoneRaw = String(formData.get("phone") ?? "").trim();
@@ -138,11 +142,26 @@ export async function updateUserAction(
 
   try {
     await prisma.$transaction(async (tx) => {
-      // S3: защита последнего активного ADMIN, конкурентно-безопасно.
-      // Advisory-xact-lock сериализует операции по ОРГАНИЗАЦИИ, поэтому две параллельные
-      // попытки снять ADMIN у разных админов не пройдут обе (вторая увидит уже 0 других).
-      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext('skladyx:lastadmin'), hashtext(${s.companyId}))`;
-      const willBeActiveAdmin = isActive && role === "ADMIN";
+      // Защита последнего активного ADMIN, конкурентно-безопасно (advisory-lock по организации).
+      // $executeRaw (не $queryRaw): pg_advisory_xact_lock возвращает void — $queryRaw падает на его десериализации.
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext('skladyx:lastadmin'), hashtext(${s.companyId}))`;
+
+      // Пока у пользователя открыта смена — нельзя деактивировать, снять активную роль
+      // смены или доступ к складу смены.
+      const openShift = await tx.workShift.findFirst({
+        where: { userId: id, companyId: s.companyId, endedAt: null },
+        select: { role: true, warehouseId: true },
+      });
+      if (openShift) {
+        if (!isActive) throw new ShiftOpenError("Нельзя отключить сотрудника, пока у него открыта смена");
+        if (!roles.includes(openShift.role))
+          throw new ShiftOpenError("Нельзя снять роль активной смены — сначала завершите смену");
+        const keepsWarehouse = wh.allWarehouses || wh.ids!.includes(openShift.warehouseId);
+        if (!keepsWarehouse)
+          throw new ShiftOpenError("Нельзя убрать доступ к складу активной смены — сначала завершите смену");
+      }
+
+      const willBeActiveAdmin = isActive && roles.includes("ADMIN");
       if (!willBeActiveAdmin) {
         const otherActiveAdmins = await tx.user.count({
           where: {
@@ -157,7 +176,7 @@ export async function updateUserAction(
 
       await tx.user.update({
         where: { id },
-        data: { name, role, isActive, phone, allWarehouses: wh.allWarehouses! },
+        data: { name, role: compat, isActive, phone, allWarehouses: wh.allWarehouses! },
       });
       await tx.userWarehouse.deleteMany({ where: { userId: id } });
       if (!wh.allWarehouses && wh.ids!.length) {
@@ -165,17 +184,20 @@ export async function updateUserAction(
           data: wh.ids!.map((warehouseId) => ({ userId: id, warehouseId })),
         });
       }
-      // S1 shadow dual-write: синхронизировать UserRole с новой (единственной) ролью
-      await tx.userRole.deleteMany({ where: { userId: id, role: { not: role } } });
-      await tx.userRole.upsert({
-        where: { userId_role: { userId: id, role } },
-        create: { userId: id, role },
-        update: {},
-      });
+      // синхронизировать UserRole с выбранным набором ролей
+      await tx.userRole.deleteMany({ where: { userId: id, role: { notIn: roles } } });
+      for (const role of roles) {
+        await tx.userRole.upsert({
+          where: { userId_role: { userId: id, role } },
+          create: { userId: id, role },
+          update: {},
+        });
+      }
     });
   } catch (e) {
     if (e instanceof LastAdminError)
       return { error: "Нельзя оставить организацию без активного администратора" };
+    if (e instanceof ShiftOpenError) return { error: e.message };
     throw e;
   }
   revalidatePath("/warehouse/employees");

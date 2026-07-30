@@ -7,8 +7,11 @@ import { updateUserAction } from "@/app/actions/users";
 import { Card, CardTitle, Field, PageTitle, Badge, LinkButton, Button, DownloadButton } from "@/components/ui";
 import { PasswordLinkButton } from "../user-forms";
 import { UserEditForm } from "./user-edit-form";
-import { fmtQty, fmtRub } from "@/lib/format";
+import { fmtQty, fmtRub, fmtDateTime } from "@/lib/format";
 import { allowedWarehouses } from "@/lib/warehouse-access";
+import { getActiveShift } from "@/lib/work-shift";
+import { ROLE_LABEL, ROLE_TONE, ROLE_ORDER } from "@/lib/role-labels";
+import type { Role } from "@/lib/jwt";
 
 export default async function EmployeePage({ params }: { params: Promise<{ id: string }> }) {
   const session = await requireAdminPage();
@@ -16,9 +19,14 @@ export default async function EmployeePage({ params }: { params: Promise<{ id: s
   const { id } = await params;
   const user = await prisma.user.findFirst({
     where: { id, companyId: s.companyId },
-    include: { warehouseLinks: { select: { warehouseId: true } } },
+    include: {
+      warehouseLinks: { select: { warehouseId: true } },
+      userRoles: { select: { role: true } },
+    },
   });
   if (!user) return null;
+  const roles = ROLE_ORDER.filter((r) => user.userRoles.some((ur) => ur.role === r));
+  const shift = await getActiveShift(user.id, s.companyId);
   const warehouses = await allowedWarehouses(session, s.companyId);
   const badge = await prisma.qrCode.findUnique({
     where: { type_refId: { type: "EMPLOYEE", refId: user.id } },
@@ -58,14 +66,32 @@ export default async function EmployeePage({ params }: { params: Promise<{ id: s
     <div className="mx-auto flex w-full max-w-2xl flex-col gap-4">
       <PageTitle
         action={
-          <Badge tone={user.role === "ADMIN" ? "blue" : user.role === "STOREKEEPER" ? "orange" : "neutral"}>
-            {user.role === "ADMIN" ? "админ" : user.role === "STOREKEEPER" ? "кладовщик" : "сотрудник"}
-          </Badge>
+          <span className="flex flex-wrap justify-end gap-1">
+            {roles.map((r) => (
+              <Badge key={r} tone={ROLE_TONE[r]}>
+                {ROLE_LABEL[r]}
+              </Badge>
+            ))}
+          </span>
         }
       >
         {user.name}
       </PageTitle>
       <p className="-mt-3 text-sm text-neutral-500">{user.phone ?? user.email}</p>
+
+      {shift && (
+        <Card>
+          <CardTitle>
+            <span className="flex items-center gap-2">
+              <Badge tone="green">На смене</Badge>
+              {ROLE_LABEL[shift.role]}
+            </span>
+          </CardTitle>
+          <div className="text-sm text-neutral-600">
+            Склад: {shift.warehouseName} · начало: {fmtDateTime(shift.startedAt)}
+          </div>
+        </Card>
+      )}
 
       <Card>
         <CardTitle>Числится за сотрудником</CardTitle>
@@ -132,7 +158,7 @@ export default async function EmployeePage({ params }: { params: Promise<{ id: s
           user={{
             id: user.id,
             name: user.name,
-            role: user.role,
+            roles: user.userRoles.map((ur) => ur.role as Role),
             isActive: user.isActive,
             phone: user.phone,
             allWarehouses: user.allWarehouses,

@@ -17,8 +17,14 @@ datasource db {
 
 enum Role {
   ADMIN
-  STOREKEEPER // кладовщик: заказы поставщикам (просмотр) + приемка; права будут расширяться
-  EMPLOYEE
+  // Этап 5: рабочие роли РостАгро (назначаются в UserRole; рабочая роль выбирается на смене).
+  RECEIVER // кладовщик-приёмка
+  LOADER // кладовщик-погрузчик
+  PICKER // кладовщик-сборка
+  CONTROLLER // контролёр
+  OBSERVER // наблюдатель (read-only)
+  STOREKEEPER // legacy-кладовщик (старые процессы; не удаляем — S6 отложен)
+  EMPLOYEE // legacy-сотрудник (не удаляем — S6 отложен)
 }
 
 enum TrackingType {
@@ -135,6 +141,7 @@ model Company {
   events            Event[]
   qrCodes           QrCode[]
   pushSubscriptions PushSubscription[]
+  workShifts        WorkShift[]
 }
 
 model User {
@@ -157,6 +164,7 @@ model User {
   authTokens     AuthToken[]
   warehouseLinks UserWarehouse[]
   userRoles      UserRole[]
+  workShifts     WorkShift[]
 
   // S3 per-tenant identity: телефон/email уникальны в пределах организации.
   @@unique([companyId, phone])
@@ -175,6 +183,32 @@ model UserRole {
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@unique([userId, role])
+}
+
+// Этап 5: рабочая смена. Пользователь выбирает ОДНУ рабочую роль + склад на смену.
+// История: завершённые смены не удаляем. Не более одной незавершённой смены на пользователя
+// гарантируется partial unique index (endedAt IS NULL) — создаётся в миграции (Prisma не
+// описывает WHERE-индексы). См. docs/ROSTAGRO_MIGRATION_DESIGN.md §2.1.
+model WorkShift {
+  id          String    @id @default(cuid())
+  companyId   String
+  userId      String
+  warehouseId String
+  role        Role
+  startedAt   DateTime  @default(now())
+  endedAt     DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  company   Company   @relation(fields: [companyId], references: [id])
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  warehouse Warehouse @relation(fields: [warehouseId], references: [id])
+
+  @@index([companyId])
+  @@index([userId])
+  @@index([warehouseId])
+  @@index([role])
+  @@index([endedAt])
 }
 
 // Привязка пользователя к складам (когда allWarehouses = false).
@@ -266,9 +300,10 @@ model Warehouse {
   sortOrder Int      @default(0)
   createdAt DateTime @default(now())
 
-  company   Company         @relation(fields: [companyId], references: [id])
-  cells     Cell[]
-  userLinks UserWarehouse[]
+  company    Company         @relation(fields: [companyId], references: [id])
+  cells      Cell[]
+  userLinks  UserWarehouse[]
+  workShifts WorkShift[]
 
   @@index([companyId])
 }

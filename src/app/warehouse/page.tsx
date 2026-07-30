@@ -5,6 +5,10 @@ import { navRole } from "@/lib/roles";
 // Отдельной «Главной» нет: /warehouse сразу ведёт на рабочий стартовый экран роли.
 export default async function HomePage() {
   const session = await requireUser();
-  // По переходной навигационной роли: только сотрудник → «Мои ТМЦ», иначе рабочий экран персонала.
-  redirect(navRole(session) === "EMPLOYEE" ? "/warehouse/my" : "/warehouse/active");
+  const role = navRole(session);
+  // ADMIN не направляем принудительно на смену; рабочего — на экран смены; OBSERVER — на остатки.
+  if (role === "ADMIN" || role === "STOREKEEPER") redirect("/warehouse/active");
+  if (role === "OBSERVER") redirect("/warehouse/stock");
+  if (role === "EMPLOYEE") redirect("/warehouse/my");
+  redirect("/warehouse/shift"); // RECEIVER/LOADER/PICKER/CONTROLLER
 }
