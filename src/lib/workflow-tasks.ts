@@ -77,8 +77,9 @@ async function emit(
   warehouseIds?: string[],
   userIds?: string[],
   key?: string,
+  actorId?: string,
 ): Promise<void> {
-  await logEvent({ companyId, type, title, body, url: "/warehouse/tasks", warehouseIds, userIds, key });
+  await logEvent({ companyId, type, title, body, url: "/warehouse/tasks", warehouseIds, userIds, key, actorId });
 }
 
 // ── Создание (идемпотентно по dedupeKey) ──
@@ -107,6 +108,16 @@ export async function createWorkflowTask(input: {
       where: { companyId_dedupeKey: { companyId: input.companyId, dedupeKey: input.dedupeKey } },
     });
     if (existing) return { task: existing, created: false, assignedTo: null as string | null };
+
+    // Tenant-изоляция зависимостей: каждый dependsOn должен существовать И принадлежать
+    // этой же организации. Иначе — понятная ошибка и полный откат tx (ни задачи, ни связей).
+    if (deps.length) {
+      const validDeps = await tx.workflowTask.count({
+        where: { id: { in: deps }, companyId: input.companyId },
+      });
+      if (validDeps !== deps.length)
+        throw new EngineError("Зависимость не найдена в этой организации");
+    }
 
     // BLOCKED, если есть незавершённые зависимости
     let status: TaskStatus = "QUEUED";
@@ -229,17 +240,21 @@ export async function startWorkflowTask(
   }
   await emit("task_started", companyId, "Задача взята в работу", taskId, undefined, [userId], `task:${taskId}:started`);
   if (skipped)
-    await emit("task_skipped", companyId, "Пропущена срочная задача", `Причина: ${skipReason}`, [skipped.warehouseId], [userId]);
+    await emit("task_skipped", companyId, "Пропущена срочная задача", `Причина: ${skipReason}`, [skipped.warehouseId], [userId], undefined, userId);
   return {};
 }
 
+// Инфо о задаче для аудита/realtime после коммита.
+type TaskBrief = { id: string; title: string; warehouseId: string };
+
 // ── Завершение (для будущих доменных обработчиков; в tx вместе с движением остатка) ──
-export async function completeWorkflowTaskInTransaction(tx: Tx, taskId: string): Promise<void> {
+// Возвращает список разблокированных зависящих задач (для события task_unblocked после коммита).
+export async function completeWorkflowTaskInTransaction(tx: Tx, taskId: string): Promise<TaskBrief[]> {
   await tx.workflowTask.update({
     where: { id: taskId },
     data: { status: "COMPLETED", completedAt: new Date() },
   });
-  await unlockDependentTasks(tx, taskId);
+  return unlockDependentTasks(tx, taskId);
 }
 
 export async function completeWorkflowTask(taskId: string): Promise<void> {
@@ -247,17 +262,21 @@ export async function completeWorkflowTask(taskId: string): Promise<void> {
     const t = await tx.workflowTask.findUnique({ where: { id: taskId } });
     if (!t) return null;
     await lockCompany(tx, t.companyId);
-    await completeWorkflowTaskInTransaction(tx, taskId);
-    return { companyId: t.companyId, warehouseId: t.warehouseId, title: t.title };
+    const unblocked = await completeWorkflowTaskInTransaction(tx, taskId);
+    return { companyId: t.companyId, warehouseId: t.warehouseId, title: t.title, unblocked };
   });
   if (info) {
     await emit("task_completed", info.companyId, "Задача выполнена", info.title, [info.warehouseId], undefined, `task:${taskId}:completed`);
+    for (const u of info.unblocked)
+      await emit("task_unblocked", info.companyId, "Задача разблокирована", u.title, [u.warehouseId], undefined, `task:${u.id}:unblocked`);
     await rebalanceQueuedTasks(info.companyId, { warehouseId: info.warehouseId });
   }
 }
 
 // Разблокировать зависящие задачи, у которых ВСЕ зависимости COMPLETED: BLOCKED → QUEUED.
-export async function unlockDependentTasks(tx: Tx, completedTaskId: string): Promise<void> {
+// Возвращает разблокированные задачи (событие task_unblocked эмитим после коммита tx).
+export async function unlockDependentTasks(tx: Tx, completedTaskId: string): Promise<TaskBrief[]> {
+  const unblocked: TaskBrief[] = [];
   const dependents = await tx.taskDependency.findMany({
     where: { dependsOnTaskId: completedTaskId },
     select: { taskId: true },
@@ -270,9 +289,11 @@ export async function unlockDependentTasks(tx: Tx, completedTaskId: string): Pro
       where: { id: { in: deps.map((d) => d.dependsOnTaskId) }, status: "COMPLETED" },
     });
     if (done >= deps.length) {
-      await tx.workflowTask.update({ where: { id: taskId }, data: { status: "QUEUED" } });
+      const upd = await tx.workflowTask.update({ where: { id: taskId }, data: { status: "QUEUED" } });
+      unblocked.push({ id: upd.id, title: upd.title, warehouseId: upd.warehouseId });
     }
   }
+  return unblocked;
 }
 
 export async function cancelWorkflowTask(taskId: string): Promise<void> {
@@ -280,6 +301,12 @@ export async function cancelWorkflowTask(taskId: string): Promise<void> {
     const t = await tx.workflowTask.findUnique({ where: { id: taskId } });
     if (!t || t.status === "COMPLETED" || t.status === "CANCELLED") return null;
     await lockCompany(tx, t.companyId);
+    // Незавершённую (PENDING) передачу закрываем в ЭТОЙ ЖЕ транзакции — иначе устаревшая
+    // передача могла бы «воскресить» отменённую задачу при accept/reject.
+    await tx.taskHandoff.updateMany({
+      where: { taskId, status: "PENDING" },
+      data: { status: "CANCELLED", respondedAt: new Date() },
+    });
     await tx.workflowTask.update({
       where: { id: taskId },
       data: { status: "CANCELLED", cancelledAt: new Date() },
@@ -334,9 +361,12 @@ export async function acceptTaskHandoff(companyId: string, handoffId: string, to
   try {
     notify = await prisma.$transaction(async (tx) => {
       await lockCompany(tx, companyId);
-      const h = await tx.taskHandoff.findFirst({ where: { id: handoffId, status: "PENDING" }, include: { toShift: true, task: true } });
+      const h = await tx.taskHandoff.findFirst({ where: { id: handoffId, status: "PENDING" }, include: { toShift: true, task: true, fromShift: true } });
       if (!h || h.task.companyId !== companyId) throw new EngineError("Передача не найдена");
       if (h.toShift.userId !== toUserId || h.toShift.endedAt !== null) throw new EngineError("Это не ваша активная передача");
+      // защита от устаревшей передачи: задача всё ещё ждёт передачи и принадлежит исходной смене/пользователю
+      if (h.task.status !== "HANDOFF_PENDING" || h.task.assignedShiftId !== h.fromShiftId || h.task.assignedUserId !== h.fromShift.userId)
+        throw new EngineError("Передача устарела — задача изменилась");
       const busy = await tx.workflowTask.findFirst({
         where: { assignedUserId: toUserId, status: { in: ["IN_PROGRESS", "HANDOFF_PENDING"] }, id: { not: h.taskId } },
       });
@@ -366,6 +396,9 @@ export async function rejectTaskHandoff(companyId: string, handoffId: string, to
       const h = await tx.taskHandoff.findFirst({ where: { id: handoffId, status: "PENDING" }, include: { toShift: true, task: true, fromShift: true } });
       if (!h || h.task.companyId !== companyId) throw new EngineError("Передача не найдена");
       if (h.toShift.userId !== toUserId) throw new EngineError("Это не ваша передача");
+      // защита от устаревшей передачи: задача всё ещё ждёт передачи и принадлежит исходной смене/пользователю
+      if (h.task.status !== "HANDOFF_PENDING" || h.task.assignedShiftId !== h.fromShiftId || h.task.assignedUserId !== h.fromShift.userId)
+        throw new EngineError("Передача устарела — задача изменилась");
       await tx.taskHandoff.update({ where: { id: handoffId }, data: { status: "REJECTED", respondedAt: new Date() } });
       // задача возвращается исходному исполнителю в IN_PROGRESS
       await tx.workflowTask.update({ where: { id: h.taskId }, data: { status: "IN_PROGRESS" } });

@@ -8,6 +8,7 @@ import { scoped } from "@/lib/tenant";
 import { warehouseAccess, isWhAllowed } from "@/lib/warehouse-access";
 import { isWorkRole, workflowTasksEnabled } from "@/lib/roles";
 import { rebalanceQueuedTasks } from "@/lib/workflow-tasks";
+import { logEvent } from "@/lib/events";
 import type { Role } from "@/lib/jwt";
 
 export interface ShiftState {
@@ -91,24 +92,41 @@ export async function endWorkShiftAction(_prev: ShiftState, _formData: FormData)
     return {};
   }
 
+  let returned: { id: string; title: string; warehouseId: string }[] = [];
   try {
-    await prisma.$transaction(async (tx) => {
+    returned = await prisma.$transaction(async (tx) => {
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext('skladyx:tasks'), hashtext(${s.companyId}))`;
       const blocking = await tx.workflowTask.count({
         where: { assignedShiftId: shift.id, status: { in: ["IN_PROGRESS", "HANDOFF_PENDING"] } },
       });
       if (blocking > 0) throw new ShiftBlockedByTask();
+      const toReturn = await tx.workflowTask.findMany({
+        where: { assignedShiftId: shift.id, status: "ASSIGNED" },
+        select: { id: true, title: true, warehouseId: true },
+      });
       await tx.workflowTask.updateMany({
         where: { assignedShiftId: shift.id, status: "ASSIGNED" },
         data: { status: "QUEUED", assignedUserId: null, assignedShiftId: null, assignedAt: null },
       });
       await tx.workShift.update({ where: { id: shift.id }, data: { endedAt: new Date() } });
+      return toReturn;
     });
   } catch (e) {
     if (e instanceof ShiftBlockedByTask)
       return { error: "Есть задача в работе или ожидающая передачи. Завершите задачу или передайте её, затем закройте смену." };
     throw e;
   }
+  // аудит: каждая возвращённая в очередь задача (Event + realtime, без push)
+  for (const t of returned)
+    await logEvent({
+      companyId: s.companyId,
+      type: "task_returned",
+      title: "Задача возвращена в очередь",
+      body: t.title,
+      url: "/warehouse/tasks",
+      warehouseIds: [t.warehouseId],
+      actorId: session.userId,
+    });
   // перераспределить возвращённые задачи между оставшимися сменами
   await rebalanceQueuedTasks(s.companyId, { warehouseId: shift.warehouseId, role: shift.role });
   revalidatePath("/warehouse/shift");

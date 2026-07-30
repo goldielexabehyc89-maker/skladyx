@@ -3,7 +3,7 @@ import { redirect } from "next/navigation";
 import { requireUser } from "@/lib/auth";
 import { scoped } from "@/lib/tenant";
 import { prisma } from "@/lib/db";
-import { hasRole, workflowTasksEnabled } from "@/lib/roles";
+import { hasRole, isWorkRole, workflowTasksEnabled } from "@/lib/roles";
 import { allowedWarehouses } from "@/lib/warehouse-access";
 import { getActiveShift } from "@/lib/work-shift";
 import { ROLE_LABEL } from "@/lib/role-labels";
@@ -24,18 +24,47 @@ const toDTO = (t: {
   priority: t.priority, status: t.status, createdAt: t.createdAt.toISOString(), actionUrl: t.actionUrl,
 });
 
+// Переключатель «Мои задачи / Монитор» — только для ADMIN (монитор доступен лишь ему).
+function ViewToggle({ active }: { active: "mine" | "monitor" }) {
+  const base = "rounded-md px-3 py-1 text-sm font-medium transition-colors";
+  const on = "bg-[#1a1a2e] text-white";
+  const off = "text-neutral-600 hover:text-neutral-900";
+  return (
+    <div className="inline-flex items-center gap-0.5 rounded-lg border border-[#e4e4f0] bg-white p-0.5">
+      <Link href="/warehouse/tasks?view=mine" className={`${base} ${active === "mine" ? on : off}`}>Мои задачи</Link>
+      <Link href="/warehouse/tasks?view=monitor" className={`${base} ${active === "monitor" ? on : off}`}>Монитор</Link>
+    </div>
+  );
+}
+
 export default async function TasksPage({
   searchParams,
 }: {
-  searchParams: Promise<{ warehouse?: string; role?: string; status?: string; priority?: string; assignee?: string }>;
+  searchParams: Promise<{ warehouse?: string; role?: string; status?: string; priority?: string; assignee?: string; view?: string }>;
 }) {
   if (!workflowTasksEnabled()) redirect("/warehouse");
   const session = await requireUser();
   const s = scoped(session);
+  const sp = await searchParams;
+
+  const isAdmin = hasRole(session, "ADMIN");
+  const shift = await getActiveShift(session.userId, s.companyId);
+  const hasWorkShift = !!shift && isWorkRole(shift.role);
+
+  // Монитор всех задач видит только ADMIN. По умолчанию ADMIN с активной рабочей сменой
+  // попадает на свою рабочую очередь, без смены — на монитор. Явный выбор — ?view=mine|monitor.
+  const view: "mine" | "monitor" = isAdmin
+    ? sp.view === "monitor"
+      ? "monitor"
+      : sp.view === "mine"
+        ? "mine"
+        : hasWorkShift
+          ? "mine"
+          : "monitor"
+    : "mine";
 
   // ── ADMIN: read-only монитор всех задач организации ──
-  if (hasRole(session, "ADMIN")) {
-    const sp = await searchParams;
+  if (isAdmin && view === "monitor") {
     const where: Prisma.WorkflowTaskWhereInput = {
       companyId: s.companyId,
       ...(sp.warehouse ? { warehouseId: sp.warehouse } : {}),
@@ -56,7 +85,7 @@ export default async function TasksPage({
     ]);
 
     return (
-      <PageShell title="Задачи — монитор">
+      <PageShell title="Задачи — монитор" action={<ViewToggle active="monitor" />}>
         <FilterBar>
           <SelectField name="warehouse" defaultValue={sp.warehouse ?? ""} className="text-sm">
             <option value="">Все склады</option>
@@ -109,11 +138,11 @@ export default async function TasksPage({
     );
   }
 
-  // ── Рабочий сотрудник: доска задач текущей смены ──
-  const shift = await getActiveShift(session.userId, s.companyId);
+  // ── Рабочая доска (сотрудник или ADMIN в режиме «Мои задачи») ──
   if (!shift) {
     return (
       <div className="mx-auto flex w-full max-w-lg flex-col gap-4">
+        {isAdmin && <ViewToggle active="mine" />}
         <PageTitle>Задачи</PageTitle>
         <Card>
           <p className="text-sm text-neutral-600">Чтобы получать задачи, начните смену.</p>
@@ -142,6 +171,7 @@ export default async function TasksPage({
 
   return (
     <div className="mx-auto flex w-full max-w-lg flex-col gap-4">
+      {isAdmin && <ViewToggle active="mine" />}
       <PageTitle action={<Badge tone="green">{ROLE_LABEL[shift.role]} · {shift.warehouseName}</Badge>}>Задачи</PageTitle>
       <WorkerTasks
         current={current ? toDTO(current) : null}

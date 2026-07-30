@@ -10,6 +10,7 @@ import {
   rebalanceQueuedTasks,
   startWorkflowTask,
   completeWorkflowTask,
+  cancelWorkflowTask,
   requestTaskHandoff,
   acceptTaskHandoff,
   rejectTaskHandoff,
@@ -52,10 +53,18 @@ async function task(wh: string, role: Role, opts: { type?: string; priority?: "N
 }
 const assignee = async (id: string) => (await prisma.workflowTask.findUnique({ where: { id } }))?.assignedUserId ?? null;
 const statusOf = async (id: string) => (await prisma.workflowTask.findUnique({ where: { id } }))?.status ?? null;
+const TASK_EVENT_TYPES = [
+  "task_created", "task_assigned", "task_started", "task_completed", "task_cancelled",
+  "task_returned", "task_unblocked", "task_needs_attention", "task_skipped",
+  "task_handoff_requested", "task_handoff_accepted", "task_handoff_rejected",
+];
 async function resetTasks() {
   await prisma.taskHandoff.deleteMany({ where: { task: { companyId: { in: [companyId, demoId].filter(Boolean) } } } });
   await prisma.taskDependency.deleteMany({ where: { task: { companyId: { in: [companyId, demoId].filter(Boolean) } } } });
   await prisma.workflowTask.deleteMany({ where: { companyId: { in: [companyId, demoId].filter(Boolean) } } });
+}
+async function resetTaskEvents() {
+  await prisma.event.deleteMany({ where: { companyId: { in: [companyId, demoId].filter(Boolean) }, type: { in: TASK_EVENT_TYPES } } });
 }
 
 // ── HTTP (endWorkShiftAction) ──
@@ -108,9 +117,11 @@ async function provision() {
   const demo = await prisma.company.upsert({ where: { slug: "demo" }, update: {}, create: { name: "Demo", slug: "demo", settings: {} } });
   demoId = demo.id;
   DW = (await prisma.warehouse.create({ data: { companyId: demoId, name: "P2 DW", isActive: true } })).id;
+  await resetTaskEvents(); // старые task-события прошлых прогонов не должны давать ложных срабатываний в блоке 14
 }
 async function cleanup() {
   await resetTasks();
+  await resetTaskEvents();
   await prisma.workShift.deleteMany({ where: { companyId: { in: [companyId, demoId].filter(Boolean) }, warehouseId: { in: [W1, W2, DW].filter(Boolean) } } });
   await prisma.user.deleteMany({ where: { id: { in: UIDS } } });
   if (demoId) { await prisma.user.deleteMany({ where: { companyId: demoId } }); await prisma.warehouse.deleteMany({ where: { companyId: demoId } }); await prisma.company.deleteMany({ where: { id: demoId } }); }
@@ -247,6 +258,70 @@ async function main() {
   await endShiftHttp(ck);
   ok("после завершения задачи смена закрыта", (await prisma.workShift.count({ where: { userId: lA, endedAt: null } })) === 0);
   ok("ASSIGNED-задача возвращена в QUEUED", (await statusOf(assignedNotStarted.id)) === "QUEUED" && (await assignee(assignedNotStarted.id)) === null);
+
+  console.log("11) защита передачи: request → cancel → accept/reject отклонены, задача остаётся CANCELLED");
+  await resetTasks();
+  await prisma.workShift.updateMany({ where: { userId: { in: [lA, lB] }, endedAt: null }, data: { endedAt: new Date() } });
+  await mkShift(lA, companyId, W1, "LOADER");
+  await mkShift(lB, companyId, W1, "LOADER");
+  const ct = (await task(W1, "LOADER")).task;
+  const cOwner = (await assignee(ct.id))!;
+  const cOther = cOwner === lA ? lB : lA;
+  await startWorkflowTask(cOwner, companyId, ct.id);
+  const cReq = await requestTaskHandoff(companyId, ct.id, cOwner, cOther);
+  ok("передача запрошена → HANDOFF_PENDING", !cReq.error && (await statusOf(ct.id)) === "HANDOFF_PENDING");
+  const cHo = await prisma.taskHandoff.findFirstOrThrow({ where: { taskId: ct.id, status: "PENDING" } });
+  await cancelWorkflowTask(ct.id);
+  ok("cancel отменил задачу", (await statusOf(ct.id)) === "CANCELLED");
+  const cHoAfter = await prisma.taskHandoff.findUniqueOrThrow({ where: { id: cHo.id } });
+  ok("cancel перевёл передачу в CANCELLED с respondedAt", cHoAfter.status === "CANCELLED" && !!cHoAfter.respondedAt);
+  const accStale = await acceptTaskHandoff(companyId, cHo.id, cOther);
+  ok("accept устаревшей передачи отклонён, задача осталась CANCELLED", !!accStale.error && (await statusOf(ct.id)) === "CANCELLED", JSON.stringify(accStale));
+  const rejStale = await rejectTaskHandoff(companyId, cHo.id, cOther);
+  ok("reject устаревшей передачи отклонён, задача осталась CANCELLED", !!rejStale.error && (await statusOf(ct.id)) === "CANCELLED", JSON.stringify(rejStale));
+
+  console.log("12) tenant-изоляция зависимостей (чужая/несуществующая задача)");
+  await resetTasks();
+  const demoDep = await createWorkflowTask({
+    companyId: demoId, warehouseId: DW, type: "PLACE_GROUP", requiredRole: "LOADER",
+    title: "demo dep", dedupeKey: dk("demo-dep"),
+  });
+  let crossErr = "";
+  try {
+    await createWorkflowTask({
+      companyId, warehouseId: W1, type: "PLACE_GROUP", requiredRole: "LOADER",
+      title: "cross", dedupeKey: dk("cross"), dependsOn: [demoDep.task.id],
+    });
+  } catch (e) { crossErr = (e as Error).message; }
+  ok("зависимость от задачи другой организации отклонена", !!crossErr, crossErr);
+  ok("cross-задача не создана", (await prisma.workflowTask.count({ where: { companyId, dedupeKey: dk("cross") } })) === 0);
+  ok("TaskDependency на чужую задачу не создана", (await prisma.taskDependency.count({ where: { dependsOnTaskId: demoDep.task.id } })) === 0);
+  let missErr = "";
+  try {
+    await createWorkflowTask({
+      companyId, warehouseId: W1, type: "PLACE_GROUP", requiredRole: "LOADER",
+      title: "miss", dedupeKey: dk("miss"), dependsOn: ["nonexistent_task_id_xyz"],
+    });
+  } catch (e) { missErr = (e as Error).message; }
+  ok("зависимость от несуществующей задачи отклонена, задача не создана", !!missErr && (await prisma.workflowTask.count({ where: { companyId, dedupeKey: dk("miss") } })) === 0);
+
+  console.log("13) ADMIN с рабочей сменой LOADER: задача назначается и может быть начата");
+  await resetTasks();
+  await prisma.workShift.updateMany({ where: { companyId, warehouseId: W1, role: "LOADER", endedAt: null }, data: { endedAt: new Date() } });
+  const adm = await mkUser("p2_admLoader", companyId, "+79997001099", "ADMIN", W1);
+  await prisma.userRole.create({ data: { userId: adm, role: "LOADER" } });
+  await mkShift(adm, companyId, W1, "LOADER");
+  const admTask = (await task(W1, "LOADER")).task;
+  ok("задача назначена смене ADMIN+LOADER", (await assignee(admTask.id)) === adm, `got ${await assignee(admTask.id)}`);
+  const admStart = await startWorkflowTask(adm, companyId, admTask.id);
+  ok("ADMIN может начать назначенную задачу", !admStart.error && (await statusOf(admTask.id)) === "IN_PROGRESS", JSON.stringify(admStart));
+
+  console.log("14) аудит-события задействованы (task_skipped с actorId, task_returned, task_unblocked)");
+  const skipEv = await prisma.event.findFirst({ where: { companyId, type: "task_skipped" }, orderBy: { createdAt: "desc" } });
+  ok("task_skipped записан с actorId сотрудника", !!skipEv && !!skipEv.actorId, `actorId=${skipEv?.actorId ?? "—"}`);
+  ok("task_returned записан (возврат при завершении смены)", (await prisma.event.count({ where: { companyId, type: "task_returned" } })) >= 1);
+  ok("task_unblocked записан (разблокировка зависимости)", (await prisma.event.count({ where: { companyId, type: "task_unblocked" } })) >= 1);
+  ok("push движком не создаётся (аудит только Event+realtime)", (await prisma.pushSubscription.count({ where: { userId: { in: UIDS } } })) === 0);
 }
 
 main()
