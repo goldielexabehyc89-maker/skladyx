@@ -42,6 +42,8 @@ async function main() {
         name: adminName,
         role: "ADMIN",
         passwordHash: await bcrypt.hash(adminPassword, 10),
+        // S1 shadow dual-write: роль в UserRole
+        userRoles: { create: { role: "ADMIN" } },
       },
     });
     console.log(`Админ создан: ${adminPhone ?? adminEmail} / ${adminPassword}${generated ? " (пароль сгенерирован — смените после входа)" : ""}`);

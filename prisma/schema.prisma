@@ -138,25 +138,39 @@ model Company {
 }
 
 model User {
-  id           String   @id @default(cuid())
-  companyId    String
+  id            String   @id @default(cuid())
+  companyId     String
   // логин — телефон (+7XXXXXXXXXX); email — legacy-вход для старых учёток
-  phone        String?  @unique
-  email        String?  @unique
-  passwordHash String? // null — пароль не задан, вход только по одноразовой ссылке
-  name         String
-  role         Role     @default(EMPLOYEE)
-  isActive     Boolean  @default(true)
+  phone         String?  @unique
+  email         String?  @unique
+  passwordHash  String? // null — пароль не задан, вход только по одноразовой ссылке
+  name          String
+  role          Role     @default(EMPLOYEE)
+  isActive      Boolean  @default(true)
   // доступ к складам: true — все склады; иначе только перечисленные в warehouseLinks
-  allWarehouses Boolean @default(true)
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
+  allWarehouses Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
 
   company        Company         @relation(fields: [companyId], references: [id])
   authTokens     AuthToken[]
   warehouseLinks UserWarehouse[]
+  userRoles      UserRole[]
 
   @@index([companyId])
+}
+
+// Этап 4B/S1: мультироли пользователя (теневая копия; авторизация ещё по User.role).
+// role/доступ пока читаются из User.role — UserRole наполняется backfill + dual-write.
+// См. docs/MULTITENANT_SECURITY_DESIGN.md.
+model UserRole {
+  id     String @id @default(cuid())
+  userId String
+  role   Role
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, role])
 }
 
 // Привязка пользователя к складам (когда allWarehouses = false).
@@ -590,16 +604,16 @@ model PickList {
   warehouseId       String? // склад, с которого собирают (обязателен на уровне приложения)
   targetEmployeeId  String? // кому выдать (заявка на сбор)
   targetWarehouseId String? // на какой склад переместить (перемещение)
-  status           PickListStatus @default(NEW)
-  stagingCellId    String? // текущая ячейка выдачи при сборке (последняя назначенная)
-  note             String?
-  createdById      String
-  pickedById       String?
-  createdAt        DateTime       @default(now())
-  savedAt          DateTime? // документ сохранён админом: виден кладовщикам, ушёл пуш
-  pickedAt         DateTime?
-  stagedAt         DateTime?
-  issuedAt         DateTime?
+  status            PickListStatus @default(NEW)
+  stagingCellId     String? // текущая ячейка выдачи при сборке (последняя назначенная)
+  note              String?
+  createdById       String
+  pickedById        String?
+  createdAt         DateTime       @default(now())
+  savedAt           DateTime? // документ сохранён админом: виден кладовщикам, ушёл пуш
+  pickedAt          DateTime?
+  stagedAt          DateTime?
+  issuedAt          DateTime?
 
   company Company        @relation(fields: [companyId], references: [id])
   lines   PickLine[]
@@ -610,7 +624,7 @@ model PickList {
 }
 
 model PickLine {
-  id           String   @id @default(cuid())
+  id           String  @id @default(cuid())
   companyId    String
   pickListId   String
   itemId       String
@@ -618,8 +632,8 @@ model PickLine {
   lotId        String?
   unitId       String?
   cellId       String?
-  qtyRequested Decimal  @db.Decimal(14, 3)
-  qtyPicked    Decimal  @default(0) @db.Decimal(14, 3)
+  qtyRequested Decimal @db.Decimal(14, 3)
+  qtyPicked    Decimal @default(0) @db.Decimal(14, 3)
 
   pickList     PickList          @relation(fields: [pickListId], references: [id], onDelete: Cascade)
   fulfillments PickFulfillment[]

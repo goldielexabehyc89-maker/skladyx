@@ -80,6 +80,8 @@ export async function createUserAction(
         warehouseLinks: wh.allWarehouses
           ? undefined
           : { create: wh.ids!.map((warehouseId) => ({ warehouseId })) },
+        // S1 shadow dual-write: роль в UserRole (авторизация ещё по User.role)
+        userRoles: { create: { role: parsed.data.role } },
       },
     });
     await createQrIn(tx, { companyId: s.companyId, type: "EMPLOYEE", refId: u.id });
@@ -141,6 +143,13 @@ export async function updateUserAction(
         data: wh.ids!.map((warehouseId) => ({ userId: id, warehouseId })),
       });
     }
+    // S1 shadow dual-write: синхронизировать UserRole с новой (единственной) ролью
+    await tx.userRole.deleteMany({ where: { userId: id, role: { not: role } } });
+    await tx.userRole.upsert({
+      where: { userId_role: { userId: id, role } },
+      create: { userId: id, role },
+      update: {},
+    });
   });
   revalidatePath("/warehouse/employees");
   revalidatePath(`/warehouse/employees/${id}`);
