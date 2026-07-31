@@ -19,6 +19,7 @@ import {
   ListTodo,
   Menu,
   Package,
+  PackagePlus,
   ScanLine,
   Settings,
   ShoppingCart,
@@ -67,15 +68,24 @@ const SETTINGS: NavItem = { href: "/warehouse/settings", label: "Настрой�
 const MY: NavItem = { href: "/warehouse/my", label: "Мои ТМЦ", icon: Briefcase };
 const SHIFT: NavItem = { href: "/warehouse/shift", label: "Смена", icon: Clock };
 const TASKS: NavItem = { href: "/warehouse/tasks", label: "Задачи", icon: ListTodo };
+const RECEIVING_GROUP: NavItem = { href: "/warehouse/receiving", label: "Приёмка группами", icon: PackagePlus };
 
 const WORK_ROLES = ["RECEIVER", "LOADER", "PICKER", "CONTROLLER"] as const;
 
 // role — переходная навигационная роль (профиль меню); canStartShift — есть ли у пользователя
-// рабочая роль (тогда даже у ADMIN показываем «Смену»); tasksEnabled — флаг очереди задач.
-function groupsFor(role: Role, canStartShift: boolean, tasksEnabled: boolean): NavGroup[] {
+// рабочая роль (тогда даже у ADMIN показываем «Смену»); tasksEnabled — флаг очереди задач;
+// canReceive — есть роль RECEIVER; groupReceiving — флаг групповой приёмки (Пакет 4).
+function groupsFor(
+  role: Role,
+  canStartShift: boolean,
+  tasksEnabled: boolean,
+  canReceive: boolean,
+  groupReceiving: boolean,
+): NavGroup[] {
+  const receivingItem = groupReceiving && canReceive ? [RECEIVING_GROUP] : [];
   if (role === "ADMIN")
     return [
-      { title: "Работа", items: [ACTIVE, SCAN, RECEIPTS, STAGING, ...(canStartShift ? [SHIFT] : [])] },
+      { title: "Работа", items: [ACTIVE, SCAN, RECEIPTS, STAGING, ...receivingItem, ...(canStartShift ? [SHIFT] : [])] },
       { title: "Документы", items: [ORDERS, PICKLISTS, TRANSFERS, ISSUES, WRITEOFFS, INVENTORIES] },
       { title: "Справочники", items: [STOCK, ITEMS, WAREHOUSES, SUPPLIERS, EMPLOYEES] },
       { title: "Контроль", items: [...(tasksEnabled ? [TASKS] : []), HISTORY, FEED, SETTINGS] },
@@ -89,10 +99,10 @@ function groupsFor(role: Role, canStartShift: boolean, tasksEnabled: boolean): N
       { title: "Контроль", items: [HISTORY, FEED] },
       { title: "Моё", items: [MY] },
     ];
-  // Новые рабочие роли (Этап 5): смена + задачи (за флагом) + read-only просмотр.
+  // Новые рабочие роли (Этап 5): смена + задачи (за флагом) + приёмка группами (RECEIVER) + просмотр.
   if ((WORK_ROLES as readonly string[]).includes(role))
     return [
-      { title: "Работа", items: [...(tasksEnabled ? [TASKS] : []), SHIFT] },
+      { title: "Работа", items: [...(tasksEnabled ? [TASKS] : []), ...receivingItem, SHIFT] },
       { title: "Просмотр", items: [STOCK, HISTORY] },
       { title: "Моё", items: [MY, FEED] },
     ];
@@ -105,6 +115,8 @@ function NavContent({
   role,
   canStartShift,
   tasksEnabled,
+  canReceive,
+  groupReceiving,
   name,
   collapsed,
   onNavigate,
@@ -113,13 +125,15 @@ function NavContent({
   role: Role;
   canStartShift: boolean;
   tasksEnabled: boolean;
+  canReceive: boolean;
+  groupReceiving: boolean;
   name: string;
   collapsed: boolean;
   onNavigate?: () => void;
   onToggleCollapse?: () => void;
 }) {
   const pathname = usePathname();
-  const groups = groupsFor(role, canStartShift, tasksEnabled);
+  const groups = groupsFor(role, canStartShift, tasksEnabled, canReceive, groupReceiving);
 
   const itemClass = (active: boolean) =>
     clsx(
@@ -261,16 +275,20 @@ export function AppNav({
   roles,
   name,
   tasksEnabled,
+  groupReceivingEnabled = false,
 }: {
   role: Role;
   roles: Role[];
   name: string;
   tasksEnabled: boolean;
+  groupReceivingEnabled?: boolean;
 }) {
   const [mobileOpen, setMobileOpen] = useState(false);
   const [collapsed, setCollapsed] = useState(false);
   // «Смена» показываем всем с рабочей ролью — включая ADMIN с дополнительной рабочей ролью.
   const canStartShift = roles.some((r) => (WORK_ROLES as readonly string[]).includes(r));
+  // «Приёмка группами» — только для роли RECEIVER (страница дополнительно требует активную смену).
+  const canReceive = roles.includes("RECEIVER");
 
   return (
     <>
@@ -285,6 +303,8 @@ export function AppNav({
           role={role}
           canStartShift={canStartShift}
           tasksEnabled={tasksEnabled}
+          canReceive={canReceive}
+          groupReceiving={groupReceivingEnabled}
           name={name}
           collapsed={collapsed}
           onToggleCollapse={() => setCollapsed((v) => !v)}
@@ -328,6 +348,8 @@ export function AppNav({
               role={role}
               canStartShift={canStartShift}
               tasksEnabled={tasksEnabled}
+              canReceive={canReceive}
+              groupReceiving={groupReceivingEnabled}
               name={name}
               collapsed={false}
               onNavigate={() => setMobileOpen(false)}

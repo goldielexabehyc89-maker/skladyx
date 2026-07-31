@@ -51,6 +51,11 @@ export function workflowTasksEnabled(): boolean {
 export function warehouseZonesEnabled(): boolean {
   return process.env.WAREHOUSE_ZONES_ENABLED === "true";
 }
+// Этап 5/Пакет 4: групповая приёмка + температурный контроль. false — экран приёмки группами
+// скрыт, action запрещён; старые процессы работают как раньше.
+export function groupReceivingEnabled(): boolean {
+  return process.env.GROUP_RECEIVING_ENABLED === "true";
+}
 
 // Эффективный набор ролей.
 // При TENANT_AUTH=true роли всегда берутся из session.roles (их наполняет свежая

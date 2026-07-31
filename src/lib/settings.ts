@@ -12,6 +12,9 @@ export const companySettingsSchema = z.object({
   // Размер этикетки термопринтера, мм
   labelWidthMm: z.number().int().min(20).max(150).default(58),
   labelHeightMm: z.number().int().min(20).max(150).default(40),
+  // Этап 5/Пакет 4: общий порог допустимой температуры X, °C (nullable, без prod-default).
+  // Пока null — групповая приёмка заблокирована. temperature <= X → STORAGE, иначе COOLING.
+  tempThresholdX: z.number().min(-100).max(100).nullable().default(null),
 });
 
 export type CompanySettings = z.infer<typeof companySettingsSchema>;

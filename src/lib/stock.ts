@@ -11,6 +11,7 @@ import { Prisma, type ItemUnit, type MovementDocType, type UnitStatus } from "@p
 
 export type Loc =
   | { kind: "cell"; warehouseId: string; cellId: string }
+  | { kind: "zone"; warehouseId: string; zoneId: string } // Пакет 4: виртуальная зона (RECEIVING и др.)
   | { kind: "warehouse"; warehouseId: string }
   | { kind: "employee"; employeeId: string }
   | { kind: "employeePending"; employeeId: string }
@@ -22,6 +23,8 @@ export function locKey(loc: Exclude<Loc, null>): string {
   switch (loc.kind) {
     case "cell":
       return `C:${loc.cellId}`;
+    case "zone":
+      return `Z:${loc.zoneId}`;
     case "warehouse":
       return `W:${loc.warehouseId}`;
     case "employee":
@@ -36,6 +39,7 @@ function locFields(loc: Loc, side: "from" | "to") {
   return {
     [`${p}WarehouseId`]: loc && "warehouseId" in loc ? loc.warehouseId : null,
     [`${p}CellId`]: loc?.kind === "cell" ? loc.cellId : null,
+    [`${p}ZoneId`]: loc?.kind === "zone" ? loc.zoneId : null,
     [`${p}EmployeeId`]:
       loc?.kind === "employee" || loc?.kind === "employeePending" ? loc.employeeId : null,
     [`${p}Pending`]: loc?.kind === "employeePending",
@@ -46,6 +50,7 @@ function balanceFields(loc: Exclude<Loc, null>) {
   return {
     warehouseId: "warehouseId" in loc ? loc.warehouseId : null,
     cellId: loc.kind === "cell" ? loc.cellId : null,
+    zoneId: loc.kind === "zone" ? loc.zoneId : null,
     employeeId: loc.kind === "employee" || loc.kind === "employeePending" ? loc.employeeId : null,
   };
 }

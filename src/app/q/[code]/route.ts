@@ -46,6 +46,9 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ code
         return hasRole(session, "ADMIN") ? `/warehouse/employees/${qr.refId}` : "/warehouse";
       case "PICKLIST":
         return `/warehouse/picklists/${qr.refId}`;
+      case "GROUP":
+        // Пакет 4: скан группы/паллеты — на доску задач (там размещение назначенным погрузчиком)
+        return "/warehouse/tasks";
     }
   };
 

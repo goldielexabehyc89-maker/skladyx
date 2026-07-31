@@ -1,6 +1,7 @@
 import { requireAdminPage } from "@/lib/auth";
 import { scoped } from "@/lib/tenant";
 import { getSettings } from "@/lib/settings";
+import { groupReceivingEnabled } from "@/lib/roles";
 import { updateCompanySettingsAction } from "@/app/actions/settings";
 import { ActionForm } from "@/components/action-form";
 import { Card, CardTitle, Field, PageTitle } from "@/components/ui";
@@ -9,6 +10,7 @@ export default async function SettingsPage() {
   const session = await requireAdminPage();
   const s = scoped(session);
   const settings = await getSettings(s.companyId);
+  const zonesTemp = groupReceivingEnabled();
 
   return (
     <div className="mx-auto flex w-full max-w-2xl flex-col gap-4">
@@ -57,6 +59,22 @@ export default async function SettingsPage() {
               defaultValue={String(settings.labelHeightMm)}
             />
           </div>
+          {zonesTemp && (
+            <div className="border-t border-[#eee] pt-3">
+              <Field
+                label="Порог температуры X, °C (для групповой приёмки)"
+                name="tempThresholdX"
+                type="number"
+                inputMode="decimal"
+                step="0.1"
+                defaultValue={settings.tempThresholdX === null ? "" : String(settings.tempThresholdX)}
+              />
+              <p className="mt-1 text-xs text-neutral-400">
+                Пусто — групповая приёмка заблокирована. При приёмке: температура ≤ X → хранение,
+                выше X → охлаждение.
+              </p>
+            </div>
+          )}
         </ActionForm>
       </Card>
     </div>

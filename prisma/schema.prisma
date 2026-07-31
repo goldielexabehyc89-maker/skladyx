@@ -38,6 +38,7 @@ enum QrType {
   CELL
   EMPLOYEE
   PICKLIST
+  GROUP
 }
 
 enum ReceiptStatus {
@@ -129,6 +130,7 @@ model Company {
   users             User[]
   warehouses        Warehouse[]
   warehouseZones    WarehouseZone[]
+  handlingGroups    HandlingGroup[]
   items             Item[]
   uoms              Uom[]
   suppliers         Supplier[]
@@ -410,12 +412,13 @@ model Warehouse {
   sortOrder Int      @default(0)
   createdAt DateTime @default(now())
 
-  company       Company         @relation(fields: [companyId], references: [id])
-  cells         Cell[]
-  zones         WarehouseZone[]
-  userLinks     UserWarehouse[]
-  workShifts    WorkShift[]
-  workflowTasks WorkflowTask[]
+  company        Company         @relation(fields: [companyId], references: [id])
+  cells          Cell[]
+  zones          WarehouseZone[]
+  handlingGroups HandlingGroup[]
+  userLinks      UserWarehouse[]
+  workShifts     WorkShift[]
+  workflowTasks  WorkflowTask[]
 
   @@index([companyId])
 }
@@ -474,6 +477,42 @@ model Cell {
   @@unique([warehouseId, code])
   @@index([companyId])
   @@index([zoneId])
+}
+
+// Этап 5/Пакет 4: неделимая группа/паллета приёмки. Фактическое местоположение — из
+// StockBalance/ledger (locKey Z:<receivingZone> → C:<cell>), СВОЕГО cellId нет (нет второго
+// источника истины). Приёмка поддерживает TrackingType=LOT (для UNIT — ошибка в actions).
+enum HandlingGroupStatus {
+  IN_RECEIVING // принята в виртуальную зону RECEIVING
+  AWAITING_STORAGE // temperature <= X — ждёт размещения в STORAGE
+  AWAITING_COOLING // temperature > X — ждёт размещения в COOLING
+  IN_STORAGE
+  IN_COOLING
+}
+
+model HandlingGroup {
+  id           String              @id @default(cuid())
+  companyId    String
+  warehouseId  String
+  itemId       String
+  lotId        String // связь с партией (приход этой группы)
+  qty          Decimal             @db.Decimal(14, 3) // принятое количество (целое штук)
+  temperature  Decimal             @db.Decimal(6, 2) // исходная температура, °C
+  thresholdX   Decimal             @db.Decimal(6, 2) // снимок порога X на момент приёмки
+  status       HandlingGroupStatus @default(IN_RECEIVING)
+  dedupeKey    String
+  acceptedById String
+  acceptedAt   DateTime            @default(now())
+  createdAt    DateTime            @default(now())
+  updatedAt    DateTime            @updatedAt
+
+  company   Company   @relation(fields: [companyId], references: [id])
+  warehouse Warehouse @relation(fields: [warehouseId], references: [id])
+
+  @@unique([companyId, dedupeKey])
+  @@index([companyId, status])
+  @@index([warehouseId])
+  @@index([lotId])
 }
 
 model Uom {
@@ -660,6 +699,7 @@ model StockBalance {
   locKey      String
   warehouseId String? // денормализация для выборок
   cellId      String?
+  zoneId      String? // Пакет 4: виртуальная зона (locKey Z:<zoneId>), напр. RECEIVING
   employeeId  String?
   qty         Decimal @db.Decimal(14, 3)
 
@@ -667,6 +707,7 @@ model StockBalance {
   @@index([companyId, itemId])
   @@index([companyId, warehouseId, cellId])
   @@index([companyId, employeeId])
+  @@index([companyId, zoneId])
 }
 
 // Append-only журнал движений. Пустая сторона = «внешний мир» (приемка/списание).
@@ -681,10 +722,12 @@ model StockMovement {
   qty             Decimal         @db.Decimal(14, 3)
   fromWarehouseId String?
   fromCellId      String?
+  fromZoneId      String? // Пакет 4: виртуальная зона-источник (Z:<zoneId>)
   fromEmployeeId  String?
   fromPending     Boolean         @default(false) // сторона "EP:" — ждёт подтверждения
   toWarehouseId   String?
   toCellId        String?
+  toZoneId        String? // Пакет 4: виртуальная зона-назначение (Z:<zoneId>)
   toEmployeeId    String?
   toPending       Boolean         @default(false)
   createdById     String

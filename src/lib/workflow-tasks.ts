@@ -17,7 +17,9 @@ export interface TaskResult {
 class EngineError extends Error {}
 const ACTIVE: { in: TaskStatus[] } = { in: ["ASSIGNED", "IN_PROGRESS", "HANDOFF_PENDING"] };
 
-async function lockCompany(tx: Tx, companyId: string): Promise<void> {
+// Экспортируется: групповая приёмка (Пакет 4) создаёт задачу в СВОЕЙ транзакции под этим же
+// локом (createWorkflowTaskInTx), чтобы приход + группа + задача были атомарны.
+export async function lockCompany(tx: Tx, companyId: string): Promise<void> {
   // $executeRaw: pg_advisory_xact_lock возвращает void — $queryRaw падает на десериализации.
   await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext('skladyx:tasks'), hashtext(${companyId}))`;
 }
@@ -82,8 +84,7 @@ async function emit(
   await logEvent({ companyId, type, title, body, url: "/warehouse/tasks", warehouseIds, userIds, key, actorId });
 }
 
-// ── Создание (идемпотентно по dedupeKey) ──
-export async function createWorkflowTask(input: {
+export interface TaskCreateInput {
   companyId: string;
   warehouseId: string;
   type: string;
@@ -97,63 +98,93 @@ export async function createWorkflowTask(input: {
   dedupeKey: string;
   loadUnits?: number;
   dependsOn?: string[];
-}): Promise<{ task: WorkflowTask; created: boolean }> {
+}
+export interface TaskCreateResult {
+  task: WorkflowTask;
+  created: boolean;
+  assignedTo: string | null;
+}
+
+// ── Создание в ПЕРЕДАННОЙ транзакции (идемпотентно по dedupeKey, авто-назначение) ──
+// Вызывающий ДОЛЖЕН держать lockCompany(tx). События эмитятся после коммита через emitTaskCreated.
+// Позволяет групповой приёмке (Пакет 4) сделать приход + группу + задачу одной транзакцией.
+export async function createWorkflowTaskInTx(tx: Tx, input: TaskCreateInput): Promise<TaskCreateResult> {
   if (!isTaskType(input.type)) throw new Error(`Неизвестный тип задачи: ${input.type}`);
   const loadUnits = Math.max(1, Math.floor(input.loadUnits ?? 1));
   const deps = Array.from(new Set(input.dependsOn ?? [])).filter((d) => d && d !== "");
 
+  const existing = await tx.workflowTask.findUnique({
+    where: { companyId_dedupeKey: { companyId: input.companyId, dedupeKey: input.dedupeKey } },
+  });
+  if (existing) return { task: existing, created: false, assignedTo: null };
+
+  // Tenant-изоляция зависимостей: каждый dependsOn существует И принадлежит этой организации.
+  if (deps.length) {
+    const validDeps = await tx.workflowTask.count({
+      where: { id: { in: deps }, companyId: input.companyId },
+    });
+    if (validDeps !== deps.length) throw new EngineError("Зависимость не найдена в этой организации");
+  }
+
+  // BLOCKED, если есть незавершённые зависимости
+  let status: TaskStatus = "QUEUED";
+  if (deps.length) {
+    const done = await tx.workflowTask.count({ where: { id: { in: deps }, status: "COMPLETED" } });
+    if (done < deps.length) status = "BLOCKED";
+  }
+  const task = await tx.workflowTask.create({
+    data: {
+      companyId: input.companyId,
+      warehouseId: input.warehouseId,
+      type: input.type,
+      requiredRole: input.requiredRole,
+      priority: input.priority ?? "NORMAL",
+      status,
+      title: input.title,
+      description: input.description,
+      actionUrl: input.actionUrl,
+      subjectType: input.subjectType,
+      subjectId: input.subjectId,
+      dedupeKey: input.dedupeKey,
+      loadUnits,
+      dependencies: deps.length ? { create: deps.map((dependsOnTaskId) => ({ dependsOnTaskId })) } : undefined,
+    },
+  });
+  let assignedTo: string | null = null;
+  if (status === "QUEUED") assignedTo = await assignInTx(tx, task);
+  const fresh = await tx.workflowTask.findUniqueOrThrow({ where: { id: task.id } });
+  return { task: fresh, created: true, assignedTo };
+}
+
+// События создания/назначения задачи — вызывать ПОСЛЕ коммита транзакции.
+export async function emitTaskCreated(res: TaskCreateResult): Promise<void> {
+  if (!res.created) return;
+  const t = res.task;
+  await emit("task_created", t.companyId, "Задача создана", t.title, [t.warehouseId], undefined, `task:${t.id}:created`);
+  if (res.assignedTo)
+    await emit("task_assigned", t.companyId, "Задача назначена", t.title, [t.warehouseId], [res.assignedTo]);
+}
+
+// События завершения задачи — вызывать ПОСЛЕ коммита (для доменных обработчиков вроде размещения группы).
+export async function emitTaskCompleted(info: {
+  companyId: string;
+  warehouseId: string;
+  title: string;
+  taskId: string;
+  unblocked: TaskBrief[];
+}): Promise<void> {
+  await emit("task_completed", info.companyId, "Задача выполнена", info.title, [info.warehouseId], undefined, `task:${info.taskId}:completed`);
+  for (const u of info.unblocked)
+    await emit("task_unblocked", info.companyId, "Задача разблокирована", u.title, [u.warehouseId], undefined, `task:${u.id}:unblocked`);
+}
+
+// ── Создание (идемпотентно по dedupeKey, собственная транзакция + lock) ──
+export async function createWorkflowTask(input: TaskCreateInput): Promise<{ task: WorkflowTask; created: boolean }> {
   const res = await prisma.$transaction(async (tx) => {
     await lockCompany(tx, input.companyId);
-    const existing = await tx.workflowTask.findUnique({
-      where: { companyId_dedupeKey: { companyId: input.companyId, dedupeKey: input.dedupeKey } },
-    });
-    if (existing) return { task: existing, created: false, assignedTo: null as string | null };
-
-    // Tenant-изоляция зависимостей: каждый dependsOn должен существовать И принадлежать
-    // этой же организации. Иначе — понятная ошибка и полный откат tx (ни задачи, ни связей).
-    if (deps.length) {
-      const validDeps = await tx.workflowTask.count({
-        where: { id: { in: deps }, companyId: input.companyId },
-      });
-      if (validDeps !== deps.length)
-        throw new EngineError("Зависимость не найдена в этой организации");
-    }
-
-    // BLOCKED, если есть незавершённые зависимости
-    let status: TaskStatus = "QUEUED";
-    if (deps.length) {
-      const done = await tx.workflowTask.count({ where: { id: { in: deps }, status: "COMPLETED" } });
-      if (done < deps.length) status = "BLOCKED";
-    }
-    const task = await tx.workflowTask.create({
-      data: {
-        companyId: input.companyId,
-        warehouseId: input.warehouseId,
-        type: input.type,
-        requiredRole: input.requiredRole,
-        priority: input.priority ?? "NORMAL",
-        status,
-        title: input.title,
-        description: input.description,
-        actionUrl: input.actionUrl,
-        subjectType: input.subjectType,
-        subjectId: input.subjectId,
-        dedupeKey: input.dedupeKey,
-        loadUnits,
-        dependencies: deps.length ? { create: deps.map((dependsOnTaskId) => ({ dependsOnTaskId })) } : undefined,
-      },
-    });
-    let assignedTo: string | null = null;
-    if (status === "QUEUED") assignedTo = await assignInTx(tx, task);
-    const fresh = await tx.workflowTask.findUniqueOrThrow({ where: { id: task.id } });
-    return { task: fresh, created: true, assignedTo };
+    return createWorkflowTaskInTx(tx, input);
   });
-
-  if (res.created) {
-    await emit("task_created", input.companyId, "Задача создана", res.task.title, [input.warehouseId], undefined, `task:${res.task.id}:created`);
-    if (res.assignedTo)
-      await emit("task_assigned", input.companyId, "Задача назначена", res.task.title, [input.warehouseId], [res.assignedTo]);
-  }
+  await emitTaskCreated(res);
   return { task: res.task, created: res.created };
 }
 

@@ -3,7 +3,8 @@ import { redirect } from "next/navigation";
 import { requireUser } from "@/lib/auth";
 import { scoped } from "@/lib/tenant";
 import { prisma } from "@/lib/db";
-import { hasRole, isWorkRole, workflowTasksEnabled } from "@/lib/roles";
+import { hasRole, isWorkRole, workflowTasksEnabled, groupReceivingEnabled } from "@/lib/roles";
+import { eligibleCellsForGroup } from "@/lib/group-receiving";
 import { allowedWarehouses } from "@/lib/warehouse-access";
 import { getActiveShift } from "@/lib/work-shift";
 import { ROLE_LABEL } from "@/lib/role-labels";
@@ -169,6 +170,16 @@ export default async function TasksPage({
     include: { user: { select: { id: true, name: true } } },
   });
 
+  // Пакет 4: для текущей PLACE_GROUP-задачи в работе — подходящие пустые ячейки для размещения.
+  let placement: { taskId: string; routeLabel: string; cells: { id: string; code: string; level: number | null; recommended: boolean }[] } | null = null;
+  if (current && current.type === "PLACE_GROUP" && current.status === "IN_PROGRESS" && groupReceivingEnabled()) {
+    const group = await prisma.handlingGroup.findFirst({ where: { id: current.subjectId ?? "", companyId: s.companyId } });
+    if (group && (group.status === "AWAITING_STORAGE" || group.status === "AWAITING_COOLING")) {
+      const cells = await eligibleCellsForGroup(s.companyId, group.warehouseId, group.status);
+      placement = { taskId: current.id, routeLabel: group.status === "AWAITING_COOLING" ? "охлаждение" : "хранение", cells };
+    }
+  }
+
   return (
     <div className="mx-auto flex w-full max-w-lg flex-col gap-4">
       {isAdmin && <ViewToggle active="mine" />}
@@ -179,6 +190,7 @@ export default async function TasksPage({
         normal={assigned.filter((t) => t.priority === "NORMAL").map(toDTO)}
         incoming={incoming.map((h) => ({ handoffId: h.id, taskTitle: h.task.title, taskType: h.task.type }))}
         mates={mateShifts.map((sh) => ({ userId: sh.userId, name: sh.user.name }))}
+        placement={placement}
       />
     </div>
   );

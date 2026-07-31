@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useActionState } from "react";
+import { useActionState, useState } from "react";
 import {
   startTaskAction,
   requestHandoffAction,
@@ -9,6 +9,7 @@ import {
   rejectHandoffAction,
   type TaskActionState,
 } from "@/app/actions/tasks";
+import { completeGroupPlacementAction, type PlacementState } from "@/app/actions/group-receiving";
 import { Button, Card, CardTitle, Badge, EmptyState } from "@/components/ui";
 import { TASK_STATUS_TONE, taskStatusLabel, taskTypeLabel } from "@/lib/task-labels";
 
@@ -30,6 +31,17 @@ export interface IncomingHandoff {
   handoffId: string;
   taskTitle: string;
   taskType: string;
+}
+export interface PlacementCell {
+  id: string;
+  code: string;
+  level: number | null;
+  recommended: boolean;
+}
+export interface Placement {
+  taskId: string;
+  routeLabel: string;
+  cells: PlacementCell[];
 }
 
 const fmtTime = (iso: string) => {
@@ -119,18 +131,56 @@ function HandoffResponse({ handoffId }: { handoffId: string }) {
   );
 }
 
+// Пакет 4: завершение размещения группы (PLACE_GROUP) — выбор пустой целевой ячейки.
+function PlacementForm({ placement }: { placement: Placement }) {
+  const [state, action, pending] = useActionState<PlacementState, FormData>(completeGroupPlacementAction, {});
+  const [cellId, setCellId] = useState(placement.cells[0]?.id ?? "");
+  if (placement.cells.length === 0)
+    return (
+      <p className="text-xs text-orange-600">
+        Нет пустой активной ячейки зоны «{placement.routeLabel}». Освободите ячейку и обновите.
+      </p>
+    );
+  return (
+    <form action={action} className="flex flex-col gap-2">
+      <input type="hidden" name="taskId" value={placement.taskId} />
+      <label className="text-xs font-medium text-neutral-500">Целевая ячейка ({placement.routeLabel})</label>
+      <select
+        name="cellId"
+        value={cellId}
+        onChange={(e) => setCellId(e.target.value)}
+        className="rounded-lg border border-[#e4e4f0] px-3 py-2 text-sm"
+      >
+        {placement.cells.map((c) => (
+          <option key={c.id} value={c.id}>
+            {c.code}
+            {c.level != null ? ` · ур.${c.level}` : ""}
+            {c.recommended ? " · рекомендуется" : ""}
+          </option>
+        ))}
+      </select>
+      {state.error && <p className="text-xs text-red-600">{state.error}</p>}
+      <Button type="submit" disabled={pending} className="w-full">
+        {pending ? "…" : "Разместить группу"}
+      </Button>
+    </form>
+  );
+}
+
 export function WorkerTasks({
   current,
   urgent,
   normal,
   incoming,
   mates,
+  placement,
 }: {
   current: TaskDTO | null;
   urgent: TaskDTO[];
   normal: TaskDTO[];
   incoming: IncomingHandoff[];
   mates: Mate[];
+  placement?: Placement | null;
 }) {
   return (
     <div className="flex flex-col gap-4">
@@ -164,6 +214,7 @@ export function WorkerTasks({
                   <Button className="w-full">Открыть</Button>
                 </Link>
               )}
+              {placement && current.status === "IN_PROGRESS" && <PlacementForm placement={placement} />}
               {current.status === "IN_PROGRESS" && <HandoffForm taskId={current.id} mates={mates} />}
               {current.status === "HANDOFF_PENDING" && (
                 <p className="text-xs text-orange-600">Ожидает принятия передачи получателем.</p>
