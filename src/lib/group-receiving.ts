@@ -224,6 +224,10 @@ export async function completeGroupPlacement(input: {
       where: { lotId: group.lotId, locKey: `Z:${receiving.id}`, qty: { gt: 0 } },
     });
     if (!recvBal) throw new GroupError("Остаток группы в зоне приёмки не найден");
+    // Группа неделима: остаток в RECEIVING должен ТОЧНО равняться количеству группы.
+    // Иначе (частичный расход/доп. приход в ту же зону) — отменяем, не размещаем «что нашлось».
+    if (!recvBal.qty.equals(group.qty))
+      throw new GroupError("Остаток группы в зоне приёмки не совпадает с её количеством — размещение отменено");
 
     await applyLotMovement(tx, {
       companyId: input.companyId,
@@ -231,7 +235,7 @@ export async function completeGroupPlacement(input: {
       docId: group.id,
       itemId: group.itemId,
       lotId: group.lotId,
-      qty: recvBal.qty,
+      qty: group.qty,
       from: { kind: "zone", warehouseId: group.warehouseId, zoneId: receiving.id },
       to: { kind: "cell", warehouseId: group.warehouseId, cellId: cell.id },
       createdById: input.userId,

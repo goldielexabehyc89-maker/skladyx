@@ -13,6 +13,7 @@ import { broadcastRealtime } from "@/lib/realtime";
 import { nextNumber } from "@/lib/counters";
 import { resolveQr, parseScannedCode } from "@/lib/qr";
 import { applyLotMovement, StockError, type Loc } from "@/lib/stock";
+import { assertCellNotHeldByGroup } from "@/lib/cells";
 import { fmtQty } from "@/lib/format";
 import { sendPushToWarehouseStorekeepers } from "@/lib/push";
 import type { FormState } from "@/app/actions/warehouses";
@@ -391,6 +392,7 @@ export async function receiveOrderScanAction(
   let lotTaken: Prisma.Decimal | null = null; // сколько принято этим сканом (обычный товар)
   try {
     await prisma.$transaction(async (tx) => {
+      await assertCellNotHeldByGroup(tx, s.companyId, cell.id); // «одна ячейка = одна группа»
       // приемка создаётся при первом скане
       let receiptId = order.receiptId;
       if (!receiptId) {

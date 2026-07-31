@@ -1,6 +1,7 @@
 import "server-only";
 import { Prisma, type ZoneKind } from "@prisma/client";
 import { prisma } from "@/lib/db";
+import { StockError } from "@/lib/stock";
 import { createQrIn } from "@/lib/qr";
 import {
   STANDARD_ZONES,
@@ -13,6 +14,27 @@ import {
 // зона и уровень — метаданные Cell, locKey по-прежнему C:<cellId>.
 
 export class CellError extends Error {}
+
+// Этап 5/Пакет 4: инвариант «одна ячейка = одна группа». Старые операции размещения
+// (скан «товар→ячейка», приёмка по заказу) НЕ должны докладывать товар в ячейку, где уже
+// лежит размещённая группа/паллета (HandlingGroup IN_STORAGE/IN_COOLING). Вызывать ВНУТРИ
+// транзакции размещения. Бросает StockError (перехватывается вызывающими → {error}).
+export async function assertCellNotHeldByGroup(
+  tx: Prisma.TransactionClient,
+  companyId: string,
+  cellId: string,
+): Promise<void> {
+  const bals = await tx.stockBalance.findMany({
+    where: { companyId, cellId, qty: { gt: 0 } },
+    select: { lotId: true },
+  });
+  if (bals.length === 0) return;
+  const grp = await tx.handlingGroup.findFirst({
+    where: { companyId, status: { in: ["IN_STORAGE", "IN_COOLING"] }, lotId: { in: bals.map((b) => b.lotId) } },
+    select: { id: true },
+  });
+  if (grp) throw new StockError("Ячейка занята группой (паллетой) — размещение другого товара запрещено");
+}
 
 // Создать стандартные зоны склада в ПЕРЕДАННОЙ транзакции (идемпотентно).
 // Используется при атомарном создании склада (склад + 7 зон в одной транзакции).

@@ -8,6 +8,7 @@ import { warehouseAccess, isWhAllowed } from "@/lib/warehouse-access";
 import { resolveQr, parseScannedCode } from "@/lib/qr";
 import { logEvent } from "@/lib/events";
 import { applyLotMovement, moveUnit, StockError, type Loc } from "@/lib/stock";
+import { assertCellNotHeldByGroup } from "@/lib/cells";
 import { fmtQty } from "@/lib/format";
 import { revalidatePath } from "next/cache";
 
@@ -270,6 +271,7 @@ export async function assignCellAction(
         return { error: "Ячейка на другом складе — оформите перемещение" };
       const item = await s.item(unit.itemId);
       await prisma.$transaction(async (tx) => {
+        await assertCellNotHeldByGroup(tx, s.companyId, cell.id); // «одна ячейка = одна группа»
         await moveUnit(tx, {
           companyId: s.companyId,
           docType: "CELL_ASSIGN",
@@ -305,6 +307,7 @@ export async function assignCellAction(
 
     let moved = 0;
     await prisma.$transaction(async (tx) => {
+      await assertCellNotHeldByGroup(tx, s.companyId, cell.id); // «одна ячейка = одна группа»
       for (const b of sources) {
         const from: Loc = b.cellId
           ? { kind: "cell", warehouseId: cell.warehouseId, cellId: b.cellId }

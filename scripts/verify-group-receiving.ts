@@ -5,7 +5,7 @@
 import { PrismaClient, type Role } from "@prisma/client";
 import bcrypt from "bcryptjs";
 import { createHandlingGroup, completeGroupPlacement, eligibleCellsForGroup } from "@/lib/group-receiving";
-import { ensureStandardZones, createCellsInZone } from "@/lib/cells";
+import { ensureStandardZones, createCellsInZone, assertCellNotHeldByGroup } from "@/lib/cells";
 import { startWorkflowTask } from "@/lib/workflow-tasks";
 import { updateSettings } from "@/lib/settings";
 
@@ -237,6 +237,30 @@ async function main() {
 
   console.log("20) push не создаётся");
   ok("нет push-подписок у тест-пользователей", (await prisma.pushSubscription.count({ where: { userId: { in: UIDS } } })) === 0);
+
+  console.log("21) «одна ячейка = одна группа»: старые операции не докладывают в ячейку с группой");
+  // S3 содержит g16 (IN_STORAGE) из блока 16
+  const held = await err(() => prisma.$transaction((t) => assertCellNotHeldByGroup(t, companyId, S3)));
+  ok("ячейка с размещённой группой → старая операция отклонена", held.includes("занята группой"), held);
+  const emptyCode = "P4EMPTY";
+  await createCellsInZone({ companyId, warehouseId: W, zoneId: zStorage, codes: [emptyCode], level: 1 });
+  const emptyCell = (await prisma.cell.findFirstOrThrow({ where: { warehouseId: W, code: emptyCode } })).id;
+  const freeChk = await err(() => prisma.$transaction((t) => assertCellNotHeldByGroup(t, companyId, emptyCell)));
+  ok("пустая ячейка → старая операция разрешена", freeChk === "", freeChk);
+
+  console.log("22) размещение отклоняется при несовпадении остатка в RECEIVING с количеством группы");
+  await freeLoader(L1);
+  const g22 = await G(3, 5);
+  const g22row = await prisma.handlingGroup.findUniqueOrThrow({ where: { id: g22.groupId } });
+  // тест-манипуляция: имитируем расхождение остатка в зоне приёмки (5 → 4)
+  await prisma.stockBalance.updateMany({ where: { lotId: g22row.lotId, locKey: `Z:${zRecv}` }, data: { qty: 4 } });
+  const t22 = await taskOf(g22.groupId);
+  await startWorkflowTask(L1, companyId, t22!.id);
+  const r22 = await err(() => completeGroupPlacement({ companyId, userId: L1, taskId: t22!.id, cellId: emptyCell }));
+  ok("несовпадение остатка → размещение отклонено", r22.includes("не совпадает"), r22);
+  ok("после отказа: группа AWAITING, в ячейку ничего не перенесено",
+    (await prisma.handlingGroup.findUniqueOrThrow({ where: { id: g22.groupId } })).status === "AWAITING_STORAGE" &&
+    (await bal(g22row.lotId, `C:${emptyCell}`)) === null);
 }
 
 main()
