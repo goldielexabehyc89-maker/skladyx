@@ -8,6 +8,7 @@ import { createHandlingGroup, completeGroupPlacement, eligibleCellsForGroup } fr
 import { ensureStandardZones, createCellsInZone, assertCellNotHeldByGroup } from "@/lib/cells";
 import { startWorkflowTask } from "@/lib/workflow-tasks";
 import { updateSettings } from "@/lib/settings";
+import { applyLotMovement } from "@/lib/stock";
 
 const prisma = new PrismaClient();
 let failures = 0;
@@ -44,6 +45,24 @@ const freeLoader = (userId: string) => prisma.workflowTask.updateMany({ where: {
 const mkShift = (userId: string, role: Role, wh: string) => prisma.workShift.create({ data: { companyId, userId, warehouseId: wh, role } });
 const taskOf = (groupId: string) => prisma.workflowTask.findFirst({ where: { subjectId: groupId, type: "PLACE_GROUP" } });
 const bal = (lotId: string, locKey: string) => prisma.stockBalance.findFirst({ where: { lotId, locKey } });
+
+// обычная партия с остатком на складе (для имитации «старой операции» размещения)
+async function mkWarehouseLot(qty: number): Promise<string> {
+  const rcpt = await prisma.receipt.create({ data: { companyId, number: 990000 + ++seq, warehouseId: W, status: "POSTED", createdById: RUSER } });
+  const rline = await prisma.receiptLine.create({ data: { companyId, receiptId: rcpt.id, itemId: lotItem, qty } });
+  const lot = await prisma.lot.create({ data: { companyId, itemId: lotItem, receiptLineId: rline.id, qtyReceived: qty } });
+  await prisma.$transaction((tx) => applyLotMovement(tx, { companyId, docType: "RECEIPT", docId: rcpt.id, itemId: lotItem, lotId: lot.id, qty, from: null, to: { kind: "warehouse", warehouseId: W }, createdById: RUSER }));
+  return lot.id;
+}
+// «старая операция»: как scan.ts — assertCellNotHeldByGroup + движение партии склад→ячейку
+async function oldOpPlace(cellId: string, lotId: string): Promise<string> {
+  return err(() => prisma.$transaction(async (tx) => {
+    await assertCellNotHeldByGroup(tx, companyId, cellId);
+    const b = await tx.stockBalance.findFirst({ where: { lotId, locKey: `W:${W}`, qty: { gt: 0 } } });
+    if (!b) throw new Error("нет остатка на складе");
+    await applyLotMovement(tx, { companyId, docType: "CELL_ASSIGN", docId: cellId, itemId: lotItem, lotId, qty: b.qty, from: { kind: "warehouse", warehouseId: W }, to: { kind: "cell", warehouseId: W, cellId }, createdById: L1 });
+  }));
+}
 
 async function place(loader: string, groupId: string, cellId: string): Promise<string> {
   const t = await taskOf(groupId);
@@ -261,6 +280,31 @@ async function main() {
   ok("после отказа: группа AWAITING, в ячейку ничего не перенесено",
     (await prisma.handlingGroup.findUniqueOrThrow({ where: { id: g22.groupId } })).status === "AWAITING_STORAGE" &&
     (await bal(g22row.lotId, `C:${emptyCell}`)) === null);
+
+  console.log("23) гонка: старая операция и размещение группы за одну пустую ячейку — успех один");
+  await freeLoader(L1);
+  await createCellsInZone({ companyId, warehouseId: W, zoneId: zCooling, codes: ["P4RACE"], level: null });
+  const CC = (await prisma.cell.findFirstOrThrow({ where: { warehouseId: W, code: "P4RACE" } })).id;
+  const gRace = await G(9); // AWAITING_COOLING
+  const tRace = await taskOf(gRace.groupId);
+  await startWorkflowTask(L1, companyId, tRace!.id);
+  const LL = await mkWarehouseLot(2);
+  const [rGroup, rOld] = await Promise.all([
+    err(() => completeGroupPlacement({ companyId, userId: L1, taskId: tRace!.id, cellId: CC })),
+    oldOpPlace(CC, LL),
+  ]);
+  ok("успешна ровно одна операция (вторая отклонена)", (rGroup === "") !== (rOld === ""), `group="${rGroup}" old="${rOld}"`);
+  ok("в ячейке ровно одна позиция (одна партия qty>0)", (await prisma.stockBalance.count({ where: { locKey: `C:${CC}`, qty: { gt: 0 } } })) === 1);
+  // очистка вспомогательной партии LL
+  await prisma.stockMovement.deleteMany({ where: { lotId: LL } });
+  await prisma.stockBalance.deleteMany({ where: { lotId: LL } });
+  const llRl = (await prisma.lot.findUnique({ where: { id: LL }, select: { receiptLineId: true } }))?.receiptLineId;
+  await prisma.lot.deleteMany({ where: { id: LL } });
+  if (llRl) {
+    const rid = (await prisma.receiptLine.findUnique({ where: { id: llRl }, select: { receiptId: true } }))?.receiptId;
+    await prisma.receiptLine.deleteMany({ where: { id: llRl } });
+    if (rid) await prisma.receipt.deleteMany({ where: { id: rid } });
+  }
 }
 
 main()

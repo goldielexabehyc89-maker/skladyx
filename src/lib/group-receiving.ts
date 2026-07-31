@@ -2,6 +2,7 @@ import "server-only";
 import { Prisma, type HandlingGroupStatus } from "@prisma/client";
 import { prisma } from "@/lib/db";
 import { applyLotMovement } from "@/lib/stock";
+import { lockCell } from "@/lib/cells";
 import { createQrIn } from "@/lib/qr";
 import { nextNumber } from "@/lib/counters";
 import { getSettings } from "@/lib/settings";
@@ -204,7 +205,9 @@ export async function completeGroupPlacement(input: {
     if (!cell.zone || cell.zone.kind !== targetKind)
       throw new GroupError(targetKind === "STORAGE" ? "Нужна ячейка зоны хранения" : "Нужна ячейка зоны охлаждения");
 
-    // пустая (одна ячейка — одна группа); повторная проверка под advisory-lock
+    // пустая (одна ячейка — одна группа). Берём per-cell advisory-lock ДО проверки занятости —
+    // тем же ключом, что и старые операции (assertCellNotHeldByGroup), — чтобы исключить гонку.
+    await lockCell(tx, input.companyId, cell.id);
     if (await cellIsBusy(tx, cell.id)) throw new GroupError("Ячейка занята — выберите пустую");
 
     // STORAGE: нижний доступный уровень (не класть выше при свободной ниже)

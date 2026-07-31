@@ -15,6 +15,13 @@ import {
 
 export class CellError extends Error {}
 
+// Транзакционный advisory-lock по (companyId, cellId). Общий ключ сериализует размещение
+// группы и старые операции размещения на ОДНОЙ ячейке: оба пути берут этот лок, поэтому
+// «увидели пустую ячейку → оба положили» невозможно. $executeRaw (lock возвращает void).
+export async function lockCell(tx: Prisma.TransactionClient, companyId: string, cellId: string): Promise<void> {
+  await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext('skladyx:cell'), hashtext(${`${companyId}:${cellId}`}))`;
+}
+
 // Этап 5/Пакет 4: инвариант «одна ячейка = одна группа». Старые операции размещения
 // (скан «товар→ячейка», приёмка по заказу) НЕ должны докладывать товар в ячейку, где уже
 // лежит размещённая группа/паллета (HandlingGroup IN_STORAGE/IN_COOLING). Вызывать ВНУТРИ
@@ -24,6 +31,7 @@ export async function assertCellNotHeldByGroup(
   companyId: string,
   cellId: string,
 ): Promise<void> {
+  await lockCell(tx, companyId, cellId); // защита от гонки: держим ячейку до конца транзакции
   const bals = await tx.stockBalance.findMany({
     where: { companyId, cellId, qty: { gt: 0 } },
     select: { lotId: true },
