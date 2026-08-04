@@ -338,6 +338,16 @@ export async function cancelWorkflowTask(taskId: string): Promise<void> {
     const t = await tx.workflowTask.findUnique({ where: { id: taskId } });
     if (!t || t.status === "COMPLETED" || t.status === "CANCELLED") return null;
     await lockCompany(tx, t.companyId);
+    // Пакет 5: активное охлаждение нельзя отменить — иначе группа останется IN_COOLING без
+    // действующей задачи. Нужно повторно измерить и вывезти (RETRIEVE_COOLING завершится сам).
+    if (t.type === "RETRIEVE_COOLING") {
+      const activeSession = await tx.coolingSession.findFirst({
+        where: { id: t.subjectId ?? "", status: "ACTIVE" },
+        select: { id: true },
+      });
+      if (activeSession)
+        throw new EngineError("Активное охлаждение нельзя отменить — измерьте температуру и вывезите группу");
+    }
     // Незавершённую (PENDING) передачу закрываем в ЭТОЙ ЖЕ транзакции — иначе устаревшая
     // передача могла бы «воскресить» отменённую задачу при accept/reject.
     await tx.taskHandoff.updateMany({

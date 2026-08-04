@@ -13,6 +13,7 @@ export function DueActivator() {
     const tick = () => {
       if (!stopped) void activateDueTasksAction().catch(() => {});
     };
+    tick(); // сразу при открытии экрана, затем каждые 30 секунд
     const t = setInterval(tick, 30_000);
     return () => {
       stopped = true;

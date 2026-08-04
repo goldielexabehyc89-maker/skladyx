@@ -58,6 +58,31 @@ async function pickReservableStorageCell(
   return null;
 }
 
+// Вывоз после охлаждения: приоритет нижних уровней (1 → 2), затем верхний резерв (ур. 3+).
+// Внутри уровня — code ASC. Каждую кандидат-ячейку блокируем и перепроверяем (пусто + не
+// зарезервирована); занятую конкурентно пропускаем. Верхний резерв — гарантированный fallback
+// (он держится за эту сессию, старые операции/размещения в него не кладут).
+async function pickRetrievalCell(tx: Tx, companyId: string, warehouseId: string, reservedCellId: string): Promise<string> {
+  for (const lvl of [1, 2]) {
+    const cands = await tx.cell.findMany({
+      where: { companyId, warehouseId, isActive: true, level: lvl, zone: { kind: "STORAGE" } },
+      select: { id: true },
+      orderBy: { code: "asc" },
+    });
+    for (const c of cands) {
+      await lockCell(tx, companyId, c.id);
+      const [bal, unit, res] = await Promise.all([
+        tx.stockBalance.findFirst({ where: { cellId: c.id, qty: { gt: 0 } }, select: { id: true } }),
+        tx.itemUnit.findFirst({ where: { cellId: c.id }, select: { id: true } }),
+        tx.cellReservation.findFirst({ where: { cellId: c.id, status: "ACTIVE" }, select: { id: true } }),
+      ]);
+      if (!bal && !unit && !res) return c.id;
+    }
+  }
+  await lockCell(tx, companyId, reservedCellId); // верхний резерв — гарантированный fallback
+  return reservedCellId;
+}
+
 // Старт охлаждения ВНУТРИ транзакции размещения группы в COOLING-ячейку. Требует R>0 и свободный
 // резерв уровня 3+, иначе бросает CoolingError (без частичных изменений — вся tx откатится).
 // Делает: перенос группы RECEIVING→COOLING (ядро), IN_COOLING, CoolingSession(снимки X/R),
@@ -172,26 +197,29 @@ export async function completeCoolingRetrieval(input: {
       return { companyId: input.companyId, warehouseId: group.warehouseId, title: task.title, taskId: task.id, unblocked: [] as { id: string; title: string; warehouseId: string }[], nextTaskRes: next, placed: false };
     }
 
-    // temp <= X — атомарный вывоз в зарезервированную ячейку
+    // temp <= X — вывоз всей группы. Приоритет: свободная ячейка ур.1 → ур.2 → верхний резерв (ур.3+).
     const reservation = await tx.cellReservation.findFirst({ where: { sessionId: session.id, status: "ACTIVE" } });
     if (!reservation) throw new CoolingError("Активный резерв ячейки не найден");
-    await lockTwoCells(tx, input.companyId, session.coolingCellId, reservation.cellId);
-    const [rbal, runit] = await Promise.all([
-      tx.stockBalance.findFirst({ where: { cellId: reservation.cellId, qty: { gt: 0 } }, select: { id: true } }),
-      tx.itemUnit.findFirst({ where: { cellId: reservation.cellId }, select: { id: true } }),
+    await lockCell(tx, input.companyId, session.coolingCellId);
+    const destCellId = await pickRetrievalCell(tx, input.companyId, group.warehouseId, reservation.cellId);
+    // финальная перепроверка целевой ячейки под локом (гарантия «одна ячейка = одна группа»)
+    const [dbal, dunit] = await Promise.all([
+      tx.stockBalance.findFirst({ where: { cellId: destCellId, qty: { gt: 0 } }, select: { id: true } }),
+      tx.itemUnit.findFirst({ where: { cellId: destCellId }, select: { id: true } }),
     ]);
-    if (rbal || runit) throw new CoolingError("Резервная ячейка занята — размещение отменено");
+    if (dbal || dunit) throw new CoolingError("Целевая ячейка занята — размещение отменено");
     const coolBal = await tx.stockBalance.findFirst({ where: { lotId: group.lotId, locKey: `C:${session.coolingCellId}`, qty: { gt: 0 } } });
     if (!coolBal || !coolBal.qty.equals(group.qty))
       throw new CoolingError("Остаток группы в ячейке охлаждения не совпадает — размещение отменено");
     await applyLotMovement(tx, {
       companyId: input.companyId, docType: "TRANSFER", docId: group.id, itemId: group.itemId, lotId: group.lotId, qty: group.qty,
       from: { kind: "cell", warehouseId: group.warehouseId, cellId: session.coolingCellId },
-      to: { kind: "cell", warehouseId: group.warehouseId, cellId: reservation.cellId },
+      to: { kind: "cell", warehouseId: group.warehouseId, cellId: destCellId },
       createdById: input.userId,
     });
     await tx.handlingGroup.update({ where: { id: group.id }, data: { status: "IN_STORAGE" } });
     await tx.coolingSession.update({ where: { id: session.id }, data: { status: "COMPLETED" } });
+    // верхний резерв освобождаем НЕЗАВИСИМО от того, положили в нижнюю ячейку или в него.
     await tx.cellReservation.update({ where: { id: reservation.id }, data: { status: "RELEASED", releasedAt: now } });
     const unblocked = await completeWorkflowTaskInTransaction(tx, task.id);
     return { companyId: input.companyId, warehouseId: group.warehouseId, title: task.title, taskId: task.id, unblocked, nextTaskRes: null as TaskCreateResult | null, placed: true };

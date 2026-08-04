@@ -8,7 +8,7 @@ import bcrypt from "bcryptjs";
 import { createHandlingGroup, completeGroupPlacement } from "@/lib/group-receiving";
 import { completeCoolingRetrieval, estimateReadyAt } from "@/lib/cooling";
 import { ensureStandardZones, createCellsInZone, assertCellNotHeldByGroup } from "@/lib/cells";
-import { startWorkflowTask, rebalanceQueuedTasks } from "@/lib/workflow-tasks";
+import { startWorkflowTask, rebalanceQueuedTasks, cancelWorkflowTask } from "@/lib/workflow-tasks";
 import { updateSettings } from "@/lib/settings";
 
 const prisma = new PrismaClient();
@@ -35,6 +35,14 @@ const cellId = async (code: string, wh = W) => (await prisma.cell.findFirstOrThr
 const placeTaskOf = (groupId: string) => prisma.workflowTask.findFirst({ where: { subjectId: groupId, type: "PLACE_GROUP" } });
 const retrieveTaskOf = (sessionId: string) => prisma.workflowTask.findFirst({ where: { subjectId: sessionId, type: "RETRIEVE_COOLING", status: { in: ["QUEUED", "ASSIGNED", "IN_PROGRESS"] } }, orderBy: { createdAt: "desc" } });
 const bal = (lotId: string, locKey: string) => prisma.stockBalance.findFirst({ where: { lotId, locKey } });
+const grp = (id: string) => prisma.handlingGroup.findUniqueOrThrow({ where: { id } });
+const sessOf = (gid: string) => prisma.coolingSession.findFirst({ where: { handlingGroupId: gid } });
+const resCellOf = async (sid: string) => (await prisma.cellReservation.findFirst({ where: { sessionId: sid }, orderBy: { createdAt: "desc" } }))?.cellId ?? "";
+const activeRes = (cid: string) => prisma.cellReservation.count({ where: { cellId: cid, status: "ACTIVE" } });
+const occupied = (cid: string) => prisma.stockBalance.count({ where: { cellId: cid, qty: { gt: 0 } } });
+// сбросить зависшую IN_PROGRESS-задачу исполнителя (после откатов размещения в конкурентных сценариях)
+const freeLoader = (u: string) => prisma.workflowTask.updateMany({ where: { assignedUserId: u, status: "IN_PROGRESS" }, data: { status: "ASSIGNED" } });
+const endShift = (u: string) => prisma.workShift.updateMany({ where: { userId: u, endedAt: null }, data: { endedAt: new Date() } });
 
 const mkGroup = (temp: number, qty = 4) => createHandlingGroup({ companyId, warehouseId: W, itemId: lotItem, qty, temperature: temp, acceptedById: RUSER, dedupeKey: dk() });
 // поставить группу в ячейку через реальный поток (PLACE_GROUP: назначить→начать→завершить)
@@ -227,6 +235,65 @@ async function main() {
 
   console.log("13) push не создаётся");
   ok("нет push-подписок у тест-пользователей", (await prisma.pushSubscription.count({ where: { userId: { in: UIDS } } })) === 0);
+
+  // §2.6: вывоз при temp<=X — приоритет нижних уровней (1 → 2), верхний резерв ур.3+ только как fallback.
+  // Детерминизм назначения: закрываем смену L2 (всё авто-назначение идёт на L1) и снимаем зависшие IN_PROGRESS.
+  await endShift(L2);
+  await freeLoader(L1);
+  await createCellsInZone({ companyId, warehouseId: W, zoneId: zStorage, codes: ["P5-LA"], level: 1 }); // свободный ур.1
+  await createCellsInZone({ companyId, warehouseId: W, zoneId: zStorage, codes: ["P5-LB"], level: 2 }); // свободный ур.2
+  await createCellsInZone({ companyId, warehouseId: W, zoneId: zStorage, codes: ["P5-RA", "P5-RB", "P5-RC"], level: 3 }); // резервы ур.3
+  await createCellsInZone({ companyId, warehouseId: W, zoneId: zCooling, codes: ["P5-CA", "P5-CB", "P5-CC"], level: null });
+  const cLA = await cellId("P5-LA"), cLB = await cellId("P5-LB"), cCA = await cellId("P5-CA"), cCB = await cellId("P5-CB"), cCC = await cellId("P5-CC");
+
+  console.log("14) вывоз <=X: свободен уровень 1 → размещение на уровень 1, верхний резерв освобождён");
+  const gA = await mkGroup(9);
+  ok("gA размещена в охлаждение", (await place(L1, gA.groupId, cCA)) === "");
+  const sA = await sessOf(gA.groupId); const rA = await resCellOf(sA!.id);
+  ok("верхний резерв gA — STORAGE-ячейка уровня 3+", (await prisma.cell.findUniqueOrThrow({ where: { id: rA } })).level! >= 3);
+  ok("замер <=X: успех", (await retrieve(L1, sA!.id, 4)) === "");
+  const gAr = await grp(gA.groupId);
+  ok("группа IN_STORAGE и размещена на уровне 1 (P5-LA)", gAr.status === "IN_STORAGE" && !!(await bal(gAr.lotId, `C:${cLA}`)));
+  ok("верхний резерв ур.3+ освобождён и остался пустым", rA !== cLA && (await activeRes(rA)) === 0 && (await occupied(rA)) === 0);
+  ok("COOLING-ячейка gA пуста", (await occupied(cCA)) === 0);
+
+  console.log("15) вывоз <=X: уровень 1 занят, уровень 2 свободен → размещение на уровень 2");
+  const gB = await mkGroup(9);
+  ok("gB размещена в охлаждение", (await place(L1, gB.groupId, cCB)) === "");
+  const sB = await sessOf(gB.groupId); const rB = await resCellOf(sB!.id);
+  ok("замер <=X: успех", (await retrieve(L1, sB!.id, 4)) === "");
+  const gBr = await grp(gB.groupId);
+  ok("группа IN_STORAGE и размещена на уровне 2 (P5-LB), не в резерв", gBr.status === "IN_STORAGE" && !!(await bal(gBr.lotId, `C:${cLB}`)) && (await occupied(rB)) === 0);
+  ok("верхний резерв ур.3+ освобождён", (await activeRes(rB)) === 0);
+
+  console.log("16) вывоз <=X: уровни 1–2 заняты → используется верхний резерв ур.3+");
+  const gC = await mkGroup(9);
+  ok("gC размещена в охлаждение", (await place(L1, gC.groupId, cCC)) === "");
+  const sC = await sessOf(gC.groupId); const rC = await resCellOf(sC!.id);
+  ok("замер <=X: успех", (await retrieve(L1, sC!.id, 4)) === "");
+  const gCr = await grp(gC.groupId);
+  ok("группа IN_STORAGE и размещена в верхний резерв (ур.3+)", gCr.status === "IN_STORAGE" && !!(await bal(gCr.lotId, `C:${rC}`)));
+  ok("резерв использован и снят с активной брони", (await activeRes(rC)) === 0);
+  ok("остатки не смешаны: в ур.1, ур.2 и резерве — ровно по одной партии", (await occupied(cLA)) === 1 && (await occupied(cLB)) === 1 && (await occupied(rC)) === 1);
+
+  console.log("17) отмена активной RETRIEVE_COOLING отклоняется (группа не остаётся без задачи)");
+  await freeLoader(L1);
+  const gD = await mkGroup(9);
+  ok("gD размещена в охлаждение", (await place(L1, gD.groupId, cCA)) === "");
+  const sD = await sessOf(gD.groupId);
+  const tD = await retrieveTaskOf(sD!.id);
+  const cancelErr = await err(() => cancelWorkflowTask(tD!.id));
+  ok("отмена активной RETRIEVE_COOLING отклонена доменной ошибкой", cancelErr.includes("Активное охлаждение нельзя отменить"));
+  ok("задача, сессия и резерв остались активными", (await prisma.workflowTask.findUniqueOrThrow({ where: { id: tD!.id } })).status !== "CANCELLED" && (await prisma.coolingSession.findUniqueOrThrow({ where: { id: sD!.id } })).status === "ACTIVE" && (await activeRes(await resCellOf(sD!.id))) === 1);
+
+  console.log("18) наступившая отложенная задача активируется идемпотентно");
+  await prisma.workflowTask.update({ where: { id: tD!.id }, data: { availableAt: new Date(Date.now() - 60_000) } });
+  await rebalanceQueuedTasks(companyId);
+  const after1 = await prisma.workflowTask.findUniqueOrThrow({ where: { id: tD!.id } });
+  await rebalanceQueuedTasks(companyId); // повторно — не должно менять назначение
+  const after2 = await prisma.workflowTask.findUniqueOrThrow({ where: { id: tD!.id } });
+  ok("после активации задача назначена LOADER (ASSIGNED)", after1.status === "ASSIGNED" && after1.assignedUserId === L1);
+  ok("повторная активация идемпотентна (тот же исполнитель и смена)", after2.status === "ASSIGNED" && after2.assignedUserId === after1.assignedUserId && after2.assignedShiftId === after1.assignedShiftId);
 }
 
 main()
