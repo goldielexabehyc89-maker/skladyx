@@ -11,6 +11,7 @@ import {
   type TaskActionState,
 } from "@/app/actions/tasks";
 import { completeGroupPlacementAction, type PlacementState } from "@/app/actions/group-receiving";
+import { completeMoveGroupAction, pickScanAction, reportShortageAction, type OrderActionState } from "@/app/actions/external-orders";
 import { Button, Card, CardTitle, Badge, EmptyState } from "@/components/ui";
 import { TASK_STATUS_TONE, taskStatusLabel, taskTypeLabel } from "@/lib/task-labels";
 
@@ -48,6 +49,21 @@ export interface Cooling {
   taskId: string;
   label: string;
   thresholdX: number;
+}
+export interface PickOrderCtx {
+  orderId: string;
+  externalId: string;
+  lines: { id: string; item: string; itemId: string; required: string; picked: string }[];
+  picks: { itemId: string; item: string; cellId: string; cell: string; level: number | null; qty: string }[];
+}
+export interface MoveGroupCtx {
+  taskId: string;
+  item: string;
+  qty: string;
+  fromCell: string;
+  fromLevel: number | null;
+  toCell: string;
+  toLevel: number | null;
 }
 
 const fmtTime = (iso: string) => {
@@ -202,6 +218,75 @@ function CoolingRetrievalForm({ cooling }: { cooling: Cooling }) {
   );
 }
 
+// Пакет 6: перестановка группы (MOVE_GROUP) — погрузчик подтверждает перемещение вниз.
+function MoveGroupForm({ ctx }: { ctx: MoveGroupCtx }) {
+  const [state, action, pending] = useActionState<OrderActionState, FormData>(completeMoveGroupAction, {});
+  return (
+    <form action={action} className="flex flex-col gap-2">
+      <input type="hidden" name="taskId" value={ctx.taskId} />
+      <div className="rounded-lg bg-neutral-50 p-2 text-sm">
+        <div className="font-medium">{ctx.item} · {ctx.qty} шт</div>
+        <div className="text-xs text-neutral-500">
+          Из {ctx.fromCell}{ctx.fromLevel != null ? ` (ур.${ctx.fromLevel})` : ""} → в {ctx.toCell}{ctx.toLevel != null ? ` (ур.${ctx.toLevel})` : ""}
+        </div>
+      </div>
+      {state.error && <p className="text-xs text-red-600">{state.error}</p>}
+      <Button type="submit" disabled={pending} className="w-full">
+        {pending ? "…" : "Готово: группа переставлена"}
+      </Button>
+    </form>
+  );
+}
+
+// Пакет 6: сборка заказа (PICK_ORDER) — по каждой зарезервированной строке: ячейка(1-2)→товар→кол-во.
+function PickOrderForm({ ctx, taskId }: { ctx: PickOrderCtx; taskId: string }) {
+  const [state, action, pending] = useActionState<OrderActionState, FormData>(pickScanAction, {});
+  const [shortState, shortAction, shortPending] = useActionState<OrderActionState, FormData>(reportShortageAction, {});
+  const remaining = ctx.picks;
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="rounded-lg bg-neutral-50 p-2 text-sm">
+        <div className="font-medium">Заказ {ctx.externalId}</div>
+        <ul className="mt-1 flex flex-col gap-0.5 text-xs text-neutral-600">
+          {ctx.lines.map((l) => (
+            <li key={l.id}>{l.item}: собрано {l.picked} из {l.required}</li>
+          ))}
+        </ul>
+      </div>
+      {remaining.length === 0 ? (
+        <p className="text-xs text-neutral-500">Все резервы этой ячейки собраны. Обновите экран.</p>
+      ) : (
+        <div className="flex flex-col gap-2">
+          <div className="text-xs font-medium text-neutral-500">Собрать по резервам (ячейка → товар → количество):</div>
+          {remaining.map((p, i) => (
+            <form key={`${p.cellId}:${p.itemId}:${i}`} action={action} className="flex items-center gap-2 rounded-lg border border-[#eee] p-2">
+              <input type="hidden" name="taskId" value={taskId} />
+              <input type="hidden" name="cellId" value={p.cellId} />
+              <input type="hidden" name="itemId" value={p.itemId} />
+              <input type="hidden" name="qty" value={p.qty} />
+              <div className="min-w-0 flex-1 text-sm">
+                <div className="truncate font-medium">{p.item}</div>
+                <div className="text-xs text-neutral-500">ячейка {p.cell}{p.level != null ? ` · ур.${p.level}` : ""} · {p.qty} шт</div>
+              </div>
+              <Button type="submit" disabled={pending}>{pending ? "…" : "Собрать"}</Button>
+            </form>
+          ))}
+        </div>
+      )}
+      {state.error && <p className="text-xs text-red-600">{state.error}</p>}
+      <details className="text-xs text-neutral-500">
+        <summary className="cursor-pointer">Сообщить о недостаче</summary>
+        <form action={shortAction} className="mt-2 flex flex-col gap-2">
+          <input type="hidden" name="taskId" value={taskId} />
+          <input name="reason" required placeholder="Причина недостачи" className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm" />
+          {shortState.error && <p className="text-red-600">{shortState.error}</p>}
+          <Button type="submit" variant="ghost" disabled={shortPending}>{shortPending ? "…" : "Зафиксировать недостачу"}</Button>
+        </form>
+      </details>
+    </div>
+  );
+}
+
 export function WorkerTasks({
   current,
   urgent,
@@ -210,6 +295,8 @@ export function WorkerTasks({
   mates,
   placement,
   cooling,
+  pickOrder,
+  moveGroup,
 }: {
   current: TaskDTO | null;
   urgent: TaskDTO[];
@@ -218,6 +305,8 @@ export function WorkerTasks({
   mates: Mate[];
   placement?: Placement | null;
   cooling?: Cooling | null;
+  pickOrder?: PickOrderCtx | null;
+  moveGroup?: MoveGroupCtx | null;
 }) {
   return (
     <div className="flex flex-col gap-4">
@@ -253,6 +342,8 @@ export function WorkerTasks({
               )}
               {placement && current.status === "IN_PROGRESS" && <PlacementForm placement={placement} />}
               {cooling && current.status === "IN_PROGRESS" && <CoolingRetrievalForm cooling={cooling} />}
+              {moveGroup && current.status === "IN_PROGRESS" && <MoveGroupForm ctx={moveGroup} />}
+              {pickOrder && current.status === "IN_PROGRESS" && <PickOrderForm ctx={pickOrder} taskId={current.id} />}
               {current.status === "IN_PROGRESS" && <HandoffForm taskId={current.id} mates={mates} />}
               {current.status === "HANDOFF_PENDING" && (
                 <p className="text-xs text-orange-600">Ожидает принятия передачи получателем.</p>

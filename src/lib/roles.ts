@@ -62,6 +62,11 @@ export function groupReceivingEnabled(): boolean {
 export function coolingWorkflowEnabled(): boolean {
   return process.env.COOLING_WORKFLOW_ENABLED === "true";
 }
+// Этап 5/Пакет 6: внешние заказы, FIFO-резерв и сборка. false — импорт/резерв/сборка недоступны,
+// экран задач сборки скрыт, action запрещён; остальные процессы работают как раньше.
+export function externalOrderPickingEnabled(): boolean {
+  return process.env.EXTERNAL_ORDER_PICKING_ENABLED === "true";
+}
 
 // Эффективный набор ролей.
 // При TENANT_AUTH=true роли всегда берутся из session.roles (их наполняет свежая

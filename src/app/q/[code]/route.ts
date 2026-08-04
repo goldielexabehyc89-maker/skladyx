@@ -49,6 +49,9 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ code
       case "GROUP":
         // Пакет 4: скан группы/паллеты — на доску задач (там размещение назначенным погрузчиком)
         return "/warehouse/tasks";
+      case "ORDER":
+        // Пакет 6: QR внешнего заказа однозначно открывает карточку собранного заказа
+        return `/warehouse/external-orders/${qr.refId}`;
     }
   };
 

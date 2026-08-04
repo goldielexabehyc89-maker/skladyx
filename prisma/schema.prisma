@@ -39,6 +39,7 @@ enum QrType {
   EMPLOYEE
   PICKLIST
   GROUP
+  ORDER // Этап 5/Пакет 6: внешний заказ (ExternalOrder)
 }
 
 enum ReceiptStatus {
@@ -270,6 +271,9 @@ model WorkflowTask {
   // Этап 5/Пакет 5: отложенная задача — не назначается, пока availableAt в будущем
   // (напр. срочный забор из охлаждения к estimatedReadyAt). null — обычная задача.
   availableAt DateTime?
+  // Этап 5/Пакет 6: срок исполнения (напр. arrivalAt внешнего заказа) — ключ сортировки
+  // очереди: URGENT → ближайший dueAt → createdAt. null сортируется в конец (nulls last).
+  dueAt       DateTime?
   assignedAt  DateTime?
   startedAt   DateTime?
   completedAt DateTime?
@@ -290,6 +294,7 @@ model WorkflowTask {
   @@index([warehouseId])
   @@index([status])
   @@index([status, availableAt])
+  @@index([status, dueAt])
   @@index([requiredRole])
   @@index([assignedUserId])
   @@index([assignedShiftId])
@@ -586,6 +591,10 @@ model CellReservation {
   warehouseId String
   cellId      String
   sessionId   String?
+  // Этап 5/Пакет 6: бронь ячейки под перестановку группы (§2.6 «резерв под задачу/группу»).
+  // Заполняется при цепочке погрузчика ур.3+→ур.1-2: ячейка забронирована принять эту группу.
+  // sessionId — бронь под охлаждение; handlingGroupId — бронь под перестановку. Взаимоисключимы.
+  handlingGroupId String?
   status      CellReservationStatus @default(ACTIVE)
   createdAt   DateTime              @default(now())
   releasedAt  DateTime?
@@ -595,6 +604,7 @@ model CellReservation {
   @@index([companyId, status])
   @@index([cellId])
   @@index([sessionId])
+  @@index([handlingGroupId])
 }
 
 model Uom {
@@ -1063,4 +1073,95 @@ model InventoryLine {
   inventory Inventory @relation(fields: [inventoryId], references: [id], onDelete: Cascade)
 
   @@index([inventoryId])
+}
+
+// ---------- Этап 5/Пакет 6: внешние заказы, резерв и сборка ----------
+
+// ExternalOrder — КАНОНИЧЕСКИЙ владелец жизненного цикла заказа (дизайн §1.6/§2.4). Легаси
+// PickList НЕ переиспользуется (у него свой жизненный цикл выдачи сотруднику) — исполнение
+// ведут StockReservation + WorkflowTask(PICK_ORDER), чтобы не было двух конкурирующих машин.
+enum ExternalOrderStatus {
+  IMPORTED // импортирован (идемпотентно по externalId)
+  PARTIALLY_RESERVED // зарезервирована часть строк (FIFO), задача сборщику НЕ создаётся
+  READY_TO_PICK // полное покрытие; PICK_ORDER создан (возможно BLOCKED цепочкой перестановки)
+  PICKING // сборщик взял задачу
+  IN_CONTROL // сборка завершена, товар в зоне CONTROL (задача контроля — Пакет 7)
+  BLOCKED // полное покрытие, но нет безопасной цепочки перестановки/места — без невыполнимой задачи
+}
+
+// Резерв товара на ТОЧНЫЙ источник (дизайн §1.7/§2.7). Остаток НЕ двигает (это бронь);
+// движение — при отборе через ядро. lotId-уникальность ЗАПРЕЩЕНА (один lot — частями в
+// разные заказы); корректность даёт блокировка строки-источника + Σ active ≤ balance.
+enum StockReservationStatus {
+  ACTIVE
+  FULFILLED // товар отобран (движение через ядро)
+  RELEASED // отменён/ошибка/переназначение
+}
+
+model ExternalOrder {
+  id          String              @id @default(cuid())
+  companyId   String
+  warehouseId String
+  externalId  String // идентификатор во внешней системе — источник идемпотентности импорта
+  status      ExternalOrderStatus @default(IMPORTED)
+  arrivalAt   DateTime? // срок/ожидаемое время — ключ сортировки очереди (dueAt задачи)
+  payloadHash String // снимок нормализованного payload; изменённый payload → контролируемая ошибка
+  createdById String
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @updatedAt
+
+  lines        ExternalOrderLine[]
+  reservations StockReservation[]
+
+  @@unique([companyId, externalId]) // идемпотентность импорта (дизайн §3)
+  @@index([companyId, status])
+  @@index([warehouseId])
+}
+
+model ExternalOrderLine {
+  id             String  @id @default(cuid())
+  companyId      String
+  orderId        String
+  externalLineId String // идентификатор строки во внешней системе
+  itemId         String
+  requiredQty    Decimal @db.Decimal(14, 3)
+  reservedQty    Decimal @default(0) @db.Decimal(14, 3)
+  pickedQty      Decimal @default(0) @db.Decimal(14, 3)
+
+  order        ExternalOrder      @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  reservations StockReservation[]
+
+  @@unique([orderId, externalLineId])
+  @@index([companyId])
+  @@index([orderId])
+  @@index([itemId])
+}
+
+model StockReservation {
+  id              String                 @id @default(cuid())
+  companyId       String
+  orderId         String
+  lineId          String
+  taskId          String? // задача сборки/перестановки (для аудита)
+  handlingGroupId String? // какая паллета
+  lotId           String? // партия-источник (FIFO по Lot.createdAt)
+  sourceLocKey    String? // точная строка баланса-источника: "C:<cellId>"
+  cellId          String? // денормализация источника (для UI/цепочки)
+  unitId          String? // для поштучных (TrackingType=UNIT)
+  qty             Decimal                @db.Decimal(14, 3)
+  status          StockReservationStatus @default(ACTIVE)
+  dedupeKey       String // идемпотентность создания резерва
+  createdAt       DateTime               @default(now())
+  releasedAt      DateTime?
+  fulfilledAt     DateTime?
+
+  order ExternalOrder     @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  line  ExternalOrderLine @relation(fields: [lineId], references: [id], onDelete: Cascade)
+
+  @@unique([companyId, dedupeKey])
+  @@index([companyId, status])
+  @@index([lotId, sourceLocKey]) // Σ active(lotId, locKey) — проверка суммы резервов на строке
+  @@index([orderId])
+  @@index([lineId])
+  @@index([handlingGroupId])
 }

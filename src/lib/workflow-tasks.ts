@@ -99,6 +99,7 @@ export interface TaskCreateInput {
   loadUnits?: number;
   dependsOn?: string[];
   availableAt?: Date; // Пакет 5: отложенная задача — не назначается, пока время не наступит
+  dueAt?: Date; // Пакет 6: срок (arrivalAt заказа) — ключ сортировки очереди после приоритета
 }
 export interface TaskCreateResult {
   task: WorkflowTask;
@@ -149,6 +150,7 @@ export async function createWorkflowTaskInTx(tx: Tx, input: TaskCreateInput): Pr
       dedupeKey: input.dedupeKey,
       loadUnits,
       availableAt: input.availableAt ?? null,
+      dueAt: input.dueAt ?? null,
       dependencies: deps.length ? { create: deps.map((dependsOnTaskId) => ({ dependsOnTaskId })) } : undefined,
     },
   });
@@ -222,7 +224,8 @@ export async function rebalanceQueuedTasks(
         ...(filter?.warehouseId ? { warehouseId: filter.warehouseId } : {}),
         ...(filter?.role ? { requiredRole: filter.role } : {}),
       },
-      orderBy: [{ priority: "desc" }, { createdAt: "asc" }],
+      // Пакет 6: URGENT раньше обычных, затем ближайший срок (dueAt, nulls last), затем createdAt.
+      orderBy: [{ priority: "desc" }, { dueAt: { sort: "asc", nulls: "last" } }, { createdAt: "asc" }],
     });
     const events: { companyId: string; warehouseId: string; title: string; to: string }[] = [];
     for (const t of queued) {
@@ -258,7 +261,7 @@ export async function startWorkflowTask(
       // пропуск доступной срочной — только с причиной
       const recommended = await tx.workflowTask.findFirst({
         where: { assignedUserId: userId, status: "ASSIGNED" },
-        orderBy: [{ priority: "desc" }, { createdAt: "asc" }],
+        orderBy: [{ priority: "desc" }, { dueAt: { sort: "asc", nulls: "last" } }, { createdAt: "asc" }],
       });
       const skipsUrgent = !!recommended && recommended.id !== task.id && recommended.priority === "URGENT";
       if (skipsUrgent && !skipReason?.trim())

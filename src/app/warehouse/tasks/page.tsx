@@ -3,8 +3,9 @@ import { redirect } from "next/navigation";
 import { requireUser } from "@/lib/auth";
 import { scoped } from "@/lib/tenant";
 import { prisma } from "@/lib/db";
-import { hasRole, isWorkRole, workflowTasksEnabled, groupReceivingEnabled, coolingWorkflowEnabled } from "@/lib/roles";
+import { hasRole, isWorkRole, workflowTasksEnabled, groupReceivingEnabled, coolingWorkflowEnabled, externalOrderPickingEnabled } from "@/lib/roles";
 import { eligibleCellsForGroup } from "@/lib/group-receiving";
+import { getPickOrderContext, getMoveGroupContext } from "@/lib/external-orders";
 import { DueActivator } from "./due-activator";
 import { allowedWarehouses } from "@/lib/warehouse-access";
 import { getActiveShift } from "@/lib/work-shift";
@@ -189,6 +190,14 @@ export default async function TasksPage({
     if (session) cooling = { taskId: current.id, label: current.title, thresholdX: session.thresholdX.toNumber() };
   }
 
+  // Пакет 6: контекст текущей задачи сборки (PICK_ORDER) и перестановки (MOVE_GROUP).
+  let pickOrder = null as Awaited<ReturnType<typeof getPickOrderContext>> | null;
+  let moveGroup = null as Awaited<ReturnType<typeof getMoveGroupContext>> | null;
+  if (current && current.status === "IN_PROGRESS" && externalOrderPickingEnabled()) {
+    if (current.type === "PICK_ORDER") pickOrder = await getPickOrderContext(s.companyId, current.id);
+    else if (current.type === "MOVE_GROUP") moveGroup = await getMoveGroupContext(s.companyId, current.id);
+  }
+
   return (
     <div className="mx-auto flex w-full max-w-lg flex-col gap-4">
       <DueActivator />
@@ -202,6 +211,8 @@ export default async function TasksPage({
         mates={mateShifts.map((sh) => ({ userId: sh.userId, name: sh.user.name }))}
         placement={placement}
         cooling={cooling}
+        pickOrder={pickOrder}
+        moveGroup={moveGroup}
       />
     </div>
   );
