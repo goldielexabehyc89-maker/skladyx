@@ -98,6 +98,7 @@ export interface TaskCreateInput {
   dedupeKey: string;
   loadUnits?: number;
   dependsOn?: string[];
+  availableAt?: Date; // Пакет 5: отложенная задача — не назначается, пока время не наступит
 }
 export interface TaskCreateResult {
   task: WorkflowTask;
@@ -147,11 +148,14 @@ export async function createWorkflowTaskInTx(tx: Tx, input: TaskCreateInput): Pr
       subjectId: input.subjectId,
       dedupeKey: input.dedupeKey,
       loadUnits,
+      availableAt: input.availableAt ?? null,
       dependencies: deps.length ? { create: deps.map((dependsOnTaskId) => ({ dependsOnTaskId })) } : undefined,
     },
   });
+  // Отложенную задачу (availableAt в будущем) сразу НЕ назначаем — её подхватит rebalance по сроку.
+  const due = !input.availableAt || input.availableAt.getTime() <= Date.now();
   let assignedTo: string | null = null;
-  if (status === "QUEUED") assignedTo = await assignInTx(tx, task);
+  if (status === "QUEUED" && due) assignedTo = await assignInTx(tx, task);
   const fresh = await tx.workflowTask.findUniqueOrThrow({ where: { id: task.id } });
   return { task: fresh, created: true, assignedTo };
 }
@@ -213,6 +217,8 @@ export async function rebalanceQueuedTasks(
       where: {
         companyId,
         status: "QUEUED",
+        // Пакет 5: отложенные задачи назначаем только по наступлении availableAt.
+        OR: [{ availableAt: null }, { availableAt: { lte: new Date() } }],
         ...(filter?.warehouseId ? { warehouseId: filter.warehouseId } : {}),
         ...(filter?.role ? { requiredRole: filter.role } : {}),
       },

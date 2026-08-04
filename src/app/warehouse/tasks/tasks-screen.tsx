@@ -7,6 +7,7 @@ import {
   requestHandoffAction,
   acceptHandoffAction,
   rejectHandoffAction,
+  completeCoolingRetrievalAction,
   type TaskActionState,
 } from "@/app/actions/tasks";
 import { completeGroupPlacementAction, type PlacementState } from "@/app/actions/group-receiving";
@@ -42,6 +43,11 @@ export interface Placement {
   taskId: string;
   routeLabel: string;
   cells: PlacementCell[];
+}
+export interface Cooling {
+  taskId: string;
+  label: string;
+  thresholdX: number;
 }
 
 const fmtTime = (iso: string) => {
@@ -167,6 +173,35 @@ function PlacementForm({ placement }: { placement: Placement }) {
   );
 }
 
+// Пакет 5: завершение срочной задачи «Забрать из охлаждения» — ввод фактической температуры.
+function CoolingRetrievalForm({ cooling }: { cooling: Cooling }) {
+  const [state, action, pending] = useActionState<TaskActionState, FormData>(completeCoolingRetrievalAction, {});
+  return (
+    <form action={action} className="flex flex-col gap-2">
+      <input type="hidden" name="taskId" value={cooling.taskId} />
+      <label className="text-xs font-medium text-neutral-500">
+        Фактическая температура, °C (порог X = {cooling.thresholdX})
+      </label>
+      <input
+        name="temperature"
+        type="number"
+        inputMode="decimal"
+        step="0.1"
+        required
+        placeholder="напр. 4"
+        className="rounded-lg border border-[#e4e4f0] px-3 py-2 text-sm"
+      />
+      {state.error && <p className="text-xs text-red-600">{state.error}</p>}
+      <Button type="submit" disabled={pending} className="w-full">
+        {pending ? "…" : "Записать замер"}
+      </Button>
+      <p className="text-xs text-neutral-400">
+        ≤ X — группа уедет в зарезервированную ячейку хранения; выше X — новый цикл охлаждения.
+      </p>
+    </form>
+  );
+}
+
 export function WorkerTasks({
   current,
   urgent,
@@ -174,6 +209,7 @@ export function WorkerTasks({
   incoming,
   mates,
   placement,
+  cooling,
 }: {
   current: TaskDTO | null;
   urgent: TaskDTO[];
@@ -181,6 +217,7 @@ export function WorkerTasks({
   incoming: IncomingHandoff[];
   mates: Mate[];
   placement?: Placement | null;
+  cooling?: Cooling | null;
 }) {
   return (
     <div className="flex flex-col gap-4">
@@ -215,6 +252,7 @@ export function WorkerTasks({
                 </Link>
               )}
               {placement && current.status === "IN_PROGRESS" && <PlacementForm placement={placement} />}
+              {cooling && current.status === "IN_PROGRESS" && <CoolingRetrievalForm cooling={cooling} />}
               {current.status === "IN_PROGRESS" && <HandoffForm taskId={current.id} mates={mates} />}
               {current.status === "HANDOFF_PENDING" && (
                 <p className="text-xs text-orange-600">Ожидает принятия передачи получателем.</p>

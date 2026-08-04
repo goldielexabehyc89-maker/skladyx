@@ -7,6 +7,7 @@ export const TASK_TYPES = {
   PICK_ORDER: "PICK_ORDER", // сборка заказа (PICKER)
   CONTROL_ORDER: "CONTROL_ORDER", // контроль заказа (CONTROLLER)
   ISSUE_ORDER: "ISSUE_ORDER", // размещение в зоне выдачи/выдача (LOADER)
+  RETRIEVE_COOLING: "RETRIEVE_COOLING", // забрать группу из охлаждения (LOADER, срочная, Пакет 5)
 } as const;
 
 export type TaskType = (typeof TASK_TYPES)[keyof typeof TASK_TYPES];

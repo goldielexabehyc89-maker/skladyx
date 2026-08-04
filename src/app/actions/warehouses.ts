@@ -10,7 +10,7 @@ import { warehouseAccess, isWhAllowed } from "@/lib/warehouse-access";
 import { logEvent } from "@/lib/events";
 import { broadcastRealtime } from "@/lib/realtime";
 import { createQrIn } from "@/lib/qr";
-import { warehouseZonesEnabled } from "@/lib/roles";
+import { warehouseZonesEnabled, coolingWorkflowEnabled } from "@/lib/roles";
 import {
   createStandardZonesInTx,
   createCellsInZone,
@@ -84,12 +84,25 @@ export async function updateWarehouseAction(
   });
   if (!parsed.success) return { error: parsed.error.errors[0].message };
 
+  // Пакет 5: скорость охлаждения R (°C/час) — только при включённом флаге (иначе поле не трогаем).
+  let coolingRate: number | null | undefined;
+  if (coolingWorkflowEnabled()) {
+    const rRaw = String(formData.get("coolingRate") ?? "").trim().replace(",", ".");
+    if (rRaw === "") coolingRate = null;
+    else {
+      const r = Number(rRaw);
+      if (!Number.isFinite(r) || r <= 0) return { error: "Скорость охлаждения R должна быть больше 0 (°C/час)" };
+      coolingRate = r;
+    }
+  }
+
   await prisma.warehouse.update({
     where: { id },
     data: {
       name: parsed.data.name,
       address: parsed.data.address ?? null,
       isActive: formData.get("isActive") === "on",
+      ...(coolingRate !== undefined ? { coolingRate } : {}),
     },
   });
   broadcastRealtime({

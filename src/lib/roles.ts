@@ -56,6 +56,12 @@ export function warehouseZonesEnabled(): boolean {
 export function groupReceivingEnabled(): boolean {
   return process.env.GROUP_RECEIVING_ENABLED === "true";
 }
+// Этап 5/Пакет 5: охлаждение и срочный забор. false — группа > X размещается в COOLING как
+// прежде (IN_COOLING без сессии); true — сессия охлаждения, резерв ячейки ур. 3+, срочная
+// отложенная задача забора и повторный замер температуры.
+export function coolingWorkflowEnabled(): boolean {
+  return process.env.COOLING_WORKFLOW_ENABLED === "true";
+}
 
 // Эффективный набор ролей.
 // При TENANT_AUTH=true роли всегда берутся из session.roles (их наполняет свежая

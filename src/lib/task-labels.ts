@@ -30,6 +30,7 @@ export const TASK_TYPE_LABEL: Record<string, string> = {
   PICK_ORDER: "Сборка заказа",
   CONTROL_ORDER: "Контроль заказа",
   ISSUE_ORDER: "Выдача заказа",
+  RETRIEVE_COOLING: "Забрать из охлаждения",
 };
 
 export const taskTypeLabel = (t: string) => TASK_TYPE_LABEL[t] ?? t;

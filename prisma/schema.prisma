@@ -131,6 +131,7 @@ model Company {
   warehouses        Warehouse[]
   warehouseZones    WarehouseZone[]
   handlingGroups    HandlingGroup[]
+  coolingSessions   CoolingSession[]
   items             Item[]
   uoms              Uom[]
   suppliers         Supplier[]
@@ -266,6 +267,9 @@ model WorkflowTask {
   assignedShiftId String?
 
   createdAt   DateTime  @default(now())
+  // Этап 5/Пакет 5: отложенная задача — не назначается, пока availableAt в будущем
+  // (напр. срочный забор из охлаждения к estimatedReadyAt). null — обычная задача.
+  availableAt DateTime?
   assignedAt  DateTime?
   startedAt   DateTime?
   completedAt DateTime?
@@ -285,6 +289,7 @@ model WorkflowTask {
   @@index([companyId])
   @@index([warehouseId])
   @@index([status])
+  @@index([status, availableAt])
   @@index([requiredRole])
   @@index([assignedUserId])
   @@index([assignedShiftId])
@@ -404,21 +409,25 @@ model QrCode {
 // ---------- Склады, ячейки, номенклатура ----------
 
 model Warehouse {
-  id        String   @id @default(cuid())
-  companyId String
-  name      String
-  address   String?
-  isActive  Boolean  @default(true)
-  sortOrder Int      @default(0)
-  createdAt DateTime @default(now())
+  id          String   @id @default(cuid())
+  companyId   String
+  name        String
+  address     String?
+  isActive    Boolean  @default(true)
+  sortOrder   Int      @default(0)
+  // Этап 5/Пакет 5: скорость охлаждения R (°C/час), per-warehouse; nullable — без R>0 группа
+  // > X не может уйти в охлаждение. Снимок R копируется в CoolingSession при старте.
+  coolingRate Decimal? @db.Decimal(6, 2)
+  createdAt   DateTime @default(now())
 
-  company        Company         @relation(fields: [companyId], references: [id])
-  cells          Cell[]
-  zones          WarehouseZone[]
-  handlingGroups HandlingGroup[]
-  userLinks      UserWarehouse[]
-  workShifts     WorkShift[]
-  workflowTasks  WorkflowTask[]
+  company         Company          @relation(fields: [companyId], references: [id])
+  cells           Cell[]
+  zones           WarehouseZone[]
+  handlingGroups  HandlingGroup[]
+  coolingSessions CoolingSession[]
+  userLinks       UserWarehouse[]
+  workShifts      WorkShift[]
+  workflowTasks   WorkflowTask[]
 
   @@index([companyId])
 }
@@ -506,13 +515,86 @@ model HandlingGroup {
   createdAt    DateTime            @default(now())
   updatedAt    DateTime            @updatedAt
 
-  company   Company   @relation(fields: [companyId], references: [id])
-  warehouse Warehouse @relation(fields: [warehouseId], references: [id])
+  company        Company         @relation(fields: [companyId], references: [id])
+  warehouse      Warehouse       @relation(fields: [warehouseId], references: [id])
+  coolingSession CoolingSession?
 
   @@unique([companyId, dedupeKey])
   @@index([companyId, status])
   @@index([warehouseId])
   @@index([lotId])
+}
+
+// Этап 5/Пакет 5: сессия охлаждения группы > X. Снимки X (порог) и R (скорость) фиксируются
+// в момент старта, чтобы смена настроек не переписала начатый процесс. Фактическое
+// местоположение группы — из ledger; сессия хранит рабочую ячейку охлаждения и срок готовности.
+enum CoolingStatus {
+  ACTIVE
+  COMPLETED
+  CANCELLED
+}
+
+enum CellReservationStatus {
+  ACTIVE
+  RELEASED
+}
+
+model CoolingSession {
+  id              String        @id @default(cuid())
+  companyId       String
+  warehouseId     String
+  handlingGroupId String        @unique // одна активная сессия на группу
+  coolingCellId   String // ячейка COOLING, где физически охлаждается группа
+  startTemp       Decimal       @db.Decimal(6, 2)
+  thresholdX      Decimal       @db.Decimal(6, 2) // снимок X
+  coolingRate     Decimal       @db.Decimal(6, 2) // снимок R (°C/час)
+  startedAt       DateTime      @default(now())
+  estimatedReadyAt DateTime // startedAt + (startTemp - X)/R; пересчитывается при повторном замере
+  status          CoolingStatus @default(ACTIVE)
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  company      Company                @relation(fields: [companyId], references: [id])
+  warehouse    Warehouse              @relation(fields: [warehouseId], references: [id])
+  group        HandlingGroup          @relation(fields: [handlingGroupId], references: [id])
+  measurements TemperatureMeasurement[]
+  reservations CellReservation[]
+
+  @@index([companyId, status])
+  @@index([warehouseId])
+}
+
+model TemperatureMeasurement {
+  id         String   @id @default(cuid())
+  companyId  String
+  sessionId  String
+  temperature Decimal @db.Decimal(6, 2)
+  measuredAt DateTime @default(now())
+  byUserId   String
+
+  session CoolingSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId])
+}
+
+// Активная бронь ячейки под охлаждение (резерв STORAGE-ячейки ур. 3+). Остаток НЕ двигает.
+// Одна активная бронь на ячейку — partial unique в миграции. Старые операции и прямое
+// размещение не должны использовать активно зарезервированную ячейку.
+model CellReservation {
+  id          String                @id @default(cuid())
+  companyId   String
+  warehouseId String
+  cellId      String
+  sessionId   String?
+  status      CellReservationStatus @default(ACTIVE)
+  createdAt   DateTime              @default(now())
+  releasedAt  DateTime?
+
+  session CoolingSession? @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([companyId, status])
+  @@index([cellId])
+  @@index([sessionId])
 }
 
 model Uom {

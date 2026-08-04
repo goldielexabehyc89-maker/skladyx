@@ -2,7 +2,7 @@ import { Printer } from "lucide-react";
 import { requireAdminPage } from "@/lib/auth";
 import { scoped } from "@/lib/tenant";
 import { getAllowedWarehouse } from "@/lib/warehouse-access";
-import { warehouseZonesEnabled } from "@/lib/roles";
+import { warehouseZonesEnabled, coolingWorkflowEnabled } from "@/lib/roles";
 import {
   updateWarehouseAction,
   createCellsAction,
@@ -195,6 +195,16 @@ export default async function WarehousePage({ params }: { params: Promise<{ id: 
                 <input type="checkbox" name="isActive" defaultChecked={warehouse.isActive} className="h-5 w-5" />
                 Склад активен
               </label>
+              {coolingWorkflowEnabled() && (
+                <Field
+                  label="Скорость охлаждения R, °C/час"
+                  name="coolingRate"
+                  type="number"
+                  inputMode="decimal"
+                  step="0.1"
+                  defaultValue={warehouse.coolingRate === null ? "" : String(warehouse.coolingRate)}
+                />
+              )}
             </ActionForm>
           </Card>
         </PageShell>
@@ -248,6 +258,16 @@ export default async function WarehousePage({ params }: { params: Promise<{ id: 
               <input type="checkbox" name="isActive" defaultChecked={warehouse.isActive} className="h-5 w-5" />
               Склад активен
             </label>
+            {coolingWorkflowEnabled() && (
+              <Field
+                label="Скорость охлаждения R, °C/час"
+                name="coolingRate"
+                type="number"
+                inputMode="decimal"
+                step="0.1"
+                defaultValue={warehouse.coolingRate === null ? "" : String(warehouse.coolingRate)}
+              />
+            )}
           </ActionForm>
         </Card>
       </PageShell>

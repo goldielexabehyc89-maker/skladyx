@@ -3,8 +3,9 @@ import { redirect } from "next/navigation";
 import { requireUser } from "@/lib/auth";
 import { scoped } from "@/lib/tenant";
 import { prisma } from "@/lib/db";
-import { hasRole, isWorkRole, workflowTasksEnabled, groupReceivingEnabled } from "@/lib/roles";
+import { hasRole, isWorkRole, workflowTasksEnabled, groupReceivingEnabled, coolingWorkflowEnabled } from "@/lib/roles";
 import { eligibleCellsForGroup } from "@/lib/group-receiving";
+import { DueActivator } from "./due-activator";
 import { allowedWarehouses } from "@/lib/warehouse-access";
 import { getActiveShift } from "@/lib/work-shift";
 import { ROLE_LABEL } from "@/lib/role-labels";
@@ -87,6 +88,7 @@ export default async function TasksPage({
 
     return (
       <PageShell title="Задачи — монитор" action={<ViewToggle active="monitor" />}>
+        <DueActivator />
         <FilterBar>
           <SelectField name="warehouse" defaultValue={sp.warehouse ?? ""} className="text-sm">
             <option value="">Все склады</option>
@@ -180,8 +182,16 @@ export default async function TasksPage({
     }
   }
 
+  // Пакет 5: для текущей RETRIEVE_COOLING-задачи в работе — контекст сессии для ввода температуры.
+  let cooling: { taskId: string; label: string; thresholdX: number } | null = null;
+  if (current && current.type === "RETRIEVE_COOLING" && current.status === "IN_PROGRESS" && coolingWorkflowEnabled()) {
+    const session = await prisma.coolingSession.findFirst({ where: { id: current.subjectId ?? "", companyId: s.companyId, status: "ACTIVE" } });
+    if (session) cooling = { taskId: current.id, label: current.title, thresholdX: session.thresholdX.toNumber() };
+  }
+
   return (
     <div className="mx-auto flex w-full max-w-lg flex-col gap-4">
+      <DueActivator />
       {isAdmin && <ViewToggle active="mine" />}
       <PageTitle action={<Badge tone="green">{ROLE_LABEL[shift.role]} · {shift.warehouseName}</Badge>}>Задачи</PageTitle>
       <WorkerTasks
@@ -191,6 +201,7 @@ export default async function TasksPage({
         incoming={incoming.map((h) => ({ handoffId: h.id, taskTitle: h.task.title, taskType: h.task.type }))}
         mates={mateShifts.map((sh) => ({ userId: sh.userId, name: sh.user.name }))}
         placement={placement}
+        cooling={cooling}
       />
     </div>
   );

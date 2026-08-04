@@ -22,16 +22,20 @@ export async function lockCell(tx: Prisma.TransactionClient, companyId: string, 
   await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext('skladyx:cell'), hashtext(${`${companyId}:${cellId}`}))`;
 }
 
-// Этап 5/Пакет 4: инвариант «одна ячейка = одна группа». Старые операции размещения
-// (скан «товар→ячейка», приёмка по заказу) НЕ должны докладывать товар в ячейку, где уже
-// лежит размещённая группа/паллета (HandlingGroup IN_STORAGE/IN_COOLING). Вызывать ВНУТРИ
-// транзакции размещения. Бросает StockError (перехватывается вызывающими → {error}).
+// Этап 5/Пакет 4–5: инварианты «одна ячейка = одна группа» и «резерв под охлаждение неприкосновенен».
+// Старые операции размещения (скан «товар→ячейка», приёмка по заказу) НЕ должны докладывать товар
+// в ячейку, где уже лежит размещённая группа (HandlingGroup IN_STORAGE/IN_COOLING) ИЛИ которая
+// активно зарезервирована под охлаждение (CellReservation ACTIVE — ячейка при этом пуста).
+// Вызывать ВНУТРИ транзакции. Бросает StockError (перехватывается вызывающими → {error}).
 export async function assertCellNotHeldByGroup(
   tx: Prisma.TransactionClient,
   companyId: string,
   cellId: string,
 ): Promise<void> {
   await lockCell(tx, companyId, cellId); // защита от гонки: держим ячейку до конца транзакции
+  // Пакет 5: активная бронь под охлаждение (проверяем ДО early-return — резерв-ячейка пуста).
+  const reserved = await tx.cellReservation.findFirst({ where: { cellId, status: "ACTIVE" }, select: { id: true } });
+  if (reserved) throw new StockError("Ячейка зарезервирована под охлаждение — размещение запрещено");
   const bals = await tx.stockBalance.findMany({
     where: { companyId, cellId, qty: { gt: 0 } },
     select: { lotId: true },

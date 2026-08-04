@@ -7,6 +7,8 @@ import { createQrIn } from "@/lib/qr";
 import { nextNumber } from "@/lib/counters";
 import { getSettings } from "@/lib/settings";
 import { fmtDateTime } from "@/lib/format";
+import { coolingWorkflowEnabled } from "@/lib/roles";
+import { startCoolingInTx } from "@/lib/cooling";
 import {
   lockCompany,
   createWorkflowTaskInTx,
@@ -14,6 +16,7 @@ import {
   emitTaskCompleted,
   completeWorkflowTaskInTransaction,
   rebalanceQueuedTasks,
+  type TaskCreateResult,
 } from "@/lib/workflow-tasks";
 
 // Этап 5/Пакет 4: групповая приёмка + температурный контроль. Все движения остатка — только
@@ -33,7 +36,8 @@ async function cellIsBusy(tx: Tx, cellId: string): Promise<boolean> {
   return !!bal || !!unit;
 }
 
-// минимальный уровень среди ПУСТЫХ активных STORAGE-ячеек склада (или null, если таких нет)
+// минимальный уровень среди СВОБОДНЫХ активных STORAGE-ячеек склада (пустых и не зарезервированных
+// под охлаждение), или null. Пакет 5: активная бронь исключает ячейку из «есть свободная ниже».
 async function lowestEmptyStorageLevel(tx: Tx, companyId: string, warehouseId: string): Promise<number | null> {
   const cells = await tx.cell.findMany({
     where: { companyId, warehouseId, isActive: true, level: { not: null }, zone: { kind: "STORAGE" } },
@@ -41,11 +45,12 @@ async function lowestEmptyStorageLevel(tx: Tx, companyId: string, warehouseId: s
   });
   if (cells.length === 0) return null;
   const ids = cells.map((c) => c.id);
-  const [busyBal, busyUnit] = await Promise.all([
+  const [busyBal, busyUnit, reserved] = await Promise.all([
     tx.stockBalance.findMany({ where: { cellId: { in: ids }, qty: { gt: 0 } }, select: { cellId: true } }),
     tx.itemUnit.findMany({ where: { cellId: { in: ids } }, select: { cellId: true } }),
+    tx.cellReservation.findMany({ where: { cellId: { in: ids }, status: "ACTIVE" }, select: { cellId: true } }),
   ]);
-  const busy = new Set<string>([...busyBal.map((b) => b.cellId!), ...busyUnit.map((u) => u.cellId!)]);
+  const busy = new Set<string>([...busyBal.map((b) => b.cellId!), ...busyUnit.map((u) => u.cellId!), ...reserved.map((r) => r.cellId)]);
   const levels = cells.filter((c) => !busy.has(c.id)).map((c) => c.level!);
   return levels.length ? Math.min(...levels) : null;
 }
@@ -210,9 +215,24 @@ export async function completeGroupPlacement(input: {
     await lockCell(tx, input.companyId, cell.id);
     if (await cellIsBusy(tx, cell.id)) throw new GroupError("Ячейка занята — выберите пустую");
 
-    // STORAGE: нижний доступный уровень (не класть выше при свободной ниже)
+    // Пакет 5: группа > X при включённом флаге охлаждения — стартуем сессию охлаждения
+    // (перенос RECEIVING→COOLING, резерв ур.3+, срочная отложенная задача забора), а не просто IN_COOLING.
+    if (targetKind === "COOLING" && coolingWorkflowEnabled()) {
+      const { taskRes } = await startCoolingInTx(tx, {
+        companyId: input.companyId,
+        group,
+        coolingCellId: cell.id,
+        userId: input.userId,
+      });
+      const unblocked = await completeWorkflowTaskInTransaction(tx, task.id);
+      return { companyId: input.companyId, warehouseId: group.warehouseId, title: task.title, taskId: task.id, unblocked, coolingTaskRes: taskRes as TaskCreateResult | null };
+    }
+
+    // STORAGE: нижний доступный уровень + ячейка не должна быть зарезервирована под охлаждение.
     if (targetKind === "STORAGE") {
       if (cell.level == null) throw new GroupError("У ячейки хранения не настроен уровень");
+      const reserved = await tx.cellReservation.findFirst({ where: { cellId: cell.id, status: "ACTIVE" }, select: { id: true } });
+      if (reserved) throw new GroupError("Ячейка зарезервирована под охлаждение — выберите другую");
       const minLevel = await lowestEmptyStorageLevel(tx, input.companyId, group.warehouseId);
       if (minLevel != null && cell.level > minLevel)
         throw new GroupError(`Есть свободная ячейка ниже (уровень ${minLevel}). Разместите там.`);
@@ -251,11 +271,12 @@ export async function completeGroupPlacement(input: {
 
     // завершить задачу (+ разблокировать зависимости)
     const unblocked = await completeWorkflowTaskInTransaction(tx, task.id);
-    return { companyId: input.companyId, warehouseId: group.warehouseId, title: task.title, taskId: task.id, unblocked };
+    return { companyId: input.companyId, warehouseId: group.warehouseId, title: task.title, taskId: task.id, unblocked, coolingTaskRes: null as TaskCreateResult | null };
   });
 
   // события после коммита + перераспределение очереди (без push)
   await emitTaskCompleted(res);
+  if (res.coolingTaskRes) await emitTaskCreated(res.coolingTaskRes);
   await rebalanceQueuedTasks(res.companyId, { warehouseId: res.warehouseId });
   return { warehouseId: res.warehouseId };
 }
@@ -274,11 +295,13 @@ export async function eligibleCellsForGroup(
   });
   if (cells.length === 0) return [];
   const ids = cells.map((c) => c.id);
-  const [busyBal, busyUnit] = await Promise.all([
+  const [busyBal, busyUnit, reserved] = await Promise.all([
     prisma.stockBalance.findMany({ where: { cellId: { in: ids }, qty: { gt: 0 } }, select: { cellId: true } }),
     prisma.itemUnit.findMany({ where: { cellId: { in: ids } }, select: { cellId: true } }),
+    prisma.cellReservation.findMany({ where: { cellId: { in: ids }, status: "ACTIVE" }, select: { cellId: true } }),
   ]);
-  const busy = new Set<string>([...busyBal.map((b) => b.cellId!), ...busyUnit.map((u) => u.cellId!)]);
+  // Пакет 5: зарезервированные под охлаждение ячейки не предлагаем для прямого размещения.
+  const busy = new Set<string>([...busyBal.map((b) => b.cellId!), ...busyUnit.map((u) => u.cellId!), ...reserved.map((r) => r.cellId)]);
   let empty = cells.filter((c) => !busy.has(c.id));
   if (kind === "STORAGE") empty = empty.filter((c) => c.level != null); // для STORAGE нужен уровень
   empty.sort((a, b) => {
