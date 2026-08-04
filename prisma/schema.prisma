@@ -593,8 +593,12 @@ model CellReservation {
   sessionId   String?
   // Этап 5/Пакет 6: бронь ячейки под перестановку группы (§2.6 «резерв под задачу/группу»).
   // Заполняется при цепочке погрузчика ур.3+→ур.1-2: ячейка забронирована принять эту группу.
-  // sessionId — бронь под охлаждение; handlingGroupId — бронь под перестановку. Взаимоисключимы.
+  // sessionId — бронь под охлаждение; handlingGroupId+taskId — бронь под перестановку. Взаимоисключимы.
   handlingGroupId String?
+  // Этап 5/Пакет 6 (коррекция): однозначная привязка брони перестановки к конкретной задаче —
+  // completeMoveGroup ищет бронь по taskId (не по группе). Одна активная перестановка на группу
+  // гарантируется partial-unique по (handlingGroupId WHERE status=ACTIVE) в correction-миграции.
+  taskId      String?
   status      CellReservationStatus @default(ACTIVE)
   createdAt   DateTime              @default(now())
   releasedAt  DateTime?
@@ -605,6 +609,7 @@ model CellReservation {
   @@index([cellId])
   @@index([sessionId])
   @@index([handlingGroupId])
+  @@index([taskId])
 }
 
 model Uom {

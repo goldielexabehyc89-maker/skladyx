@@ -4,7 +4,7 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/db";
 import { applyLotMovement } from "@/lib/stock";
 import { lockCell } from "@/lib/cells";
-import { createQrIn } from "@/lib/qr";
+import { createQrIn, parseScannedCode } from "@/lib/qr";
 import { logEvent } from "@/lib/events";
 import { isPickableLevel } from "@/lib/placement";
 import { TASK_TYPES } from "@/lib/workflow-task-types";
@@ -27,6 +27,31 @@ import {
 export class ExternalOrderError extends Error {}
 type Tx = Prisma.TransactionClient;
 const D = (x: Prisma.Decimal | number | string) => new Prisma.Decimal(x);
+
+// ── Резолвинг отсканированных QR (настоящее сканирование, не скрытые id) ──
+// Ячейка: QR типа CELL, своя организация, этот склад.
+async function resolveScannedCell(tx: Tx, companyId: string, warehouseId: string, raw: string): Promise<string> {
+  const code = parseScannedCode(raw);
+  if (!code) throw new ExternalOrderError("Неверный QR ячейки");
+  const qr = await tx.qrCode.findUnique({ where: { code } });
+  if (!qr || qr.companyId !== companyId || qr.type !== "CELL") throw new ExternalOrderError("Это не QR ячейки этой организации");
+  const cell = await tx.cell.findFirst({ where: { id: qr.refId, companyId, warehouseId }, select: { id: true } });
+  if (!cell) throw new ExternalOrderError("Ячейка не найдена на этом складе");
+  return cell.id;
+}
+// Группа/партия: QR типа GROUP (паллета) или LOT (партия) → группа хранения этой организации.
+async function resolveScannedGroup(tx: Tx, companyId: string, raw: string): Promise<{ groupId: string; lotId: string; itemId: string }> {
+  const code = parseScannedCode(raw);
+  if (!code) throw new ExternalOrderError("Неверный QR группы/партии");
+  const qr = await tx.qrCode.findUnique({ where: { code } });
+  if (!qr || qr.companyId !== companyId) throw new ExternalOrderError("Это не QR этой организации");
+  let group;
+  if (qr.type === "GROUP") group = await tx.handlingGroup.findFirst({ where: { id: qr.refId, companyId }, select: { id: true, lotId: true, itemId: true } });
+  else if (qr.type === "LOT") group = await tx.handlingGroup.findFirst({ where: { lotId: qr.refId, companyId }, select: { id: true, lotId: true, itemId: true } });
+  else throw new ExternalOrderError("Отсканируйте QR группы или партии товара");
+  if (!group) throw new ExternalOrderError("Группа хранения не найдена");
+  return { groupId: group.id, lotId: group.lotId, itemId: group.itemId };
+}
 
 export interface ImportLine {
   externalLineId: string;
@@ -121,11 +146,12 @@ export async function importExternalOrder(
   });
 }
 
-// Свободные (пустые + не зарезервированные) активные STORAGE-ячейки заданных уровней, min level→code.
-// Чистая выборка (без побочных эффектов) — для планирования перестановки.
-async function freeCells(tx: Tx, companyId: string, warehouseId: string, levels: number[]): Promise<{ id: string; level: number }[]> {
+// Свободные (пустые + не зарезервированные) активные STORAGE-ячейки по фильтру уровня, min level→code.
+// Чистая выборка (без побочных эффектов) — для планирования перестановки. Нижние: {in:[1,2]};
+// верхняя ячейка — ЛЮБАЯ активная STORAGE с level>=3 ({gte:3}), без жёсткого списка уровней.
+async function freeCells(tx: Tx, companyId: string, warehouseId: string, levelWhere: Prisma.IntNullableFilter): Promise<{ id: string; level: number }[]> {
   const cells = await tx.cell.findMany({
-    where: { companyId, warehouseId, isActive: true, level: { in: levels }, zone: { kind: "STORAGE" } },
+    where: { companyId, warehouseId, isActive: true, level: levelWhere, zone: { kind: "STORAGE" } },
     select: { id: true, level: true, code: true },
     orderBy: [{ level: "asc" }, { code: "asc" }],
   });
@@ -159,6 +185,8 @@ async function liftableLowerGroups(tx: Tx, companyId: string, warehouseId: strin
     if (!group || exclude.has(group.id)) continue;
     const demand = await tx.stockReservation.findFirst({ where: { handlingGroupId: group.id, status: "ACTIVE" }, select: { id: true } });
     if (demand) continue; // востребованную не двигаем как «лишнюю»
+    const moving = await tx.cellReservation.findFirst({ where: { handlingGroupId: group.id, status: "ACTIVE" }, select: { id: true } });
+    if (moving) continue; // уже участвует в активной перестановке — не берём как «лишнюю»
     out.push({ groupId: group.id, cellId: c.id });
   }
   return out;
@@ -172,8 +200,8 @@ type MoveStep =
 // Спланировать перестановку ВСЕХ нужных групп на ур.1-2 — БЕЗ побочных эффектов (all-or-nothing).
 // Целевые ячейки учитываются виртуально (usedLower/usedUpper). null → нет безопасной цепочки (BLOCKED).
 async function planMoves(tx: Tx, companyId: string, warehouseId: string, groupIds: string[]): Promise<MoveStep[] | null> {
-  const freeLower = (await freeCells(tx, companyId, warehouseId, [1, 2])).map((c) => c.id);
-  const freeUpper = (await freeCells(tx, companyId, warehouseId, [3, 4, 5, 6, 7, 8, 9, 10])).map((c) => c.id);
+  const freeLower = (await freeCells(tx, companyId, warehouseId, { in: [1, 2] })).map((c) => c.id);
+  const freeUpper = (await freeCells(tx, companyId, warehouseId, { gte: 3 })).map((c) => c.id); // любая STORAGE ур.3+
   const liftable = await liftableLowerGroups(tx, companyId, warehouseId, new Set(groupIds));
   const usedLower = new Set<string>();
   const usedUpper = new Set<string>();
@@ -281,21 +309,28 @@ export async function reserveAndPlanOrder(input: { companyId: string; orderId: s
       }
     }
 
-    const plan = await planMoves(tx, input.companyId, order.warehouseId, need3plus);
+    // группа уже может переставляться другой активной задачей (другой заказ). Тогда НЕ создаём
+    // дубль — зависим от существующей задачи; остальные ур.3+ планируем заново.
+    const dependOn: string[] = [];
+    const toPlan: string[] = [];
+    for (const g of need3plus) {
+      const existing = await tx.cellReservation.findFirst({ where: { handlingGroupId: g, status: "ACTIVE" }, select: { taskId: true } });
+      if (existing?.taskId) dependOn.push(existing.taskId);
+      else toPlan.push(g);
+    }
+
+    const plan = await planMoves(tx, input.companyId, order.warehouseId, toPlan);
     if (!plan) {
       // нет безопасной цепочки/места → BLOCKED. Резервы товара сохраняем; невыполнимую задачу не создаём.
       await tx.externalOrder.update({ where: { id: order.id }, data: { status: "BLOCKED" } });
       return { status: "BLOCKED", warehouseId: order.warehouseId };
     }
 
-    // исполнить план: брони целевых ячеек (под группу) + задачи MOVE_GROUP (с зависимостями)
+    // исполнить план: задача MOVE_GROUP (с зависимостями) + бронь целевой ячейки, привязанная к ЗАДАЧЕ
+    // (taskId). partial-unique по (handlingGroupId WHERE ACTIVE) не даёт двух перестановок одной группы.
     const liftTaskByGroup = new Map<string, string>();
-    const downTaskIds: string[] = [];
     for (const step of plan) {
-      // под lockCompany состояние стабильно (planMoves уже проверил свободу); partial-unique на
-      // активной броне ячейки — финальная защита (при гонке create бросит P2002 → откат всей tx).
       await lockCell(tx, input.companyId, step.targetCellId);
-      await tx.cellReservation.create({ data: { companyId: input.companyId, warehouseId: order.warehouseId, cellId: step.targetCellId, handlingGroupId: step.groupId, status: "ACTIVE" } });
       const deps = step.kind === "down-after" ? [liftTaskByGroup.get(step.afterGroupId)!] : [];
       const title = step.kind === "lift" ? "Поднять группу наверх (освободить нижний уровень)" : `Переставить вниз: заказ ${order.externalId}`;
       const t = await createWorkflowTaskInTx(tx, {
@@ -306,8 +341,9 @@ export async function reserveAndPlanOrder(input: { companyId: string; orderId: s
         dueAt: order.arrivalAt ?? undefined, dependsOn: deps,
       });
       created.push(t);
+      await tx.cellReservation.create({ data: { companyId: input.companyId, warehouseId: order.warehouseId, cellId: step.targetCellId, handlingGroupId: step.groupId, taskId: t.task.id, status: "ACTIVE" } });
       if (step.kind === "lift") liftTaskByGroup.set(step.groupId, t.task.id);
-      else downTaskIds.push(t.task.id); // нужную группу опускают 'down' / 'down-after' — их ждёт сборка
+      else dependOn.push(t.task.id); // нужную группу опускают 'down' / 'down-after' — их ждёт сборка
     }
 
     const pick = await createWorkflowTaskInTx(tx, {
@@ -315,7 +351,7 @@ export async function reserveAndPlanOrder(input: { companyId: string; orderId: s
       title: `Собрать заказ ${order.externalId}`, description: `Строк: ${lines.length}`,
       subjectType: "ExternalOrder", subjectId: order.id,
       dedupeKey: `order:${order.id}:pick`, loadUnits: lines.length,
-      dueAt: order.arrivalAt ?? undefined, dependsOn: downTaskIds,
+      dueAt: order.arrivalAt ?? undefined, dependsOn: dependOn,
     });
     created.push(pick);
     await tx.externalOrder.update({ where: { id: order.id }, data: { status: "READY_TO_PICK" } });
@@ -328,8 +364,16 @@ export async function reserveAndPlanOrder(input: { companyId: string; orderId: s
   return { status: res.status };
 }
 
-// ── Завершение перестановки погрузчиком: переместить группу в забронированную ячейку ──
-export async function completeMoveGroup(input: { companyId: string; userId: string; taskId: string }): Promise<{ warehouseId: string }> {
+// ── Завершение перестановки погрузчиком: настоящее сканирование группы и целевой ячейки ──
+// Последовательность: скан QR группы → скан QR целевой ячейки → серверная сверка с задачей и
+// бронью (по taskId) → движение. Физическое подтверждение — не скрытыми id.
+export async function completeMoveGroup(input: {
+  companyId: string;
+  userId: string;
+  taskId: string;
+  groupCode: string;
+  cellCode: string;
+}): Promise<{ warehouseId: string }> {
   const res = await prisma.$transaction(async (tx) => {
     await lockCompany(tx, input.companyId);
     const task = await tx.workflowTask.findFirst({ where: { id: input.taskId, companyId: input.companyId } });
@@ -340,9 +384,16 @@ export async function completeMoveGroup(input: { companyId: string; userId: stri
     const group = await tx.handlingGroup.findFirst({ where: { id: task.subjectId ?? "", companyId: input.companyId } });
     if (!group) throw new ExternalOrderError("Группа не найдена");
 
-    const reservation = await tx.cellReservation.findFirst({ where: { handlingGroupId: group.id, status: "ACTIVE" }, select: { id: true, cellId: true } });
+    // бронь целевой ячейки — по ЗАДАЧЕ (однозначно), а не по группе
+    const reservation = await tx.cellReservation.findFirst({ where: { taskId: task.id, status: "ACTIVE" }, select: { id: true, cellId: true } });
     if (!reservation) throw new ExternalOrderError("Целевая ячейка перестановки не найдена (бронь снята)");
     const targetCellId = reservation.cellId;
+
+    // сверка отсканированных QR: группа = субъект задачи; ячейка = целевая бронь
+    const scanned = await resolveScannedGroup(tx, input.companyId, input.groupCode);
+    if (scanned.groupId !== group.id) throw new ExternalOrderError("Отсканирована не та группа для этой задачи");
+    const scannedCellId = await resolveScannedCell(tx, input.companyId, group.warehouseId, input.cellCode);
+    if (scannedCellId !== targetCellId) throw new ExternalOrderError("Отсканирована не та целевая ячейка");
 
     const curBal = await tx.stockBalance.findFirst({
       where: { lotId: group.lotId, companyId: input.companyId, cellId: { not: null }, qty: { gt: 0 } },
@@ -389,41 +440,53 @@ export async function completeMoveGroup(input: { companyId: string; userId: stri
   return { warehouseId: res.warehouseId };
 }
 
-// ── Скан сборки: ячейка(1-2) → товар → количество. Отбор через ядро, погашение резерва, → CONTROL ──
-// Идемпотентно по состоянию: повторный скан того же (ячейка, товар) не двоит движение (резерв уже
-// FULFILLED → нечего отбирать). Излишек отклоняется; недостача — отдельной кнопкой с причиной.
+// ── Скан сборки: скан QR ячейки(1-2) → скан QR группы/партии → количество. Серверная сверка,
+// что группа+товар+ячейка+активный резерв относятся к этому заказу; отбор через ядро → CONTROL. ──
+// Идемпотентно: повтор финального скана после IN_CONTROL → alreadyPicked без движения; повтор
+// скана уже собранной (заказ, группа, ячейка) → alreadyPicked. Излишек отклоняется; недостача — кнопкой.
 export async function pickOrderScan(input: {
   companyId: string;
   userId: string;
   taskId: string;
-  cellId: string;
-  itemId: string;
+  cellCode: string;
+  groupCode: string;
   qty: number;
 }): Promise<{ done: boolean; alreadyPicked: boolean }> {
+  type Brief = { id: string; title: string; warehouseId: string };
   const res = await prisma.$transaction(async (tx) => {
     await lockCompany(tx, input.companyId);
     const task = await tx.workflowTask.findFirst({ where: { id: input.taskId, companyId: input.companyId } });
     if (!task) throw new ExternalOrderError("Задача не найдена");
     if (task.type !== TASK_TYPES.PICK_ORDER) throw new ExternalOrderError("Это не задача сборки");
-    if (task.assignedUserId !== input.userId || task.status !== "IN_PROGRESS")
-      throw new ExternalOrderError("Собирать может только назначенный исполнитель с задачей «в работе»");
     const order = await tx.externalOrder.findFirst({ where: { id: task.subjectId ?? "", companyId: input.companyId } });
     if (!order) throw new ExternalOrderError("Заказ не найден");
+    const base = { companyId: input.companyId, warehouseId: order.warehouseId, orderId: order.id, taskId: task.id };
 
-    const cell = await tx.cell.findFirst({ where: { id: input.cellId, companyId: input.companyId, warehouseId: order.warehouseId }, include: { zone: true } });
-    if (!cell) throw new ExternalOrderError("Ячейка не найдена на этом складе");
-    if (!isPickableLevel(cell.level)) throw new ExternalOrderError("Сборка только с нижних уровней (1-2)");
+    // идемпотентность финального скана: заказ уже собран (IN_CONTROL) своей задачей → успех
+    // alreadyPicked, без движения и без изменения pickedQty; завершённую задачу не воскрешаем.
+    if (order.status === "IN_CONTROL" && task.assignedUserId === input.userId)
+      return { ...base, done: true, alreadyPicked: true, justCompleted: false, unblocked: [] as Brief[] };
+    if (task.assignedUserId !== input.userId || task.status !== "IN_PROGRESS")
+      throw new ExternalOrderError("Собирать может только назначенный исполнитель с задачей «в работе»");
 
-    await lockCell(tx, input.companyId, cell.id);
+    // настоящие сканы: ячейка (ур.1-2) и группа/партия
+    const cellId = await resolveScannedCell(tx, input.companyId, order.warehouseId, input.cellCode);
+    const cell = await tx.cell.findFirst({ where: { id: cellId }, select: { level: true } });
+    if (!isPickableLevel(cell?.level ?? null)) throw new ExternalOrderError("Сборка только с нижних уровней (1-2)");
+    const scanned = await resolveScannedGroup(tx, input.companyId, input.groupCode);
+
+    await lockCell(tx, input.companyId, cellId);
+    // резерв ЭТОГО заказа для этой группы в этой ячейке — связывает заказ+группу+товар+ячейку+резерв
     const reservations = await tx.stockReservation.findMany({
-      where: { orderId: order.id, cellId: cell.id, status: "ACTIVE", line: { itemId: input.itemId } },
+      where: { orderId: order.id, cellId, handlingGroupId: scanned.groupId, status: "ACTIVE" },
       orderBy: { createdAt: "asc" },
     });
     const remaining = reservations.reduce((s, r) => s.plus(r.qty), D(0));
-    const base = { companyId: input.companyId, warehouseId: order.warehouseId, orderId: order.id, taskId: task.id };
     if (remaining.lte(0)) {
-      // нечего отбирать здесь — повторный скан/уже собрано (идемпотентно, без движения)
-      return { ...base, done: await orderFullyPicked(tx, order.id), alreadyPicked: true, justCompleted: false, unblocked: [] as { id: string; title: string; warehouseId: string }[] };
+      // нет активного резерва: повтор уже собранного (заказ, группа, ячейка) → alreadyPicked; иначе — чужой скан
+      const already = await tx.stockReservation.findFirst({ where: { orderId: order.id, cellId, handlingGroupId: scanned.groupId, status: "FULFILLED" }, select: { id: true } });
+      if (already) return { ...base, done: await orderFullyPicked(tx, order.id), alreadyPicked: true, justCompleted: false, unblocked: [] as Brief[] };
+      throw new ExternalOrderError("Нет активного резерва этого заказа для этой группы в этой ячейке");
     }
     const qty = D(input.qty);
     if (qty.lte(0)) throw new ExternalOrderError("Количество должно быть больше нуля");
@@ -437,8 +500,8 @@ export async function pickOrderScan(input: {
     for (const r of reservations) {
       if (!r.lotId) continue;
       await applyLotMovement(tx, {
-        companyId: input.companyId, docType: "PICKLIST", docId: order.id, itemId: input.itemId, lotId: r.lotId, qty: r.qty,
-        from: { kind: "cell", warehouseId: order.warehouseId, cellId: cell.id },
+        companyId: input.companyId, docType: "PICKLIST", docId: order.id, itemId: scanned.itemId, lotId: r.lotId, qty: r.qty,
+        from: { kind: "cell", warehouseId: order.warehouseId, cellId },
         to: { kind: "zone", warehouseId: order.warehouseId, zoneId: control.id },
         createdById: input.userId,
       });
@@ -447,11 +510,16 @@ export async function pickOrderScan(input: {
     }
     if (order.status === "READY_TO_PICK") await tx.externalOrder.update({ where: { id: order.id }, data: { status: "PICKING" } });
 
-    const done = await orderFullyPicked(tx, order.id);
-    let unblocked: { id: string; title: string; warehouseId: string }[] = [];
+    // нагрузка = число ещё не собранных строк (не прерывает выполняемую задачу)
+    const allLines = await tx.externalOrderLine.findMany({ where: { orderId: order.id }, select: { requiredQty: true, pickedQty: true } });
+    const remainLines = allLines.filter((l) => l.pickedQty.lt(l.requiredQty)).length;
+    const done = remainLines === 0 && allLines.length > 0;
+    let unblocked: Brief[] = [];
     if (done) {
       await tx.externalOrder.update({ where: { id: order.id }, data: { status: "IN_CONTROL" } });
       unblocked = await completeWorkflowTaskInTransaction(tx, task.id);
+    } else {
+      await tx.workflowTask.update({ where: { id: task.id }, data: { loadUnits: Math.max(1, remainLines) } });
     }
     return { ...base, done, alreadyPicked: false, justCompleted: done, unblocked };
   });
@@ -475,6 +543,11 @@ export async function reportPickShortage(input: { companyId: string; userId: str
     const task = await tx.workflowTask.findFirst({ where: { id: input.taskId, companyId: input.companyId } });
     if (!task || task.type !== TASK_TYPES.PICK_ORDER) throw new ExternalOrderError("Это не задача сборки");
     if (task.assignedUserId !== input.userId) throw new ExternalOrderError("Это не ваша задача");
+    // недостачу можно фиксировать только по своей задаче В РАБОТЕ и заказу, ещё не ушедшему на контроль;
+    // завершённую/отменённую задачу воскрешать нельзя.
+    if (task.status !== "IN_PROGRESS") throw new ExternalOrderError("Недостача — только для задачи «в работе»");
+    const order = await tx.externalOrder.findFirst({ where: { id: task.subjectId ?? "", companyId: input.companyId }, select: { status: true } });
+    if (!order || order.status === "IN_CONTROL") throw new ExternalOrderError("Заказ уже собран — недостача недоступна");
     if (!input.reason.trim()) throw new ExternalOrderError("Укажите причину недостачи");
     await tx.workflowTask.update({ where: { id: task.id }, data: { status: "NEEDS_ATTENTION" } });
     return { warehouseId: task.warehouseId, title: task.title };

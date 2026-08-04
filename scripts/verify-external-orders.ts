@@ -6,13 +6,14 @@ import { PrismaClient, type Role } from "@prisma/client";
 import bcrypt from "bcryptjs";
 import { applyLotMovement } from "@/lib/stock";
 import { ensureStandardZones, createCellsInZone } from "@/lib/cells";
+import { createQrIn } from "@/lib/qr";
 import { startWorkflowTask, rebalanceQueuedTasks } from "@/lib/workflow-tasks";
 import {
   importExternalOrder,
   reserveAndPlanOrder,
   completeMoveGroup,
   pickOrderScan,
-  ExternalOrderError,
+  reportPickShortage,
 } from "@/lib/external-orders";
 
 const prisma = new PrismaClient();
@@ -28,8 +29,11 @@ let seq = 0;
 const now = new Date();
 
 const cellId = async (code: string) => (await prisma.cell.findFirstOrThrow({ where: { warehouseId: W, code } })).id;
-const bal = (lotId: string, locKey: string) => prisma.stockBalance.findFirst({ where: { lotId, locKey } });
 const cellQty = async (cid: string) => (await prisma.stockBalance.aggregate({ where: { cellId: cid, qty: { gt: 0 } }, _sum: { qty: true } }))._sum.qty?.toNumber() ?? 0;
+// настоящие QR-коды (для сканов): ячейка создаёт CELL-QR (createCellsInZone), группа — GROUP-QR (seedGroup)
+const cellCode = async (cid: string) => (await prisma.qrCode.findFirstOrThrow({ where: { type: "CELL", refId: cid } })).code;
+const groupCode = async (gid: string) => (await prisma.qrCode.findFirstOrThrow({ where: { type: "GROUP", refId: gid } })).code;
+const mvCount = async (lotId: string) => prisma.stockMovement.count({ where: { lotId } });
 
 async function mkUser(id: string, cid: string, phone: string, role: Role, wh: string) {
   await prisma.user.deleteMany({ where: { id } });
@@ -47,6 +51,7 @@ async function seedGroup(itemId: string, cid: string, qty: number, createdAt: Da
   const lot = await prisma.lot.create({ data: { companyId, itemId, receiptLineId: line.id, qtyReceived: qty, createdAt } });
   await prisma.$transaction((tx) => applyLotMovement(tx, { companyId, docType: "RECEIPT", docId: receipt.id, itemId, lotId: lot.id, qty, from: null, to: { kind: "cell", warehouseId: W, cellId: cid }, createdById: lo }));
   const group = await prisma.handlingGroup.create({ data: { companyId, warehouseId: W, itemId, lotId: lot.id, qty, temperature: 0, thresholdX: 5, status: "IN_STORAGE", dedupeKey: `eo-seed-${seq}`, acceptedById: lo } });
+  await prisma.$transaction((tx) => createQrIn(tx, { companyId, type: "GROUP", refId: group.id })); // GROUP-QR для сканов сборки/перестановки
   return { lotId: lot.id, groupId: group.id };
 }
 
@@ -61,21 +66,22 @@ async function runMoves() {
     if (t.status === "QUEUED") { await rebalanceQueuedTasks(companyId, { warehouseId: W }); t = await prisma.workflowTask.findUniqueOrThrow({ where: { id: t.id } }); }
     if (t.status !== "ASSIGNED" || !t.assignedUserId) break;
     await startWorkflowTask(t.assignedUserId, companyId, t.id);
-    await completeMoveGroup({ companyId, userId: t.assignedUserId, taskId: t.id });
+    const cr = await prisma.cellReservation.findFirstOrThrow({ where: { taskId: t.id, status: "ACTIVE" } });
+    await completeMoveGroup({ companyId, userId: t.assignedUserId, taskId: t.id, groupCode: await groupCode(t.subjectId!), cellCode: await cellCode(cr.cellId) });
   }
 }
 
 // собрать заказ целиком (скан всех активных резервов)
 async function runPick(orderId: string): Promise<string> {
-  let t = await prisma.workflowTask.findFirst({ where: { warehouseId: W, type: "PICK_ORDER", subjectId: orderId, status: { in: ["QUEUED", "ASSIGNED"] } } });
+  let t = await prisma.workflowTask.findFirst({ where: { warehouseId: W, type: "PICK_ORDER", subjectId: orderId, status: { in: ["QUEUED", "ASSIGNED", "IN_PROGRESS"] } } });
   if (!t) return "нет задачи сборки";
   if (t.status === "QUEUED") { await rebalanceQueuedTasks(companyId, { warehouseId: W }); t = await prisma.workflowTask.findUniqueOrThrow({ where: { id: t.id } }); }
-  if (t.status !== "ASSIGNED" || t.assignedUserId !== pk) return `сборка не назначена сборщику (${t.status})`;
-  await startWorkflowTask(pk, companyId, t.id);
+  if (t.assignedUserId !== pk) return `сборка не назначена сборщику (${t.status})`;
+  if (t.status === "ASSIGNED") await startWorkflowTask(pk, companyId, t.id); // уже IN_PROGRESS — повторно не стартуем
   for (let i = 0; i < 50; i++) {
-    const r = await prisma.stockReservation.findFirst({ where: { orderId, status: "ACTIVE" }, include: { line: true } });
+    const r = await prisma.stockReservation.findFirst({ where: { orderId, status: "ACTIVE" } });
     if (!r) break;
-    await pickOrderScan({ companyId, userId: pk, taskId: t.id, cellId: r.cellId!, itemId: r.line.itemId, qty: r.qty.toNumber() });
+    await pickOrderScan({ companyId, userId: pk, taskId: t.id, cellCode: await cellCode(r.cellId!), groupCode: await groupCode(r.handlingGroupId!), qty: r.qty.toNumber() });
   }
   return "";
 }
@@ -86,8 +92,9 @@ async function resetScenario() {
   await prisma.externalOrder.deleteMany({ where: { id: { in: orders.map((o) => o.id) } } }); // cascade lines
   await prisma.cellReservation.deleteMany({ where: { warehouseId: { in: [W, DW] } } });
   await prisma.workflowTask.deleteMany({ where: { warehouseId: { in: [W, DW] } } });
-  const groups = await prisma.handlingGroup.findMany({ where: { warehouseId: { in: [W, DW] } }, select: { lotId: true } });
+  const groups = await prisma.handlingGroup.findMany({ where: { warehouseId: { in: [W, DW] } }, select: { id: true, lotId: true } });
   const lotIds = groups.map((g) => g.lotId);
+  await prisma.qrCode.deleteMany({ where: { type: "GROUP", refId: { in: groups.map((g) => g.id) } } });
   await prisma.handlingGroup.deleteMany({ where: { warehouseId: { in: [W, DW] } } });
   if (lotIds.length) {
     await prisma.stockMovement.deleteMany({ where: { lotId: { in: lotIds } } });
@@ -110,6 +117,7 @@ async function provision() {
   await createCellsInZone({ companyId, warehouseId: W, zoneId: zStorage, codes: ["EO-L1A", "EO-L1B"], level: 1 });
   await createCellsInZone({ companyId, warehouseId: W, zoneId: zStorage, codes: ["EO-L2A", "EO-L2B"], level: 2 });
   await createCellsInZone({ companyId, warehouseId: W, zoneId: zStorage, codes: ["EO-U3A", "EO-U3B"], level: 3 });
+  await createCellsInZone({ companyId, warehouseId: W, zoneId: zStorage, codes: ["EO-U11"], level: 11 }); // верхняя ур.11
   const uom = await prisma.uom.create({ data: { companyId, name: "шт EO" } });
   itemA = (await prisma.item.create({ data: { companyId, name: "EO товар A", sku: "EO-A", uomId: uom.id, tracking: "LOT", isActive: true } })).id;
   itemB = (await prisma.item.create({ data: { companyId, name: "EO товар B", sku: "EO-B", uomId: uom.id, tracking: "LOT", isActive: true } })).id;
@@ -117,6 +125,8 @@ async function provision() {
   demoId = demo.id;
   DW = (await prisma.warehouse.create({ data: { companyId: demoId, name: "EO DW", isActive: true } })).id;
   await ensureStandardZones(demoId, DW);
+  const dzs = (await prisma.warehouseZone.findFirstOrThrow({ where: { warehouseId: DW, kind: "STORAGE" } })).id;
+  await createCellsInZone({ companyId: demoId, warehouseId: DW, zoneId: dzs, codes: ["EO-DEMO1"], level: 1 }); // чужая ячейка (QR другой организации)
   lo = await mkUser("eo_lo", companyId, "+79995550001", "LOADER", W);
   pk = await mkUser("eo_pk", companyId, "+79995550002", "PICKER", W);
   await mkShift(lo, "LOADER", W);
@@ -215,21 +225,25 @@ async function main() {
   ok("первым в очереди — заказ с ближайшим arrivalAt", queued[0]?.subjectId === oEarly.orderId, `first=${queued[0]?.subjectId}`);
   await resetScenario();
 
-  console.log("7) сборка: отбор через ядро → зона CONTROL; повтор скана идемпотентен; IN_CONTROL");
-  await seedGroup(itemA, await cellId("EO-L1A"), 8, new Date(now.getTime() - 20_000));
+  console.log("7) сборка: скан ячейки+группы → CONTROL; излишек отклонён; повтор не двоит; недостача после завершения отклонена");
+  const g7 = await seedGroup(itemA, await cellId("EO-L1A"), 8, new Date(now.getTime() - 20_000));
   const oPick = await imp("EO-PICK", [{ externalLineId: "1", itemId: itemA, requiredQty: 8 }]);
   await reserveAndPlanOrder({ companyId, orderId: oPick.orderId, userId: lo });
   const pt = await pickTask(oPick.orderId);
   await rebalanceQueuedTasks(companyId, { warehouseId: W });
   await startWorkflowTask(pk, companyId, pt!.id);
-  const rPick = (await activeRes(oPick.orderId))[0];
-  await pickOrderScan({ companyId, userId: pk, taskId: pt!.id, cellId: rPick.cellId!, itemId: itemA, qty: 8 });
-  const excess = await err(() => pickOrderScan({ companyId, userId: pk, taskId: pt!.id, cellId: rPick.cellId!, itemId: itemA, qty: 1 }));
-  const controlQty = (await prisma.stockBalance.aggregate({ where: { lotId: rPick.lotId!, locKey: `Z:${zControl}` }, _sum: { qty: true } }))._sum.qty?.toNumber() ?? 0;
-  const cellLeft = await cellQty(await cellId("EO-L1A"));
-  ok("вся строка отобрана в зону CONTROL (8), исходная ячейка пуста", controlQty === 8 && cellLeft === 0);
-  ok("повторный скан не двоит движение (в CONTROL всё ещё 8)", excess === "" || excess.length >= 0 ? controlQty === 8 : false);
+  const cc7 = await cellCode(await cellId("EO-L1A")), gc7 = await groupCode(g7.groupId);
+  const ctrl7 = async () => (await prisma.stockBalance.aggregate({ where: { lotId: g7.lotId, locKey: `Z:${zControl}` }, _sum: { qty: true } }))._sum.qty?.toNumber() ?? 0;
+  const excess = await err(() => pickOrderScan({ companyId, userId: pk, taskId: pt!.id, cellCode: cc7, groupCode: gc7, qty: 99 }));
+  ok("излишек (qty>резерв) отклонён", excess.includes("больше зарезервированного"));
+  await pickOrderScan({ companyId, userId: pk, taskId: pt!.id, cellCode: cc7, groupCode: gc7, qty: 8 });
+  const mv7 = await mvCount(g7.lotId);
+  ok("вся строка отобрана в зону CONTROL (8), исходная ячейка пуста", (await ctrl7()) === 8 && (await cellQty(await cellId("EO-L1A"))) === 0);
   ok("заказ IN_CONTROL, PICK_ORDER COMPLETED, резерв FULFILLED", (await orderStatus(oPick.orderId)) === "IN_CONTROL" && (await prisma.workflowTask.findUniqueOrThrow({ where: { id: pt!.id } })).status === "COMPLETED" && (await prisma.stockReservation.count({ where: { orderId: oPick.orderId, status: "FULFILLED" } })) === 1);
+  const repeat = await err(() => pickOrderScan({ companyId, userId: pk, taskId: pt!.id, cellCode: cc7, groupCode: gc7, qty: 8 }));
+  ok("повтор финального скана: без ошибки, без второго движения, CONTROL=8", repeat === "" && (await mvCount(g7.lotId)) === mv7 && (await ctrl7()) === 8);
+  const shortAfter = await err(() => reportPickShortage({ companyId, userId: pk, taskId: pt!.id, reason: "поздно" }));
+  ok("недостача после завершения (IN_CONTROL) отклонена", shortAfter.includes("уже собран") || shortAfter.includes("в работе"));
   await resetScenario();
 
   console.log("8) уровень 3+: цепочка перестановки вниз (свободная нижняя) → сборка с ур.1");
@@ -269,7 +283,8 @@ async function main() {
   await seedGroup(itemB, await cellId("EO-L2A"), 4, new Date(now.getTime() - 30_000));
   await seedGroup(itemB, await cellId("EO-L2B"), 4, new Date(now.getTime() - 30_000));
   const g10 = await seedGroup(itemA, await cellId("EO-U3A"), 6, new Date(now.getTime() - 20_000)); // нужная на ур.3
-  await seedGroup(itemB, await cellId("EO-U3B"), 4, new Date(now.getTime() - 30_000)); // занять последнюю верхнюю
+  await seedGroup(itemB, await cellId("EO-U3B"), 4, new Date(now.getTime() - 30_000)); // занять ур.3B
+  await seedGroup(itemB, await cellId("EO-U11"), 4, new Date(now.getTime() - 30_000)); // занять и ур.11 — верхних свободных нет
   const o10 = await imp("EO-BLOCK", [{ externalLineId: "1", itemId: itemA, requiredQty: 6 }]);
   await reserveAndPlanOrder({ companyId, orderId: o10.orderId, userId: lo });
   ok("статус BLOCKED", (await orderStatus(o10.orderId)) === "BLOCKED");
@@ -284,6 +299,65 @@ async function main() {
   const oIso = await imp("EO-ISO", [{ externalLineId: "1", itemId: itemA, requiredQty: 5 }]);
   const foreignReserve = await err(() => reserveAndPlanOrder({ companyId: demoId, orderId: oIso.orderId, userId: lo }));
   ok("резерв чужого заказа (другой companyId) → отказ", !!foreignReserve);
+  await resetScenario();
+
+  console.log("12) QR-валидация сборки: чужой tenant-QR и неверный QR отклонены, корректный — собирает");
+  const g12 = await seedGroup(itemA, await cellId("EO-L1A"), 4, new Date(now.getTime() - 20_000));
+  const o12 = await imp("EO-QR", [{ externalLineId: "1", itemId: itemA, requiredQty: 4 }]);
+  await reserveAndPlanOrder({ companyId, orderId: o12.orderId, userId: lo });
+  const pt12 = await pickTask(o12.orderId); await rebalanceQueuedTasks(companyId, { warehouseId: W }); await startWorkflowTask(pk, companyId, pt12!.id);
+  const demoCell = await prisma.cell.findFirstOrThrow({ where: { warehouseId: DW, code: "EO-DEMO1" } });
+  const foreignCellCode = await cellCode(demoCell.id);
+  const g12code = await groupCode(g12.groupId);
+  const foreignCell = await err(() => pickOrderScan({ companyId, userId: pk, taskId: pt12!.id, cellCode: foreignCellCode, groupCode: g12code, qty: 4 }));
+  ok("чужой tenant-QR ячейки отклонён", foreignCell.includes("этой организации") || foreignCell.includes("не найдена"));
+  const badQr = await err(() => pickOrderScan({ companyId, userId: pk, taskId: pt12!.id, cellCode: "NEVERQR234", groupCode: g12code, qty: 4 }));
+  ok("неверный QR ячейки отклонён", !!badQr);
+  ok("после отказов корректный скан собирает заказ", (await runPick(o12.orderId)) === "" && (await orderStatus(o12.orderId)) === "IN_CONTROL");
+  await resetScenario();
+
+  console.log("13) два заказа на одну верхнюю группу → одна перестановка (без дубля), второй зависит от неё");
+  const g13 = await seedGroup(itemA, await cellId("EO-U3A"), 10, new Date(now.getTime() - 20_000)); // общая группа на ур.3
+  const o13a = await imp("EO-SHARE-A", [{ externalLineId: "1", itemId: itemA, requiredQty: 4 }]);
+  await reserveAndPlanOrder({ companyId, orderId: o13a.orderId, userId: lo });
+  const o13b = await imp("EO-SHARE-B", [{ externalLineId: "1", itemId: itemA, requiredQty: 4 }]);
+  await reserveAndPlanOrder({ companyId, orderId: o13b.orderId, userId: lo });
+  ok("ровно ОДНА задача перестановки на общую группу (без дубля)", (await prisma.workflowTask.count({ where: { warehouseId: W, type: "MOVE_GROUP", subjectId: g13.groupId } })) === 1);
+  ok("ровно одна активная бронь ячейки на группу (partial-unique)", (await prisma.cellReservation.count({ where: { handlingGroupId: g13.groupId, status: "ACTIVE" } })) === 1);
+  const moveTask13 = await prisma.workflowTask.findFirstOrThrow({ where: { warehouseId: W, type: "MOVE_GROUP", subjectId: g13.groupId } });
+  const pickB13 = await prisma.workflowTask.findFirstOrThrow({ where: { type: "PICK_ORDER", subjectId: o13b.orderId } });
+  ok("второй заказ (PICK) зависит от той же задачи перестановки", pickB13.status === "BLOCKED" && (await prisma.taskDependency.count({ where: { taskId: pickB13.id, dependsOnTaskId: moveTask13.id } })) === 1);
+  await runMoves();
+  ok("после одной перестановки оба заказа собираются в IN_CONTROL", (await runPick(o13a.orderId)) === "" && (await runPick(o13b.orderId)) === "" && (await orderStatus(o13a.orderId)) === "IN_CONTROL" && (await orderStatus(o13b.orderId)) === "IN_CONTROL");
+  await resetScenario();
+
+  console.log("14) уровень 11 годится как верхняя ячейка (lift-target): нижние заняты, свободна только ур.11");
+  await seedGroup(itemB, await cellId("EO-L1A"), 4, new Date(now.getTime() - 30_000));
+  await seedGroup(itemB, await cellId("EO-L1B"), 4, new Date(now.getTime() - 30_000));
+  await seedGroup(itemB, await cellId("EO-L2A"), 4, new Date(now.getTime() - 30_000));
+  await seedGroup(itemB, await cellId("EO-L2B"), 4, new Date(now.getTime() - 30_000));
+  const g14 = await seedGroup(itemA, await cellId("EO-U3A"), 6, new Date(now.getTime() - 20_000)); // нужная на ур.3
+  await seedGroup(itemB, await cellId("EO-U3B"), 4, new Date(now.getTime() - 30_000)); // ур.3B занят; свободна только ур.11
+  const o14 = await imp("EO-LVL11", [{ externalLineId: "1", itemId: itemA, requiredQty: 6 }]);
+  const st14 = await reserveAndPlanOrder({ companyId, orderId: o14.orderId, userId: lo });
+  ok("не BLOCKED: ур.11 распознан как верхняя для подъёма", st14.status === "READY_TO_PICK");
+  ok("невостребованная группа поднимается именно в ур.11", !!(await prisma.cellReservation.findFirst({ where: { cellId: await cellId("EO-U11"), status: "ACTIVE" } })));
+  await runMoves();
+  const c14 = await prisma.stockBalance.findFirst({ where: { lotId: g14.lotId, qty: { gt: 0 } }, select: { cellId: true } });
+  const lvl14 = c14?.cellId ? (await prisma.cell.findUnique({ where: { id: c14.cellId }, select: { level: true } }))?.level : 9;
+  ok("нужная группа спущена на ур.1-2, заказ собран", (lvl14 ?? 9) <= 2 && (await runPick(o14.orderId)) === "" && (await orderStatus(o14.orderId)) === "IN_CONTROL");
+  await resetScenario();
+
+  console.log("15) loadUnits сборки = число несобранных строк (уменьшается после отбора)");
+  const g15a = await seedGroup(itemA, await cellId("EO-L1A"), 3, new Date(now.getTime() - 20_000));
+  await seedGroup(itemB, await cellId("EO-L1B"), 3, new Date(now.getTime() - 20_000));
+  const o15 = await imp("EO-LOAD", [{ externalLineId: "1", itemId: itemA, requiredQty: 3 }, { externalLineId: "2", itemId: itemB, requiredQty: 3 }]);
+  await reserveAndPlanOrder({ companyId, orderId: o15.orderId, userId: lo });
+  const pt15 = await pickTask(o15.orderId); await rebalanceQueuedTasks(companyId, { warehouseId: W }); await startWorkflowTask(pk, companyId, pt15!.id);
+  ok("до сборки loadUnits = 2 (две строки)", (await prisma.workflowTask.findUniqueOrThrow({ where: { id: pt15!.id } })).loadUnits === 2);
+  await pickOrderScan({ companyId, userId: pk, taskId: pt15!.id, cellCode: await cellCode(await cellId("EO-L1A")), groupCode: await groupCode(g15a.groupId), qty: 3 });
+  ok("после отбора одной строки loadUnits = 1", (await prisma.workflowTask.findUniqueOrThrow({ where: { id: pt15!.id } })).loadUnits === 1);
+  ok("после сбора всех строк заказ IN_CONTROL", (await runPick(o15.orderId)) === "" && (await orderStatus(o15.orderId)) === "IN_CONTROL");
   await resetScenario();
 }
 

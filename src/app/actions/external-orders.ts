@@ -67,13 +67,17 @@ export async function importOrderAction(_prev: OrderActionState, formData: FormD
   }
 }
 
+// Перестановка: настоящее сканирование — QR группы + QR целевой ячейки (сырые коды, resolve на сервере).
 export async function completeMoveGroupAction(_prev: OrderActionState, formData: FormData): Promise<OrderActionState> {
   if (!externalOrderPickingEnabled()) return OFF;
   const session = await requireUser();
   const s = scoped(session);
   const taskId = String(formData.get("taskId") ?? "").trim();
+  const groupCode = String(formData.get("groupCode") ?? "").trim();
+  const cellCode = String(formData.get("cellCode") ?? "").trim();
+  if (!groupCode || !cellCode) return { error: "Отсканируйте QR группы и целевой ячейки" };
   try {
-    await completeMoveGroup({ companyId: s.companyId, userId: session.userId, taskId });
+    await completeMoveGroup({ companyId: s.companyId, userId: session.userId, taskId, groupCode, cellCode });
   } catch (e) {
     return { error: msg(e) };
   }
@@ -81,23 +85,24 @@ export async function completeMoveGroupAction(_prev: OrderActionState, formData:
   return { ok: true };
 }
 
+// Сборка: настоящее сканирование — QR ячейки + QR группы/партии + количество (коды, resolve на сервере).
 export async function pickScanAction(_prev: OrderActionState, formData: FormData): Promise<OrderActionState> {
   if (!externalOrderPickingEnabled()) return OFF;
   const session = await requireUser();
   const s = scoped(session);
   const taskId = String(formData.get("taskId") ?? "").trim();
-  const cellId = String(formData.get("cellId") ?? "").trim();
-  const itemId = String(formData.get("itemId") ?? "").trim();
+  const cellCode = String(formData.get("cellCode") ?? "").trim();
+  const groupCode = String(formData.get("groupCode") ?? "").trim();
   const qty = Number(String(formData.get("qty") ?? "").trim().replace(",", "."));
-  if (!cellId || !itemId) return { error: "Отсканируйте ячейку и товар" };
+  if (!cellCode || !groupCode) return { error: "Отсканируйте QR ячейки и группы" };
   if (!Number.isFinite(qty)) return { error: "Укажите количество" };
   try {
-    await pickOrderScan({ companyId: s.companyId, userId: session.userId, taskId, cellId, itemId, qty });
+    const r = await pickOrderScan({ companyId: s.companyId, userId: session.userId, taskId, cellCode, groupCode, qty });
+    revalidatePath("/warehouse/tasks");
+    return { ok: true, status: r.done ? "IN_CONTROL" : r.alreadyPicked ? "alreadyPicked" : "PICKING" };
   } catch (e) {
     return { error: msg(e) };
   }
-  revalidatePath("/warehouse/tasks");
-  return { ok: true };
 }
 
 export async function reportShortageAction(_prev: OrderActionState, formData: FormData): Promise<OrderActionState> {

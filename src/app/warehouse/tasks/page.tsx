@@ -21,10 +21,11 @@ const STATUSES: TaskStatus[] = ["BLOCKED", "QUEUED", "ASSIGNED", "IN_PROGRESS", 
 
 const toDTO = (t: {
   id: string; type: string; title: string; description: string | null;
-  priority: "NORMAL" | "URGENT"; status: string; createdAt: Date; actionUrl: string | null;
+  priority: "NORMAL" | "URGENT"; status: string; createdAt: Date; actionUrl: string | null; dueAt: Date | null;
 }): TaskDTO => ({
   id: t.id, type: t.type, title: t.title, description: t.description,
   priority: t.priority, status: t.status, createdAt: t.createdAt.toISOString(), actionUrl: t.actionUrl,
+  dueAt: t.dueAt ? t.dueAt.toISOString() : null,
 });
 
 // Переключатель «Мои задачи / Монитор» — только для ADMIN (монитор доступен лишь ему).
@@ -80,7 +81,7 @@ export default async function TasksPage({
       prisma.workflowTask.findMany({
         where,
         include: { assignedUser: { select: { name: true } }, warehouse: { select: { name: true } } },
-        orderBy: [{ priority: "desc" }, { createdAt: "desc" }],
+        orderBy: [{ priority: "desc" }, { dueAt: { sort: "asc", nulls: "last" } }, { createdAt: "asc" }],
         take: 200,
       }),
       allowedWarehouses(session, s.companyId),
@@ -160,7 +161,7 @@ export default async function TasksPage({
 
   const mine = await prisma.workflowTask.findMany({
     where: { companyId: s.companyId, assignedUserId: session.userId, status: { in: ["ASSIGNED", "IN_PROGRESS", "HANDOFF_PENDING"] } },
-    orderBy: [{ priority: "desc" }, { createdAt: "asc" }],
+    orderBy: [{ priority: "desc" }, { dueAt: { sort: "asc", nulls: "last" } }, { createdAt: "asc" }],
   });
   const current = mine.find((t) => t.status === "IN_PROGRESS" || t.status === "HANDOFF_PENDING") ?? null;
   const assigned = mine.filter((t) => t.status === "ASSIGNED");

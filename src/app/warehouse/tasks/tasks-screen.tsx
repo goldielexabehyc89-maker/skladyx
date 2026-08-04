@@ -11,7 +11,8 @@ import {
   type TaskActionState,
 } from "@/app/actions/tasks";
 import { completeGroupPlacementAction, type PlacementState } from "@/app/actions/group-receiving";
-import { completeMoveGroupAction, pickScanAction, reportShortageAction, type OrderActionState } from "@/app/actions/external-orders";
+import { reportShortageAction, pickScanAction, completeMoveGroupAction, type OrderActionState } from "@/app/actions/external-orders";
+import { PickOrderScanner, MoveGroupScanner } from "./order-scanners";
 import { Button, Card, CardTitle, Badge, EmptyState } from "@/components/ui";
 import { TASK_STATUS_TONE, taskStatusLabel, taskTypeLabel } from "@/lib/task-labels";
 
@@ -24,6 +25,7 @@ export interface TaskDTO {
   status: string;
   createdAt: string;
   actionUrl: string | null;
+  dueAt: string | null; // Пакет 6: срок (arrivalAt заказа) — показываем для сборки
 }
 export interface Mate {
   userId: string;
@@ -70,6 +72,10 @@ const fmtTime = (iso: string) => {
   const d = new Date(iso);
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 };
+const fmtDue = (iso: string) => {
+  const d = new Date(iso);
+  return `${String(d.getDate()).padStart(2, "0")}.${String(d.getMonth() + 1).padStart(2, "0")} ${fmtTime(iso)}`;
+};
 
 function TaskMeta({ task }: { task: TaskDTO }) {
   return (
@@ -77,6 +83,7 @@ function TaskMeta({ task }: { task: TaskDTO }) {
       <Badge tone={TASK_STATUS_TONE[task.status] ?? "neutral"}>{taskStatusLabel(task.status)}</Badge>
       {task.priority === "URGENT" && <Badge tone="red">срочно</Badge>}
       <span>{taskTypeLabel(task.type)}</span>
+      {task.type === "PICK_ORDER" && task.dueAt && <span className="text-[#4c5fd7]">· к {fmtDue(task.dueAt)}</span>}
       <span>· создано {fmtTime(task.createdAt)}</span>
     </div>
   );
@@ -218,72 +225,53 @@ function CoolingRetrievalForm({ cooling }: { cooling: Cooling }) {
   );
 }
 
-// Пакет 6: перестановка группы (MOVE_GROUP) — погрузчик подтверждает перемещение вниз.
-function MoveGroupForm({ ctx }: { ctx: MoveGroupCtx }) {
+// Пакет 6: ручной ввод ОТСКАНИРОВАННЫХ кодов (fallback к камере + путь без камеры). Отправляет
+// коды QR (не скрытые id) — серверная сверка ячейка/группа/резерв ↔ заказ в actions/external-orders.
+function ManualPickForm({ taskId }: { taskId: string }) {
+  const [state, action, pending] = useActionState<OrderActionState, FormData>(pickScanAction, {});
+  return (
+    <details className="text-xs text-neutral-500">
+      <summary className="cursor-pointer">Ввести коды вручную (без камеры)</summary>
+      <form action={action} className="mt-2 flex flex-col gap-2">
+        <input type="hidden" name="taskId" value={taskId} />
+        <input name="cellCode" required placeholder="Код QR ячейки (1-2)" className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm" />
+        <input name="groupCode" required placeholder="Код QR группы/партии" className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm" />
+        <input name="qty" required type="number" inputMode="decimal" step="1" placeholder="Количество" className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm" />
+        {state.error && <p className="text-red-600">{state.error}</p>}
+        <Button type="submit" variant="ghost" disabled={pending}>{pending ? "…" : "Собрать по кодам"}</Button>
+      </form>
+    </details>
+  );
+}
+function ManualMoveForm({ taskId }: { taskId: string }) {
   const [state, action, pending] = useActionState<OrderActionState, FormData>(completeMoveGroupAction, {});
   return (
-    <form action={action} className="flex flex-col gap-2">
-      <input type="hidden" name="taskId" value={ctx.taskId} />
-      <div className="rounded-lg bg-neutral-50 p-2 text-sm">
-        <div className="font-medium">{ctx.item} · {ctx.qty} шт</div>
-        <div className="text-xs text-neutral-500">
-          Из {ctx.fromCell}{ctx.fromLevel != null ? ` (ур.${ctx.fromLevel})` : ""} → в {ctx.toCell}{ctx.toLevel != null ? ` (ур.${ctx.toLevel})` : ""}
-        </div>
-      </div>
-      {state.error && <p className="text-xs text-red-600">{state.error}</p>}
-      <Button type="submit" disabled={pending} className="w-full">
-        {pending ? "…" : "Готово: группа переставлена"}
-      </Button>
-    </form>
+    <details className="text-xs text-neutral-500">
+      <summary className="cursor-pointer">Ввести коды вручную (без камеры)</summary>
+      <form action={action} className="mt-2 flex flex-col gap-2">
+        <input type="hidden" name="taskId" value={taskId} />
+        <input name="groupCode" required placeholder="Код QR группы" className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm" />
+        <input name="cellCode" required placeholder="Код QR целевой ячейки" className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm" />
+        {state.error && <p className="text-red-600">{state.error}</p>}
+        <Button type="submit" variant="ghost" disabled={pending}>{pending ? "…" : "Переставить по кодам"}</Button>
+      </form>
+    </details>
   );
 }
 
-// Пакет 6: сборка заказа (PICK_ORDER) — по каждой зарезервированной строке: ячейка(1-2)→товар→кол-во.
-function PickOrderForm({ ctx, taskId }: { ctx: PickOrderCtx; taskId: string }) {
-  const [state, action, pending] = useActionState<OrderActionState, FormData>(pickScanAction, {});
-  const [shortState, shortAction, shortPending] = useActionState<OrderActionState, FormData>(reportShortageAction, {});
-  const remaining = ctx.picks;
+// Пакет 6: фиксация недостачи по своей задаче сборки (данные не подменяются, причина в аудит).
+function ShortageForm({ taskId }: { taskId: string }) {
+  const [state, action, pending] = useActionState<OrderActionState, FormData>(reportShortageAction, {});
   return (
-    <div className="flex flex-col gap-3">
-      <div className="rounded-lg bg-neutral-50 p-2 text-sm">
-        <div className="font-medium">Заказ {ctx.externalId}</div>
-        <ul className="mt-1 flex flex-col gap-0.5 text-xs text-neutral-600">
-          {ctx.lines.map((l) => (
-            <li key={l.id}>{l.item}: собрано {l.picked} из {l.required}</li>
-          ))}
-        </ul>
-      </div>
-      {remaining.length === 0 ? (
-        <p className="text-xs text-neutral-500">Все резервы этой ячейки собраны. Обновите экран.</p>
-      ) : (
-        <div className="flex flex-col gap-2">
-          <div className="text-xs font-medium text-neutral-500">Собрать по резервам (ячейка → товар → количество):</div>
-          {remaining.map((p, i) => (
-            <form key={`${p.cellId}:${p.itemId}:${i}`} action={action} className="flex items-center gap-2 rounded-lg border border-[#eee] p-2">
-              <input type="hidden" name="taskId" value={taskId} />
-              <input type="hidden" name="cellId" value={p.cellId} />
-              <input type="hidden" name="itemId" value={p.itemId} />
-              <input type="hidden" name="qty" value={p.qty} />
-              <div className="min-w-0 flex-1 text-sm">
-                <div className="truncate font-medium">{p.item}</div>
-                <div className="text-xs text-neutral-500">ячейка {p.cell}{p.level != null ? ` · ур.${p.level}` : ""} · {p.qty} шт</div>
-              </div>
-              <Button type="submit" disabled={pending}>{pending ? "…" : "Собрать"}</Button>
-            </form>
-          ))}
-        </div>
-      )}
-      {state.error && <p className="text-xs text-red-600">{state.error}</p>}
-      <details className="text-xs text-neutral-500">
-        <summary className="cursor-pointer">Сообщить о недостаче</summary>
-        <form action={shortAction} className="mt-2 flex flex-col gap-2">
-          <input type="hidden" name="taskId" value={taskId} />
-          <input name="reason" required placeholder="Причина недостачи" className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm" />
-          {shortState.error && <p className="text-red-600">{shortState.error}</p>}
-          <Button type="submit" variant="ghost" disabled={shortPending}>{shortPending ? "…" : "Зафиксировать недостачу"}</Button>
-        </form>
-      </details>
-    </div>
+    <details className="text-xs text-neutral-500">
+      <summary className="cursor-pointer">Сообщить о недостаче</summary>
+      <form action={action} className="mt-2 flex flex-col gap-2">
+        <input type="hidden" name="taskId" value={taskId} />
+        <input name="reason" required placeholder="Причина недостачи" className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm" />
+        {state.error && <p className="text-red-600">{state.error}</p>}
+        <Button type="submit" variant="ghost" disabled={pending}>{pending ? "…" : "Зафиксировать недостачу"}</Button>
+      </form>
+    </details>
   );
 }
 
@@ -342,8 +330,19 @@ export function WorkerTasks({
               )}
               {placement && current.status === "IN_PROGRESS" && <PlacementForm placement={placement} />}
               {cooling && current.status === "IN_PROGRESS" && <CoolingRetrievalForm cooling={cooling} />}
-              {moveGroup && current.status === "IN_PROGRESS" && <MoveGroupForm ctx={moveGroup} />}
-              {pickOrder && current.status === "IN_PROGRESS" && <PickOrderForm ctx={pickOrder} taskId={current.id} />}
+              {moveGroup && current.status === "IN_PROGRESS" && (
+                <>
+                  <MoveGroupScanner ctx={moveGroup} />
+                  <ManualMoveForm taskId={current.id} />
+                </>
+              )}
+              {pickOrder && current.status === "IN_PROGRESS" && (
+                <>
+                  <PickOrderScanner ctx={pickOrder} taskId={current.id} />
+                  <ManualPickForm taskId={current.id} />
+                  <ShortageForm taskId={current.id} />
+                </>
+              )}
               {current.status === "IN_PROGRESS" && <HandoffForm taskId={current.id} mates={mates} />}
               {current.status === "HANDOFF_PENDING" && (
                 <p className="text-xs text-orange-600">Ожидает принятия передачи получателем.</p>
