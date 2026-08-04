@@ -237,6 +237,8 @@ export async function reserveAndPlanOrder(input: { companyId: string; orderId: s
       return { status: order.status, warehouseId: order.warehouseId }; // уже в сборке/контроле — идемпотентно
 
     const lines = await tx.externalOrderLine.findMany({ where: { orderId: order.id }, orderBy: { externalLineId: "asc" } });
+    // задачи перестановки, от которых должна зависеть сборка (группа уже едет ВНИЗ под другой заказ)
+    const dependOnMoves = new Set<string>();
 
     // FIFO-резерв каждой недопокрытой строки на точную строку-источник (Σ active + new ≤ balance)
     for (const line of lines) {
@@ -262,6 +264,15 @@ export async function reserveAndPlanOrder(input: { companyId: string; orderId: s
           select: { id: true },
         });
         if (!group) continue;
+        // группа в активной перестановке: смотрим ЦЕЛЕВУЮ ячейку брони (не текущий уровень группы).
+        // Наверх (target ур.3+) — источник недоступен, пропускаем (следующий FIFO-источник).
+        // Вниз (target ур.1-2) — резерв разрешён, но сборка обязана зависеть от ЭТОЙ задачи.
+        const mv = await tx.cellReservation.findFirst({ where: { handlingGroupId: group.id, status: "ACTIVE" }, select: { cellId: true, taskId: true } });
+        if (mv) {
+          const mvLevel = (await tx.cell.findFirst({ where: { id: mv.cellId }, select: { level: true } }))?.level ?? null;
+          if (!isPickableLevel(mvLevel)) continue; // перестановка НАВЕРХ — из этой группы не резервируем
+          if (mv.taskId) dependOnMoves.add(mv.taskId); // перестановка ВНИЗ — сборка зависит от неё
+        }
         await lockCell(tx, input.companyId, cell.id);
         const bal2 = await tx.stockBalance.findFirst({ where: { lotId: lot.id, locKey: `C:${cell.id}`, qty: { gt: 0 } }, select: { qty: true } });
         if (!bal2) continue;
@@ -351,7 +362,9 @@ export async function reserveAndPlanOrder(input: { companyId: string; orderId: s
       title: `Собрать заказ ${order.externalId}`, description: `Строк: ${lines.length}`,
       subjectType: "ExternalOrder", subjectId: order.id,
       dedupeKey: `order:${order.id}:pick`, loadUnits: lines.length,
-      dueAt: order.arrivalAt ?? undefined, dependsOn: dependOn,
+      // зависимости: наши новые перестановки вниз + существующие (общая группа) + перестановки вниз,
+      // замеченные при резервировании (createWorkflowTaskInTx дедуплицирует список).
+      dueAt: order.arrivalAt ?? undefined, dependsOn: [...new Set([...dependOn, ...dependOnMoves])],
     });
     created.push(pick);
     await tx.externalOrder.update({ where: { id: order.id }, data: { status: "READY_TO_PICK" } });
@@ -461,19 +474,23 @@ export async function pickOrderScan(input: {
     const order = await tx.externalOrder.findFirst({ where: { id: task.subjectId ?? "", companyId: input.companyId } });
     if (!order) throw new ExternalOrderError("Заказ не найден");
     const base = { companyId: input.companyId, warehouseId: order.warehouseId, orderId: order.id, taskId: task.id };
+    if (task.assignedUserId !== input.userId) throw new ExternalOrderError("Это не ваша задача сборки");
 
-    // идемпотентность финального скана: заказ уже собран (IN_CONTROL) своей задачей → успех
-    // alreadyPicked, без движения и без изменения pickedQty; завершённую задачу не воскрешаем.
-    if (order.status === "IN_CONTROL" && task.assignedUserId === input.userId)
-      return { ...base, done: true, alreadyPicked: true, justCompleted: false, unblocked: [] as Brief[] };
-    if (task.assignedUserId !== input.userId || task.status !== "IN_PROGRESS")
-      throw new ExternalOrderError("Собирать может только назначенный исполнитель с задачей «в работе»");
-
-    // настоящие сканы: ячейка (ур.1-2) и группа/партия
+    // Настоящие сканы РЕЗОЛВИМ И СВЕРЯЕМ ВСЕГДА (в т.ч. при IN_CONTROL): чужой tenant / чужая ячейка /
+    // неверный QR — отказ (resolve* бросает при несовпадении организации/типа/существования).
     const cellId = await resolveScannedCell(tx, input.companyId, order.warehouseId, input.cellCode);
     const cell = await tx.cell.findFirst({ where: { id: cellId }, select: { level: true } });
     if (!isPickableLevel(cell?.level ?? null)) throw new ExternalOrderError("Сборка только с нижних уровней (1-2)");
     const scanned = await resolveScannedGroup(tx, input.companyId, input.groupCode);
+
+    // Точная идемпотентность повтора финального скана: при IN_CONTROL успех alreadyPicked ТОЛЬКО если
+    // есть FULFILLED-резерв этого заказа именно с этой группой и этой (исходной) ячейкой; иначе — отказ.
+    if (order.status === "IN_CONTROL") {
+      const done = await tx.stockReservation.findFirst({ where: { orderId: order.id, handlingGroupId: scanned.groupId, cellId, status: "FULFILLED" }, select: { id: true } });
+      if (done) return { ...base, done: true, alreadyPicked: true, justCompleted: false, unblocked: [] as Brief[] };
+      throw new ExternalOrderError("Скан не соответствует собранному заказу");
+    }
+    if (task.status !== "IN_PROGRESS") throw new ExternalOrderError("Задача сборки не в работе");
 
     await lockCell(tx, input.companyId, cellId);
     // резерв ЭТОГО заказа для этой группы в этой ячейке — связывает заказ+группу+товар+ячейку+резерв

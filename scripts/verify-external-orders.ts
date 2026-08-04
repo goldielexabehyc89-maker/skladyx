@@ -7,7 +7,7 @@ import bcrypt from "bcryptjs";
 import { applyLotMovement } from "@/lib/stock";
 import { ensureStandardZones, createCellsInZone } from "@/lib/cells";
 import { createQrIn } from "@/lib/qr";
-import { startWorkflowTask, rebalanceQueuedTasks } from "@/lib/workflow-tasks";
+import { startWorkflowTask, rebalanceQueuedTasks, cancelWorkflowTask } from "@/lib/workflow-tasks";
 import {
   importExternalOrder,
   reserveAndPlanOrder,
@@ -358,6 +358,64 @@ async function main() {
   await pickOrderScan({ companyId, userId: pk, taskId: pt15!.id, cellCode: await cellCode(await cellId("EO-L1A")), groupCode: await groupCode(g15a.groupId), qty: 3 });
   ok("после отбора одной строки loadUnits = 1", (await prisma.workflowTask.findUniqueOrThrow({ where: { id: pt15!.id } })).loadUnits === 1);
   ok("после сбора всех строк заказ IN_CONTROL", (await runPick(o15.orderId)) === "" && (await orderStatus(o15.orderId)) === "IN_CONTROL");
+  await resetScenario();
+
+  console.log("16) группа поднимается НАВЕРХ: заказ на её товар не получает готовую сборку; после — безопасная цепочка");
+  const H16 = await seedGroup(itemB, await cellId("EO-L1A"), 4, new Date(now.getTime() - 5_000)); // H (itemB) — единственный источник itemB, нижняя
+  await seedGroup(itemA, await cellId("EO-L1B"), 4, new Date(now.getTime() - 5_000)); // filler (нижние заняты → нужен подъём)
+  await seedGroup(itemA, await cellId("EO-L2A"), 4, new Date(now.getTime() - 5_000));
+  await seedGroup(itemA, await cellId("EO-L2B"), 4, new Date(now.getTime() - 5_000));
+  const G16 = await seedGroup(itemA, await cellId("EO-U3A"), 6, new Date(now.getTime() - 60_000)); // самый старый itemA → его берёт A
+  void G16;
+  const oA16 = await imp("EO-LIFT-A", [{ externalLineId: "1", itemId: itemA, requiredQty: 6 }]);
+  await reserveAndPlanOrder({ companyId, orderId: oA16.orderId, userId: lo });
+  const hRes = await prisma.cellReservation.findFirst({ where: { handlingGroupId: H16.groupId, status: "ACTIVE" }, select: { cellId: true } });
+  const hTargetLevel = hRes ? (await prisma.cell.findUnique({ where: { id: hRes.cellId }, select: { level: true } }))?.level ?? 0 : 0;
+  ok("A подняла невостребованную нижнюю группу H НАВЕРХ (ур.3+)", hTargetLevel >= 3, `target level=${hTargetLevel}`);
+  const oB16 = await imp("EO-LIFT-B", [{ externalLineId: "1", itemId: itemB, requiredQty: 4 }]);
+  await reserveAndPlanOrder({ companyId, orderId: oB16.orderId, userId: lo });
+  ok("B (товар поднимаемой группы) не резервирует её и не получает сборку (IMPORTED, без PICK)", (await orderStatus(oB16.orderId)) === "IMPORTED" && (await activeRes(oB16.orderId)).length === 0 && !(await pickTask(oB16.orderId)));
+  await runMoves();
+  ok("A собрана", (await runPick(oA16.orderId)) === "" && (await orderStatus(oA16.orderId)) === "IN_CONTROL");
+  await reserveAndPlanOrder({ companyId, orderId: oB16.orderId, userId: lo });
+  ok("повторное планирование B: зарезервировал H и получил безопасную цепочку", (await activeRes(oB16.orderId)).length >= 1 && !!(await pickTask(oB16.orderId)));
+  await runMoves();
+  ok("B собран после безопасной перестановки", (await runPick(oB16.orderId)) === "" && (await orderStatus(oB16.orderId)) === "IN_CONTROL");
+  await resetScenario();
+
+  console.log("17) точная идемпотентность финального скана после IN_CONTROL; чужой скан/tenant/QR отклонён");
+  const g17 = await seedGroup(itemA, await cellId("EO-L1A"), 5, new Date(now.getTime() - 20_000));
+  const o17 = await imp("EO-IDEM", [{ externalLineId: "1", itemId: itemA, requiredQty: 5 }]);
+  await reserveAndPlanOrder({ companyId, orderId: o17.orderId, userId: lo });
+  ok("заказ собран (IN_CONTROL)", (await runPick(o17.orderId)) === "" && (await orderStatus(o17.orderId)) === "IN_CONTROL");
+  const pt17 = await prisma.workflowTask.findFirstOrThrow({ where: { type: "PICK_ORDER", subjectId: o17.orderId } });
+  const l1c = await cellCode(await cellId("EO-L1A")); const g17c = await groupCode(g17.groupId);
+  const mv17 = await mvCount(g17.lotId);
+  const repeatRes = await pickOrderScan({ companyId, userId: pk, taskId: pt17.id, cellCode: l1c, groupCode: g17c, qty: 5 });
+  ok("точный повтор финального скана: alreadyPicked, без движения", repeatRes.alreadyPicked && (await mvCount(g17.lotId)) === mv17);
+  const l2c = await cellCode(await cellId("EO-L2A"));
+  const wrongCell = await err(() => pickOrderScan({ companyId, userId: pk, taskId: pt17.id, cellCode: l2c, groupCode: g17c, qty: 5 }));
+  ok("чужая ячейка после IN_CONTROL отклонена", wrongCell.includes("не соответствует"));
+  const other17 = await seedGroup(itemA, await cellId("EO-L2B"), 2, new Date(now.getTime() - 10_000));
+  const other17c = await groupCode(other17.groupId); const l2bc = await cellCode(await cellId("EO-L2B"));
+  const wrongGroup = await err(() => pickOrderScan({ companyId, userId: pk, taskId: pt17.id, cellCode: l2bc, groupCode: other17c, qty: 2 }));
+  ok("чужая группа после IN_CONTROL отклонена", wrongGroup.includes("не соответствует"));
+  const demoCell17 = await prisma.cell.findFirstOrThrow({ where: { warehouseId: DW, code: "EO-DEMO1" } });
+  const demoCell17c = await cellCode(demoCell17.id);
+  const foreignTenant = await err(() => pickOrderScan({ companyId, userId: pk, taskId: pt17.id, cellCode: demoCell17c, groupCode: g17c, qty: 5 }));
+  ok("чужой tenant-QR после IN_CONTROL отклонён", foreignTenant.includes("этой организации") || foreignTenant.includes("не найдена"));
+  const badQr17 = await err(() => pickOrderScan({ companyId, userId: pk, taskId: pt17.id, cellCode: "NEVERQR234", groupCode: g17c, qty: 5 }));
+  ok("неверный QR после IN_CONTROL отклонён", !!badQr17);
+  await resetScenario();
+
+  console.log("18) отмена активной MOVE_GROUP запрещена; задача/бронь/зависимость целы");
+  const g18 = await seedGroup(itemA, await cellId("EO-U3A"), 6, new Date(now.getTime() - 20_000)); // ур.3 → перестановка
+  const o18 = await imp("EO-CANCELMOVE", [{ externalLineId: "1", itemId: itemA, requiredQty: 6 }]);
+  await reserveAndPlanOrder({ companyId, orderId: o18.orderId, userId: lo });
+  const mt18 = await prisma.workflowTask.findFirstOrThrow({ where: { warehouseId: W, type: "MOVE_GROUP", subjectId: g18.groupId } });
+  const cancelErr = await err(() => cancelWorkflowTask(mt18.id));
+  ok("generic-отмена MOVE_GROUP с активной бронью отклонена", cancelErr.includes("Активную перестановку нельзя отменить"));
+  ok("задача, бронь и зависимость целы, PICK не разблокирован", (await prisma.workflowTask.findUniqueOrThrow({ where: { id: mt18.id } })).status !== "CANCELLED" && (await prisma.cellReservation.count({ where: { taskId: mt18.id, status: "ACTIVE" } })) === 1 && (await pickTask(o18.orderId))!.status === "BLOCKED");
   await resetScenario();
 }
 

@@ -351,6 +351,16 @@ export async function cancelWorkflowTask(taskId: string): Promise<void> {
       if (activeSession)
         throw new EngineError("Активное охлаждение нельзя отменить — измерьте температуру и вывезите группу");
     }
+    // Пакет 6: активную перестановку нельзя отменить generic-отменой, пока держится бронь ячейки под
+    // эту задачу — иначе группа/бронь/зависимая сборка рассинхронизируются. Нужно завершить перемещение.
+    if (t.type === "MOVE_GROUP") {
+      const activeMove = await tx.cellReservation.findFirst({
+        where: { taskId: t.id, status: "ACTIVE" },
+        select: { id: true },
+      });
+      if (activeMove)
+        throw new EngineError("Активную перестановку нельзя отменить — завершите физическое перемещение группы");
+    }
     // Незавершённую (PENDING) передачу закрываем в ЭТОЙ ЖЕ транзакции — иначе устаревшая
     // передача могла бы «воскресить» отменённую задачу при accept/reject.
     await tx.taskHandoff.updateMany({
