@@ -65,7 +65,7 @@ Staging-домен staging-<org>.skladyx.ru используется как те
 Эксплуатационные правила и сверка repo↔сервер: docs/OPERATIONS.md; инвентарь контуров: docs/SERVER_INVENTORY.md.
 Проект перехода к логике РостАгро: docs/ROSTAGRO_WORKFLOW_AUDIT.md и docs/ROSTAGRO_MIGRATION_DESIGN.md (только проект, реализация — по этапам после отдельных решений).
 
-> Приёмка группами и охлаждение технически доставлены на prod, но не активированы: `GROUP_RECEIVING_ENABLED=false`, `COOLING_WORKFLOW_ENABLED=false`. Не включать до создания реальных справочников РостАгро и утверждения настроек X и warehouse-scoped R (`Warehouse.coolingRate`). Активация выполняется отдельной подтверждённой задачей без тестовых движений на prod.
+> Приёмка группами, охлаждение и сборка внешних заказов технически доставлены на prod, но не активированы: `GROUP_RECEIVING_ENABLED=false`, `COOLING_WORKFLOW_ENABLED=false`, `EXTERNAL_ORDER_PICKING_ENABLED=false`. Не включать до создания реальных справочников РостАгро, утверждения настроек X и warehouse-scoped R (`Warehouse.coolingRate`) и — для внешних заказов — подключения интеграционного адаптера импорта. Активация выполняется отдельной подтверждённой задачей без тестовых движений на prod.
 
 ## Проверка каждого изменения
 
