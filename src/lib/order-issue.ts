@@ -67,34 +67,42 @@ async function controlZoneId(tx: Tx, companyId: string, warehouseId: string): Pr
   return z.id;
 }
 
-// Свободная активная ячейка зоны ISSUE (пустая по остатку/единицам и не занятая активной бронью выдачи).
-async function pickFreeIssueCell(tx: Tx, companyId: string, warehouseId: string): Promise<string | null> {
+// Свободная активная ячейка зоны ISSUE. Кандидат берётся ТОЛЬКО под lockCell с повторной проверкой в
+// одном цикле (гонка со старыми операциями): пусто по остатку и серийным единицам, нет активной брони
+// выдачи и охлаждения. Занятый конкурентно кандидат пропускается; null — только если свободных нет вовсе.
+async function reserveFreeIssueCell(tx: Tx, companyId: string, warehouseId: string): Promise<string | null> {
   const cells = await tx.cell.findMany({
     where: { companyId, warehouseId, isActive: true, zone: { kind: "ISSUE" } },
     select: { id: true }, orderBy: { code: "asc" },
   });
   for (const c of cells) {
-    const [bal, unit, occ] = await Promise.all([
+    await lockCell(tx, companyId, c.id);
+    const [bal, unit, occ, coolRes] = await Promise.all([
       tx.stockBalance.findFirst({ where: { cellId: c.id, qty: { gt: 0 } }, select: { id: true } }),
       tx.itemUnit.findFirst({ where: { cellId: c.id }, select: { id: true } }),
       tx.orderIssueCell.findFirst({ where: { cellId: c.id, status: { not: "RELEASED" } }, select: { id: true } }),
+      tx.cellReservation.findFirst({ where: { cellId: c.id, status: "ACTIVE" }, select: { id: true } }),
     ]);
-    if (!bal && !unit && !occ) return c.id;
+    if (!bal && !unit && !occ && !coolRes) return c.id;
   }
   return null;
 }
 
-// Остаток заказа, ещё лежащий в зоне CONTROL (по всем партиям заказа). 0 → весь заказ перемещён.
-async function orderControlRemaining(tx: Tx, order: OrderLite, companyId: string): Promise<Prisma.Decimal> {
-  const zone = await tx.warehouseZone.findFirst({ where: { companyId, warehouseId: order.warehouseId, kind: "CONTROL" }, select: { id: true } });
-  if (!zone) return D(0);
-  const lots = await tx.stockReservation.findMany({ where: { orderId: order.id, lotId: { not: null } }, select: { lotId: true }, distinct: ["lotId"] });
-  let sum = D(0);
-  for (const r of lots) {
-    const agg = await tx.stockBalance.aggregate({ where: { lotId: r.lotId!, locKey: `Z:${zone.id}`, qty: { gt: 0 } }, _sum: { qty: true } });
-    sum = sum.plus(agg._sum.qty ?? 0);
-  }
-  return sum;
+// Количество, собранное ЭТИМ заказом из партии (FULFILLED-резервы order+lot). Пакет 6 допускает
+// несколько заказов на одну партию, поэтому берём долю ЗАКАЗА, а не весь остаток общей зоны CONTROL.
+async function orderLotPickedQty(tx: Tx, orderId: string, lotId: string): Promise<Prisma.Decimal> {
+  const agg = await tx.stockReservation.aggregate({ where: { orderId, lotId, status: "FULFILLED" }, _sum: { qty: true } });
+  return D(agg._sum.qty ?? 0);
+}
+
+// Остаток заказа, ещё не перемещённый из CONTROL = собрано заказом − уже размещено. НЕ зависит от
+// количеств ДРУГИХ заказов той же партии в общей зоне CONTROL. 0 → весь заказ перемещён.
+async function orderControlRemaining(tx: Tx, orderId: string): Promise<Prisma.Decimal> {
+  const [picked, placed] = await Promise.all([
+    tx.stockReservation.aggregate({ where: { orderId, status: "FULFILLED" }, _sum: { qty: true } }),
+    tx.orderIssuePlacement.aggregate({ where: { orderId }, _sum: { qty: true } }),
+  ]);
+  return D(picked._sum.qty ?? 0).minus(placed._sum.qty ?? 0);
 }
 
 // ── Авто-резерв ячейки выдачи после контроля (в ПЕРЕДАННОЙ tx под lockCompany). Найдена свободная
@@ -104,15 +112,12 @@ export async function assignIssueCellInTx(tx: Tx, companyId: string, order: Orde
   // уже есть активная ячейка/задача — идемпотентно
   const existing = await tx.orderIssueCell.findFirst({ where: { orderId: order.id, status: { not: "RELEASED" } }, select: { id: true } });
   if (existing) return null;
-  const cellId = await pickFreeIssueCell(tx, companyId, order.warehouseId);
+  // выбор кандидата + lockCell + повторная проверка — в одном цикле; занятые пропускаются
+  const cellId = await reserveFreeIssueCell(tx, companyId, order.warehouseId);
   if (!cellId) {
     await tx.externalOrder.update({ where: { id: order.id }, data: { status: "AWAITING_ISSUE_CELL" } });
     return null;
   }
-  await lockCell(tx, companyId, cellId);
-  // повторная проверка занятости под локом (гонка)
-  const occ = await tx.orderIssueCell.findFirst({ where: { cellId, status: { not: "RELEASED" } }, select: { id: true } });
-  if (occ) { await tx.externalOrder.update({ where: { id: order.id }, data: { status: "AWAITING_ISSUE_CELL" } }); return null; }
   await tx.orderIssueCell.create({ data: { companyId, orderId: order.id, warehouseId: order.warehouseId, cellId, status: "RESERVED" } });
   await tx.externalOrder.update({ where: { id: order.id }, data: { status: "MOVING_TO_ISSUE" } });
   return createWorkflowTaskInTx(tx, {
@@ -165,17 +170,18 @@ export async function placeOrderGroup(input: {
     if (!ic) throw new OrderIssueError("Эта ячейка не зарезервирована под заказ (сначала «Добавить ячейку»)");
     const scanned = await resolveScannedGroup(tx, input.companyId, input.groupCode);
     if (scanned.warehouseId !== order.warehouseId) throw new OrderIssueError("Группа не на складе этого заказа");
-    // связь с заказом: партия зарезервирована этим заказом
-    const resv = await tx.stockReservation.findFirst({ where: { orderId: order.id, lotId: scanned.lotId }, select: { id: true } });
-    if (!resv) throw new OrderIssueError("Эта партия не относится к заказу");
+    // количество ИМЕННО этого заказа из партии (Пакет 6: несколько заказов на одну партию); заодно
+    // связь с заказом — при отсутствии FULFILLED-резерва order+lot доля = 0.
+    const qty = await orderLotPickedQty(tx, order.id, scanned.lotId);
+    if (qty.lte(0)) throw new OrderIssueError("Эта партия не собрана для заказа");
     // идемпотентность: партия уже размещена
     const already = await tx.orderIssuePlacement.findFirst({ where: { orderId: order.id, lotId: scanned.lotId } });
     if (already) return { placed: true, alreadyPlaced: true };
     await lockCell(tx, input.companyId, cellId);
     const zoneCtl = await controlZoneId(tx, input.companyId, order.warehouseId);
+    // в общей зоне CONTROL должно быть не меньше доли ЗАКАЗА (чужие количества той же партии не трогаем)
     const bal = await tx.stockBalance.aggregate({ where: { lotId: scanned.lotId, locKey: `Z:${zoneCtl}`, qty: { gt: 0 } }, _sum: { qty: true } });
-    const qty = bal._sum.qty ?? D(0);
-    if (qty.lte(0)) throw new OrderIssueError("Нет остатка этой партии в зоне контроля");
+    if (D(bal._sum.qty ?? 0).lt(qty)) throw new OrderIssueError("В зоне контроля недостаточно остатка партии для заказа");
     await applyLotMovement(tx, {
       companyId: input.companyId, docType: "TRANSFER", docId: order.id, itemId: scanned.itemId, lotId: scanned.lotId, qty,
       from: { kind: "zone", warehouseId: order.warehouseId, zoneId: zoneCtl },
@@ -228,7 +234,7 @@ export async function finishIssuePlacement(input: {
     if (!order) throw new OrderIssueError("Заказ не найден");
     if (task.status === "COMPLETED") return { alreadyReady: true, order, deliverTask: null as TaskCreateResult | null, unblocked: [] as { id: string; title: string; warehouseId: string }[] };
     if (task.status !== "IN_PROGRESS") throw new OrderIssueError("Задача размещения не в работе");
-    const remaining = await orderControlRemaining(tx, order, input.companyId);
+    const remaining = await orderControlRemaining(tx, order.id);
     if (remaining.gt(0)) throw new OrderIssueError("Не весь заказ перемещён из зоны контроля — разместите остаток");
     const placedCells = await tx.orderIssueCell.count({ where: { orderId: order.id, status: "PLACED" } });
     if (placedCells === 0) throw new OrderIssueError("Заказ ещё не размещён в ячейках выдачи");
@@ -316,7 +322,7 @@ export async function getIssueOrderContext(companyId: string, taskId: string) {
   const codeByCell = new Map(cellCodes.map((q) => [q.refId, q.code]));
   const cellRows = await prisma.cell.findMany({ where: { id: { in: cells.map((c) => c.cellId) } }, select: { id: true, code: true } });
   const nameByCell = new Map(cellRows.map((c) => [c.id, c.code]));
-  const remaining = await prisma.$transaction((tx) => orderControlRemaining(tx, order, companyId));
+  const remaining = await prisma.$transaction((tx) => orderControlRemaining(tx, order.id));
   return {
     taskId: task.id, orderId: order.id, externalId: order.externalId,
     arrivalAt: order.arrivalAt ? order.arrivalAt.toISOString() : null,

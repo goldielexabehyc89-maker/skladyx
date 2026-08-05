@@ -36,6 +36,10 @@ export async function assertCellNotHeldByGroup(
   // Пакет 5: активная бронь под охлаждение (проверяем ДО early-return — резерв-ячейка пуста).
   const reserved = await tx.cellReservation.findFirst({ where: { cellId, status: "ACTIVE" }, select: { id: true } });
   if (reserved) throw new StockError("Ячейка зарезервирована под охлаждение — размещение запрещено");
+  // Пакет 8: ячейка занята/зарезервирована под выдачу заказа — чужой товар класть нельзя (симметрично
+  // авто-резерву выдачи; проверяем ДО early-return, т.к. зарезервированная ячейка ещё пуста по остатку).
+  const issueHold = await tx.orderIssueCell.findFirst({ where: { cellId, status: { not: "RELEASED" } }, select: { id: true } });
+  if (issueHold) throw new StockError("Ячейка зарезервирована под выдачу заказа — размещение запрещено");
   const bals = await tx.stockBalance.findMany({
     where: { companyId, cellId, qty: { gt: 0 } },
     select: { lotId: true },
