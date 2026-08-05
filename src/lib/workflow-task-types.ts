@@ -6,7 +6,8 @@ export const TASK_TYPES = {
   PLACE_GROUP: "PLACE_GROUP", // размещение/перемещение группы (LOADER)
   MOVE_GROUP: "MOVE_GROUP", // перестановка группы ур.3+ → ур.1-2 под сборку (LOADER, Пакет 6)
   PICK_ORDER: "PICK_ORDER", // сборка заказа (PICKER)
-  CONTROL_ORDER: "CONTROL_ORDER", // контроль заказа (CONTROLLER)
+  CONTROL_ORDER: "CONTROL_ORDER", // контроль заказа (CONTROLLER, Пакет 7)
+  CORRECT_ORDER: "CORRECT_ORDER", // исправление заказа после контроля (PICKER, срочная, Пакет 7)
   ISSUE_ORDER: "ISSUE_ORDER", // размещение в зоне выдачи/выдача (LOADER)
   RETRIEVE_COOLING: "RETRIEVE_COOLING", // забрать группу из охлаждения (LOADER, срочная, Пакет 5)
 } as const;

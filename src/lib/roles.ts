@@ -67,6 +67,12 @@ export function coolingWorkflowEnabled(): boolean {
 export function externalOrderPickingEnabled(): boolean {
   return process.env.EXTERNAL_ORDER_PICKING_ENABLED === "true";
 }
+// Этап 5/Пакет 7: контроль заказа, исправление и полный повторный контроль. false — при переходе
+// заказа в IN_CONTROL задача контроля НЕ создаётся (поведение Пакета 6 без изменений); действия
+// контроля/исправления запрещены. true — авто-создание CONTROL_ORDER и цикл контроль→исправление.
+export function orderControlEnabled(): boolean {
+  return process.env.ORDER_CONTROL_ENABLED === "true";
+}
 
 // Эффективный набор ролей.
 // При TENANT_AUTH=true роли всегда берутся из session.roles (их наполняет свежая

@@ -3,9 +3,10 @@ import { redirect } from "next/navigation";
 import { requireUser } from "@/lib/auth";
 import { scoped } from "@/lib/tenant";
 import { prisma } from "@/lib/db";
-import { hasRole, isWorkRole, workflowTasksEnabled, groupReceivingEnabled, coolingWorkflowEnabled, externalOrderPickingEnabled } from "@/lib/roles";
+import { hasRole, isWorkRole, workflowTasksEnabled, groupReceivingEnabled, coolingWorkflowEnabled, externalOrderPickingEnabled, orderControlEnabled } from "@/lib/roles";
 import { eligibleCellsForGroup } from "@/lib/group-receiving";
 import { getPickOrderContext, getMoveGroupContext } from "@/lib/external-orders";
+import { getControlOrderContext, getCorrectOrderContext } from "@/lib/order-control";
 import { DueActivator } from "./due-activator";
 import { allowedWarehouses } from "@/lib/warehouse-access";
 import { getActiveShift } from "@/lib/work-shift";
@@ -199,6 +200,14 @@ export default async function TasksPage({
     else if (current.type === "MOVE_GROUP") moveGroup = await getMoveGroupContext(s.companyId, current.id);
   }
 
+  // Пакет 7: контекст текущей задачи контроля (CONTROL_ORDER) и исправления (CORRECT_ORDER).
+  let controlOrder = null as Awaited<ReturnType<typeof getControlOrderContext>> | null;
+  let correctOrder = null as Awaited<ReturnType<typeof getCorrectOrderContext>> | null;
+  if (current && current.status === "IN_PROGRESS" && orderControlEnabled()) {
+    if (current.type === "CONTROL_ORDER") controlOrder = await getControlOrderContext(s.companyId, current.id);
+    else if (current.type === "CORRECT_ORDER") correctOrder = await getCorrectOrderContext(s.companyId, current.id);
+  }
+
   return (
     <div className="mx-auto flex w-full max-w-lg flex-col gap-4">
       <DueActivator />
@@ -214,6 +223,8 @@ export default async function TasksPage({
         cooling={cooling}
         pickOrder={pickOrder}
         moveGroup={moveGroup}
+        controlOrder={controlOrder}
+        correctOrder={correctOrder}
       />
     </div>
   );

@@ -30,6 +30,7 @@ export const TASK_TYPE_LABEL: Record<string, string> = {
   MOVE_GROUP: "Перестановка группы вниз",
   PICK_ORDER: "Сборка заказа",
   CONTROL_ORDER: "Контроль заказа",
+  CORRECT_ORDER: "Исправление заказа",
   ISSUE_ORDER: "Выдача заказа",
   RETRIEVE_COOLING: "Забрать из охлаждения",
 };

@@ -1090,7 +1090,9 @@ enum ExternalOrderStatus {
   PARTIALLY_RESERVED // зарезервирована часть строк (FIFO), задача сборщику НЕ создаётся
   READY_TO_PICK // полное покрытие; PICK_ORDER создан (возможно BLOCKED цепочкой перестановки)
   PICKING // сборщик взял задачу
-  IN_CONTROL // сборка завершена, товар в зоне CONTROL (задача контроля — Пакет 7)
+  IN_CONTROL // сборка завершена, товар в зоне CONTROL (ожидает/проходит контроль — Пакет 7)
+  CORRECTION_REQUIRED // контроль нашёл расхождения — создана срочная задача исправления (Пакет 7)
+  CONTROL_PASSED // контроль пройден без расхождений (терминально до выдачи — Пакет 8) (Пакет 7)
   BLOCKED // полное покрытие, но нет безопасной цепочки перестановки/места — без невыполнимой задачи
 }
 
@@ -1117,6 +1119,7 @@ model ExternalOrder {
 
   lines        ExternalOrderLine[]
   reservations StockReservation[]
+  checks       ControlCheck[]
 
   @@unique([companyId, externalId]) // идемпотентность импорта (дизайн §3)
   @@index([companyId, status])
@@ -1169,4 +1172,62 @@ model StockReservation {
   @@index([orderId])
   @@index([lineId])
   @@index([handlingGroupId])
+}
+
+// Этап 5/Пакет 7: контроль заказа. ExternalOrder остаётся единственным владельцем жизненного
+// цикла; ControlCheck — сущность результата проверки (§1.8/§2.9), не параллельная машина состояний.
+// Каждая попытка контроля — отдельный ControlCheck (attempt 1,2,…); история не редактируется.
+enum ControlCheckStatus {
+  IN_PROGRESS
+  PASSED // расхождений нет → заказ CONTROL_PASSED
+  FAILED // есть расхождения → заказ CORRECTION_REQUIRED + срочная CORRECT_ORDER
+}
+
+// Тип расхождения (фиксирует контролёр). Излишек/непонятный товар обнаруживает контролёр (§2.9);
+// физическая изоляция в зону DISCREPANCY и любое движение остатка — через ядро/инвентаризацию.
+enum ControlDiscrepancyType {
+  SHORTAGE // недостача (факт < ожидания)
+  EXCESS // излишек (факт > ожидания)
+  WRONG_ITEM // не тот/непонятный товар
+  DAMAGED // повреждён
+  OTHER
+}
+
+model ControlCheck {
+  id           String             @id @default(cuid())
+  companyId    String
+  orderId      String
+  taskId       String             @unique // одна проверка на CONTROL_ORDER-задачу (идемпотентность скана)
+  attempt      Int // номер попытки контроля (1,2,…) — полная повторная проверка после исправления
+  status       ControlCheckStatus @default(IN_PROGRESS)
+  controllerId String?
+  startedAt    DateTime           @default(now())
+  finishedAt   DateTime?
+  createdAt    DateTime           @default(now())
+
+  order ExternalOrder      @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  lines ControlCheckLine[]
+
+  @@unique([orderId, attempt]) // упорядоченная история попыток
+  @@index([companyId, status])
+  @@index([orderId])
+}
+
+model ControlCheckLine {
+  id              String                  @id @default(cuid())
+  companyId       String
+  checkId         String
+  lineId          String? // строка заказа (ExternalOrderLine); null — лишний/непонятный товар без строки
+  itemId          String
+  expectedQty     Decimal                 @db.Decimal(14, 3) // снимок требуемого
+  countedQty      Decimal?                @db.Decimal(14, 3) // факт; null — строка ещё не отмечена
+  discrepancyType ControlDiscrepancyType? // null — расхождения нет
+  comment         String?
+  byUserId        String?
+  checkedAt       DateTime?
+
+  check ControlCheck @relation(fields: [checkId], references: [id], onDelete: Cascade)
+
+  @@unique([checkId, lineId]) // одна строка проверки на строку заказа (NULL — лишние товары допускаются)
+  @@index([checkId])
 }

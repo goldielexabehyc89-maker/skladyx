@@ -7,6 +7,8 @@ import { lockCell } from "@/lib/cells";
 import { createQrIn, parseScannedCode } from "@/lib/qr";
 import { logEvent } from "@/lib/events";
 import { isPickableLevel } from "@/lib/placement";
+import { orderControlEnabled } from "@/lib/roles";
+import { createControlTaskInTx } from "@/lib/order-control";
 import { TASK_TYPES } from "@/lib/workflow-task-types";
 import {
   lockCompany,
@@ -487,7 +489,7 @@ export async function pickOrderScan(input: {
     // есть FULFILLED-резерв этого заказа именно с этой группой и этой (исходной) ячейкой; иначе — отказ.
     if (order.status === "IN_CONTROL") {
       const done = await tx.stockReservation.findFirst({ where: { orderId: order.id, handlingGroupId: scanned.groupId, cellId, status: "FULFILLED" }, select: { id: true } });
-      if (done) return { ...base, done: true, alreadyPicked: true, justCompleted: false, unblocked: [] as Brief[] };
+      if (done) return { ...base, done: true, alreadyPicked: true, justCompleted: false, unblocked: [] as Brief[], controlTask: null as TaskCreateResult | null };
       throw new ExternalOrderError("Скан не соответствует собранному заказу");
     }
     if (task.status !== "IN_PROGRESS") throw new ExternalOrderError("Задача сборки не в работе");
@@ -502,7 +504,7 @@ export async function pickOrderScan(input: {
     if (remaining.lte(0)) {
       // нет активного резерва: повтор уже собранного (заказ, группа, ячейка) → alreadyPicked; иначе — чужой скан
       const already = await tx.stockReservation.findFirst({ where: { orderId: order.id, cellId, handlingGroupId: scanned.groupId, status: "FULFILLED" }, select: { id: true } });
-      if (already) return { ...base, done: await orderFullyPicked(tx, order.id), alreadyPicked: true, justCompleted: false, unblocked: [] as Brief[] };
+      if (already) return { ...base, done: await orderFullyPicked(tx, order.id), alreadyPicked: true, justCompleted: false, unblocked: [] as Brief[], controlTask: null as TaskCreateResult | null };
       throw new ExternalOrderError("Нет активного резерва этого заказа для этой группы в этой ячейке");
     }
     const qty = D(input.qty);
@@ -532,17 +534,23 @@ export async function pickOrderScan(input: {
     const remainLines = allLines.filter((l) => l.pickedQty.lt(l.requiredQty)).length;
     const done = remainLines === 0 && allLines.length > 0;
     let unblocked: Brief[] = [];
+    let controlTask: TaskCreateResult | null = null;
     if (done) {
       await tx.externalOrder.update({ where: { id: order.id }, data: { status: "IN_CONTROL" } });
       unblocked = await completeWorkflowTaskInTransaction(tx, task.id);
+      // Пакет 7: при включённом флаге атомарно создаём задачу контроля (CONTROL_ORDER) вместе с
+      // переходом в IN_CONTROL. Флаг OFF → поведение Пакета 6 без изменений (задача не создаётся).
+      if (orderControlEnabled())
+        controlTask = await createControlTaskInTx(tx, { companyId: input.companyId, order, dedupeKey: `control:${order.id}:initial` });
     } else {
       await tx.workflowTask.update({ where: { id: task.id }, data: { loadUnits: Math.max(1, remainLines) } });
     }
-    return { ...base, done, alreadyPicked: false, justCompleted: done, unblocked };
+    return { ...base, done, alreadyPicked: false, justCompleted: done, unblocked, controlTask };
   });
 
   if (res.justCompleted) {
     await emitTaskCompleted({ companyId: res.companyId, warehouseId: res.warehouseId, title: "Заказ собран", taskId: res.taskId, unblocked: res.unblocked });
+    if (res.controlTask) await emitTaskCreated(res.controlTask);
     await rebalanceQueuedTasks(res.companyId, { warehouseId: res.warehouseId });
   }
   return { done: res.done, alreadyPicked: res.alreadyPicked };

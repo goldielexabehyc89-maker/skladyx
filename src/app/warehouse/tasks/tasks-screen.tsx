@@ -13,6 +13,7 @@ import {
 import { completeGroupPlacementAction, type PlacementState } from "@/app/actions/group-receiving";
 import { reportShortageAction, pickScanAction, completeMoveGroupAction, type OrderActionState } from "@/app/actions/external-orders";
 import { PickOrderScanner, MoveGroupScanner } from "./order-scanners";
+import { ControlOrderPanel, CorrectOrderPanel, type ControlOrderCtx, type CorrectOrderCtx } from "./control-panels";
 import { Button, Card, CardTitle, Badge, EmptyState } from "@/components/ui";
 import { TASK_STATUS_TONE, taskStatusLabel, taskTypeLabel } from "@/lib/task-labels";
 
@@ -285,6 +286,8 @@ export function WorkerTasks({
   cooling,
   pickOrder,
   moveGroup,
+  controlOrder,
+  correctOrder,
 }: {
   current: TaskDTO | null;
   urgent: TaskDTO[];
@@ -295,6 +298,8 @@ export function WorkerTasks({
   cooling?: Cooling | null;
   pickOrder?: PickOrderCtx | null;
   moveGroup?: MoveGroupCtx | null;
+  controlOrder?: ControlOrderCtx | null;
+  correctOrder?: CorrectOrderCtx | null;
 }) {
   return (
     <div className="flex flex-col gap-4">
@@ -343,6 +348,8 @@ export function WorkerTasks({
                   <ShortageForm taskId={current.id} />
                 </>
               )}
+              {controlOrder && current.status === "IN_PROGRESS" && <ControlOrderPanel ctx={controlOrder} />}
+              {correctOrder && current.status === "IN_PROGRESS" && <CorrectOrderPanel ctx={correctOrder} />}
               {current.status === "IN_PROGRESS" && <HandoffForm taskId={current.id} mates={mates} />}
               {current.status === "HANDOFF_PENDING" && (
                 <p className="text-xs text-orange-600">Ожидает принятия передачи получателем.</p>

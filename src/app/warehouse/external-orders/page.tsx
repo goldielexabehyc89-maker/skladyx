@@ -15,6 +15,8 @@ const STATUS_RU: Record<ExternalOrderStatus, { label: string; tone: "neutral" | 
   READY_TO_PICK: { label: "Готов к сборке", tone: "blue" },
   PICKING: { label: "Собирается", tone: "blue" },
   IN_CONTROL: { label: "На контроле", tone: "green" },
+  CORRECTION_REQUIRED: { label: "Требует исправления", tone: "red" },
+  CONTROL_PASSED: { label: "Контроль пройден", tone: "green" },
   BLOCKED: { label: "Заблокирован", tone: "red" },
 };
 
