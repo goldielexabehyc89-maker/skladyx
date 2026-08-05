@@ -5,16 +5,20 @@ import { useRouter } from "next/navigation";
 import { ScanLine } from "lucide-react";
 import {
   scanOrderControlAction,
-  markControlLineAction,
+  markControlScanAction,
   finishControlAction,
+  resolveShortageAction,
+  resolveRemovalAction,
   completeCorrectionAction,
   type ControlActionState,
 } from "@/app/actions/order-control";
 import { Button, Badge } from "@/components/ui";
 import { WorkflowSheet } from "@/components/workflow-sheet";
 
-// Этап 5/Пакет 7: панели контролёра (проверка всего заказа по QR) и сборщика (исправление).
-// Настоящее сканирование QR заказа через WorkflowSheet/QrScanner + ручной ввод кода как fallback.
+// Этап 5/Пакет 7 (+коррекция): контролёр сканирует QR заказа, затем QR каждой группы/товара +
+// количество (неожиданный товар — отдельной строкой). Сборщик исправляет КАЖДОЕ расхождение
+// отдельным действием (скан удаляемого/добавляемого товара); общее завершение заблокировано,
+// пока не разрешены все расхождения. Ручной ввод кодов — fallback к камере.
 
 export interface ControlOrderCtx {
   taskId: string;
@@ -23,6 +27,7 @@ export interface ControlOrderCtx {
   scanConfirmed: boolean;
   attempt: number;
   lines: { lineId: string; item: string; required: string; counted: string | null; discrepancyType: string | null }[];
+  extras: { item: string; counted: string; discrepancyType: string | null }[];
   allMarked: boolean;
   previousChecks: { attempt: number; status: string }[];
 }
@@ -30,7 +35,18 @@ export interface CorrectOrderCtx {
   taskId: string;
   orderId: string;
   externalId: string;
-  discrepancies: { item: string; type: string | null; expected: string; counted: string; comment: string | null }[];
+  discrepancies: {
+    checkLineId: string;
+    item: string;
+    type: string | null;
+    expected: string;
+    counted: string;
+    comment: string | null;
+    resolutionStatus: string;
+    resolutionMethod: string | null;
+    groupCode: string | null;
+  }[];
+  allResolved: boolean;
 }
 
 const DISCREPANCY_LABEL: Record<string, string> = {
@@ -39,6 +55,11 @@ const DISCREPANCY_LABEL: Record<string, string> = {
   WRONG_ITEM: "Не тот товар",
   DAMAGED: "Повреждён",
   OTHER: "Другое",
+};
+const METHOD_LABEL: Record<string, string> = {
+  ALIGNED: "добавлено (без движения)",
+  RETURNED: "возвращено в хранение",
+  ISOLATED_DISCREPANCY: "изолировано в DISCREPANCY",
 };
 
 // ── Скан QR заказа камерой (WorkflowSheet) ──
@@ -93,7 +114,6 @@ function ScanOrderCamera({ taskId }: { taskId: string }) {
   );
 }
 
-// ── Ручной ввод кода заказа (fallback без камеры) ──
 function ScanOrderManual({ taskId }: { taskId: string }) {
   const [state, action, pending] = useActionState<ControlActionState, FormData>(scanOrderControlAction, {});
   return (
@@ -109,36 +129,103 @@ function ScanOrderManual({ taskId }: { taskId: string }) {
   );
 }
 
-// ── Отметка одной строки: фактическое количество + опц. тип расхождения и комментарий ──
-function MarkLineForm({ taskId, line }: { taskId: string; line: ControlOrderCtx["lines"][number] }) {
-  const [state, action, pending] = useActionState<ControlActionState, FormData>(markControlLineAction, {});
-  const marked = line.counted != null;
-  const ok = marked && !line.discrepancyType;
+// ── Контроль: скан QR группы/товара камерой → количество (+ опц. тип для неожиданного товара) ──
+function MarkGroupScanner({ taskId }: { taskId: string }) {
+  const router = useRouter();
+  const [open, setOpen] = useState(false);
+  const [scanning, setScanning] = useState(false);
+  const [step, setStep] = useState<"group" | "qty">("group");
+  const [groupRaw, setGroupRaw] = useState("");
+  const [qty, setQty] = useState("");
+  const [type, setType] = useState("");
+  const [busy, startTransition] = useTransition();
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+
+  function reset() { setStep("group"); setGroupRaw(""); setQty(""); setType(""); setNotice(null); }
+  function handleScan(raw: string) {
+    if (busy) return;
+    setGroupRaw(raw); setScanning(false); setStep("qty"); setNotice("Группа отсканирована — введите количество");
+  }
+  function submit() {
+    const n = Number(qty.replace(",", "."));
+    if (!Number.isFinite(n) || n < 0) { setError("Укажите количество"); return; }
+    startTransition(async () => {
+      const fd = new FormData();
+      fd.set("taskId", taskId); fd.set("groupCode", groupRaw); fd.set("countedQty", String(n)); fd.set("discrepancyType", type);
+      const res = await markControlScanAction({}, fd);
+      if (res.error) { setError(res.error); return; }
+      reset(); router.refresh();
+    });
+  }
+  if (!open)
+    return (
+      <Button type="button" variant="primary" onClick={() => { setOpen(true); setScanning(true); setStep("group"); }} className="w-full">
+        <ScanLine size={18} /> Проверить группу (сканирование)
+      </Button>
+    );
   return (
-    <form action={action} className="rounded-xl border border-[#eee] p-2.5">
-      <input type="hidden" name="taskId" value={taskId} />
-      <input type="hidden" name="lineId" value={line.lineId} />
-      <div className="flex items-center justify-between gap-2">
-        <span className="min-w-0 truncate text-sm font-medium">{line.item}</span>
-        <Badge tone={!marked ? "neutral" : ok ? "green" : "red"}>
-          {!marked ? `нужно ${line.required}` : ok ? `✓ ${line.counted}` : `${DISCREPANCY_LABEL[line.discrepancyType ?? ""] ?? "расхождение"}: ${line.counted}/${line.required}`}
-        </Badge>
-      </div>
-      <div className="mt-2 flex flex-wrap items-center gap-2">
-        <input name="countedQty" required type="number" inputMode="decimal" step="1" defaultValue={line.counted ?? ""} placeholder={`факт (нужно ${line.required})`} className="w-28 rounded-lg border border-[#e4e4f0] px-2 py-1 text-sm" />
-        <select name="discrepancyType" defaultValue={line.discrepancyType ?? ""} className="rounded-lg border border-[#e4e4f0] px-2 py-1 text-sm">
-          <option value="">нет расхождения</option>
-          <option value="SHORTAGE">недостача</option>
-          <option value="EXCESS">излишек</option>
+    <WorkflowSheet
+      title="Проверка группы"
+      subtitle="Сканируйте QR группы/партии, затем количество"
+      scanning={scanning}
+      scanHint="Сканируйте QR группы/партии"
+      onScan={handleScan}
+      scanPaused={busy}
+      busy={busy}
+      onBackToList={() => setScanning(false)}
+      onClose={() => { setOpen(false); setScanning(false); reset(); setError(null); }}
+      error={error}
+      onErrorRetry={() => setError(null)}
+      onErrorExit={() => { setError(null); setScanning(false); reset(); }}
+      footer={
+        step === "qty" ? (
+          <>
+            <input value={qty} onChange={(e) => setQty(e.target.value)} type="number" inputMode="decimal" step="1" placeholder="Фактическое количество" className="rounded-lg border border-[#e4e4f0] px-3 py-2 text-sm" />
+            <select value={type} onChange={(e) => setType(e.target.value)} className="rounded-lg border border-[#e4e4f0] px-3 py-2 text-sm">
+              <option value="">авто (по количеству)</option>
+              <option value="EXCESS">излишек / неожиданный товар</option>
+              <option value="WRONG_ITEM">не тот товар</option>
+              <option value="DAMAGED">повреждён</option>
+              <option value="OTHER">другое</option>
+            </select>
+            <Button type="button" variant="primary" disabled={busy} onClick={submit} className="w-full">{busy ? "…" : "Отметить"}</Button>
+            <Button type="button" variant="ghost" onClick={reset} className="w-full">Заново сканировать</Button>
+          </>
+        ) : (
+          <Button type="button" variant="primary" onClick={() => { setScanning(true); setStep("group"); setNotice(null); }} className="w-full">
+            <ScanLine size={18} /> Сканировать группу
+          </Button>
+        )
+      }
+    >
+      {notice && <p className="pb-1 text-sm font-medium text-green-600">{notice}</p>}
+      <p className="text-sm text-neutral-500">Сканируйте каждую группу/партию заказа и вводите фактическое количество. Неожиданный товар отметьте как «излишек» или «не тот товар».</p>
+    </WorkflowSheet>
+  );
+}
+
+function MarkGroupManual({ taskId }: { taskId: string }) {
+  const [state, action, pending] = useActionState<ControlActionState, FormData>(markControlScanAction, {});
+  return (
+    <details className="text-xs text-neutral-500">
+      <summary className="cursor-pointer">Ввести код группы вручную (без камеры)</summary>
+      <form action={action} className="mt-2 flex flex-col gap-2">
+        <input type="hidden" name="taskId" value={taskId} />
+        <input name="groupCode" required placeholder="Код QR группы/партии" className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm" />
+        <input name="countedQty" required type="number" inputMode="decimal" step="1" placeholder="Фактическое количество" className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm" />
+        <select name="discrepancyType" className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm">
+          <option value="">авто (по количеству)</option>
+          <option value="EXCESS">излишек / неожиданный товар</option>
           <option value="WRONG_ITEM">не тот товар</option>
           <option value="DAMAGED">повреждён</option>
           <option value="OTHER">другое</option>
         </select>
-        <input name="comment" placeholder="комментарий" className="min-w-0 flex-1 rounded-lg border border-[#e4e4f0] px-2 py-1 text-sm" />
-        <Button type="submit" variant="ghost" disabled={pending}>{pending ? "…" : "Отметить"}</Button>
-      </div>
-      {state.error && <p className="mt-1 text-xs text-red-600">{state.error}</p>}
-    </form>
+        <input name="comment" placeholder="комментарий" className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm" />
+        {state.error && <p className="text-red-600">{state.error}</p>}
+        <Button type="submit" variant="ghost" disabled={pending}>{pending ? "…" : "Отметить по коду"}</Button>
+      </form>
+    </details>
   );
 }
 
@@ -171,14 +258,36 @@ export function ControlOrderPanel({ ctx }: { ctx: ControlOrderCtx }) {
         <>
           <ScanOrderCamera taskId={ctx.taskId} />
           <ScanOrderManual taskId={ctx.taskId} />
-          <p className="text-xs text-neutral-400">Отсканируйте QR заказа, затем проверьте каждую строку и количество.</p>
+          <p className="text-xs text-neutral-400">Отсканируйте QR заказа, затем проверьте каждую группу/товар по QR.</p>
         </>
       ) : (
         <>
-          <div className="text-xs font-medium text-neutral-500">Строки заказа — проверьте каждую</div>
-          {ctx.lines.map((l) => (
-            <MarkLineForm key={l.lineId} taskId={ctx.taskId} line={l} />
-          ))}
+          <div className="text-xs font-medium text-neutral-500">Строки заказа — проверьте каждую по QR</div>
+          {ctx.lines.map((l) => {
+            const marked = l.counted != null;
+            const ok = marked && !l.discrepancyType;
+            return (
+              <div key={l.lineId} className="flex items-center justify-between rounded-xl bg-[#f7f8fc] px-3 py-2 text-sm">
+                <span className="min-w-0 truncate">{l.item}</span>
+                <Badge tone={!marked ? "neutral" : ok ? "green" : "red"}>
+                  {!marked ? `нужно ${l.required}` : ok ? `✓ ${l.counted}` : `${DISCREPANCY_LABEL[l.discrepancyType ?? ""] ?? "расхождение"}: ${l.counted}/${l.required}`}
+                </Badge>
+              </div>
+            );
+          })}
+          {ctx.extras.length > 0 && (
+            <>
+              <div className="pt-1 text-xs font-medium text-neutral-500">Неожиданные товары</div>
+              {ctx.extras.map((e, i) => (
+                <div key={i} className="flex items-center justify-between rounded-xl border border-red-100 bg-red-50/40 px-3 py-2 text-sm">
+                  <span className="min-w-0 truncate">{e.item}</span>
+                  <Badge tone="red">{DISCREPANCY_LABEL[e.discrepancyType ?? ""] ?? "лишний"}: {e.counted}</Badge>
+                </div>
+              ))}
+            </>
+          )}
+          <MarkGroupScanner taskId={ctx.taskId} />
+          <MarkGroupManual taskId={ctx.taskId} />
           <FinishControlForm ctx={ctx} />
         </>
       )}
@@ -186,31 +295,68 @@ export function ControlOrderPanel({ ctx }: { ctx: ControlOrderCtx }) {
   );
 }
 
-export function CorrectOrderPanel({ ctx }: { ctx: CorrectOrderCtx }) {
+// ── Исправление: отдельное действие на каждое расхождение ──
+function ResolveDiscrepancy({ taskId, disc }: { taskId: string; disc: CorrectOrderCtx["discrepancies"][number] }) {
+  const isShortage = disc.type === "SHORTAGE";
+  const isDamaged = disc.type === "DAMAGED" || disc.type === "OTHER";
+  const action = isShortage ? resolveShortageAction : resolveRemovalAction;
+  const [state, formAction, pending] = useActionState<ControlActionState, FormData>(action, {});
+  const resolved = disc.resolutionStatus === "RESOLVED";
+  return (
+    <div className="rounded-xl border border-[#eee] p-2.5">
+      <div className="flex items-center justify-between gap-2">
+        <span className="min-w-0 truncate text-sm font-medium">{disc.item}</span>
+        <Badge tone={resolved ? "green" : "red"}>
+          {resolved ? `✓ ${METHOD_LABEL[disc.resolutionMethod ?? ""] ?? "исправлено"}` : DISCREPANCY_LABEL[disc.type ?? ""] ?? "расхождение"}
+        </Badge>
+      </div>
+      <div className="mt-0.5 text-xs text-neutral-600">нужно {disc.expected} · по факту {disc.counted}{disc.comment ? ` · ${disc.comment}` : ""}</div>
+      {!resolved && (
+        <form action={formAction} className="mt-2 flex flex-col gap-2">
+          <input type="hidden" name="taskId" value={taskId} />
+          <input type="hidden" name="checkLineId" value={disc.checkLineId} />
+          <input name="groupCode" required defaultValue={disc.groupCode ?? ""} placeholder={isShortage ? "QR добавляемого товара/группы" : "QR удаляемого товара/группы"} className="rounded-lg border border-[#e4e4f0] px-2 py-1 text-sm" />
+          <input name="qty" required type="number" inputMode="decimal" step="1" placeholder="Количество" className="rounded-lg border border-[#e4e4f0] px-2 py-1 text-sm" />
+          {!isShortage && (
+            <select name="disposition" defaultValue={isDamaged ? "DISCREPANCY" : "RETURN"} className="rounded-lg border border-[#e4e4f0] px-2 py-1 text-sm">
+              {!isDamaged && <option value="RETURN">вернуть в хранение</option>}
+              <option value="DISCREPANCY">изолировать в DISCREPANCY</option>
+            </select>
+          )}
+          <input name="comment" placeholder="комментарий" className="rounded-lg border border-[#e4e4f0] px-2 py-1 text-sm" />
+          {state.error && <p className="text-xs text-red-600">{state.error}</p>}
+          <Button type="submit" variant="ghost" disabled={pending}>{pending ? "…" : isShortage ? "Подтвердить добавление" : "Подтвердить удаление"}</Button>
+        </form>
+      )}
+    </div>
+  );
+}
+
+function CompleteCorrectionForm({ ctx }: { ctx: CorrectOrderCtx }) {
   const [state, action, pending] = useActionState<ControlActionState, FormData>(completeCorrectionAction, {});
   return (
+    <form action={action} className="flex flex-col gap-1">
+      <input type="hidden" name="taskId" value={ctx.taskId} />
+      {state.error && <p className="text-xs text-red-600">{state.error}</p>}
+      {state.ok && <p className="text-xs font-medium text-green-700">Исправление выполнено — заказ отправлен на полную повторную проверку.</p>}
+      <Button type="submit" disabled={pending || !ctx.allResolved} className="w-full">
+        {pending ? "…" : ctx.allResolved ? "Исправление выполнено" : "Разрешите все расхождения"}
+      </Button>
+      <p className="text-xs text-neutral-400">После разрешения ВСЕХ расхождений заказ проходит ПОЛНЫЙ повторный контроль.</p>
+    </form>
+  );
+}
+
+export function CorrectOrderPanel({ ctx }: { ctx: CorrectOrderCtx }) {
+  return (
     <div className="flex flex-col gap-2">
-      <div className="text-xs font-medium text-neutral-500">Исправить заказ {ctx.externalId} — расхождения контроля</div>
+      <div className="text-xs font-medium text-neutral-500">Исправить заказ {ctx.externalId} — расхождения контроля (каждое отдельным действием)</div>
       {ctx.discrepancies.length === 0 ? (
         <p className="text-xs text-neutral-400">Нет данных о расхождениях.</p>
       ) : (
-        ctx.discrepancies.map((d, i) => (
-          <div key={i} className="rounded-xl border border-red-100 bg-red-50/40 px-3 py-2 text-sm">
-            <div className="flex items-center justify-between gap-2">
-              <span className="min-w-0 truncate font-medium">{d.item}</span>
-              <Badge tone="red">{DISCREPANCY_LABEL[d.type ?? ""] ?? "расхождение"}</Badge>
-            </div>
-            <div className="mt-0.5 text-xs text-neutral-600">нужно {d.expected} · по факту {d.counted}{d.comment ? ` · ${d.comment}` : ""}</div>
-          </div>
-        ))
+        ctx.discrepancies.map((d) => <ResolveDiscrepancy key={d.checkLineId} taskId={ctx.taskId} disc={d} />)
       )}
-      <form action={action} className="flex flex-col gap-1">
-        <input type="hidden" name="taskId" value={ctx.taskId} />
-        {state.error && <p className="text-xs text-red-600">{state.error}</p>}
-        {state.ok && <p className="text-xs font-medium text-green-700">Исправление выполнено — заказ отправлен на полную повторную проверку.</p>}
-        <Button type="submit" disabled={pending} className="w-full">{pending ? "…" : "Исправление выполнено"}</Button>
-        <p className="text-xs text-neutral-400">После исправления заказ проходит ПОЛНЫЙ повторный контроль (все строки заново).</p>
-      </form>
+      <CompleteCorrectionForm ctx={ctx} />
     </div>
   );
 }

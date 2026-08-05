@@ -12,8 +12,10 @@ import { startWorkflowTask, rebalanceQueuedTasks } from "@/lib/workflow-tasks";
 import { importExternalOrder, reserveAndPlanOrder, pickOrderScan } from "@/lib/external-orders";
 import {
   scanOrderForControl,
-  markOrderControlLine,
+  markOrderControlByScan,
   finishOrderControl,
+  resolveControlShortage,
+  resolveControlRemoval,
   completeOrderCorrection,
 } from "@/lib/order-control";
 
@@ -23,8 +25,8 @@ const ok = (n: string, c: boolean, e = "") => (c ? console.log(`  ✓ ${n}`) : (
 const err = async (fn: () => Promise<unknown>) => { try { await fn(); return ""; } catch (e) { return (e as Error).message; } };
 
 let companyId = "", demoId = "", W = "", DW = "";
-let zStorage = "", zControl = "";
-let itemA = "", itemB = "", pk = "", pk2 = "", ctl = "";
+let zStorage = "", zControl = "", zDisc = "";
+let itemA = "", itemB = "", itemC = "", pk = "", pk2 = "", ctl = "";
 const UIDS: string[] = [];
 let seq = 0;
 const now = new Date();
@@ -88,6 +90,35 @@ async function startControl(orderId: string): Promise<string> {
   return t.id;
 }
 const orderLines = (orderId: string) => prisma.externalOrderLine.findMany({ where: { orderId }, orderBy: { externalLineId: "asc" } });
+// код группы, зарезервированной заказом под строку (её сканирует контролёр/сборщик)
+const ctlGroupCode = async (orderId: string, lineId: string) =>
+  groupCode((await prisma.stockReservation.findFirstOrThrow({ where: { orderId, lineId }, select: { handlingGroupId: true } })).handlingGroupId!);
+// контроль по СКАНУ группы строки заказа
+async function markScan(taskId: string, orderId: string, lineId: string, qty: number, type?: string) {
+  await markOrderControlByScan({ companyId, userId: ctl, taskId, groupCode: await ctlGroupCode(orderId, lineId), countedQty: qty, discrepancyType: type ?? null });
+}
+// строка расхождения (checkLineId) по товару в последней FAILED-проверке заказа
+async function discLineId(orderId: string, itemId: string): Promise<string> {
+  const chk = await prisma.controlCheck.findFirstOrThrow({ where: { orderId, status: "FAILED" }, orderBy: { attempt: "desc" } });
+  return (await prisma.controlCheckLine.findFirstOrThrow({ where: { checkId: chk.id, itemId, discrepancyType: { not: null } } })).id;
+}
+// bare-группа (для проверки отказа скана чужого tenant/склада): без остатка, только для резолвинга QR
+async function bareGroup(cId: string, wh: string, itemId: string): Promise<{ code: string; groupId: string; lotId: string; receiptId: string; lineId: string }> {
+  const n = 780000 + ++seq;
+  const rc = await prisma.receipt.create({ data: { companyId: cId, number: n, warehouseId: wh, status: "POSTED", postedAt: now, createdById: pk } });
+  const rl = await prisma.receiptLine.create({ data: { companyId: cId, receiptId: rc.id, itemId, qty: 1 } });
+  const lot = await prisma.lot.create({ data: { companyId: cId, itemId, receiptLineId: rl.id, qtyReceived: 1, createdAt: now } });
+  const g = await prisma.handlingGroup.create({ data: { companyId: cId, warehouseId: wh, itemId, lotId: lot.id, qty: 1, temperature: 0, thresholdX: 5, status: "IN_STORAGE", dedupeKey: `bare-${seq}`, acceptedById: pk } });
+  const code = await prisma.$transaction((tx) => createQrIn(tx, { companyId: cId, type: "GROUP", refId: g.id }));
+  return { code, groupId: g.id, lotId: lot.id, receiptId: rc.id, lineId: rl.id };
+}
+async function dropBare(b: { groupId: string; lotId: string; receiptId: string; lineId: string }) {
+  await prisma.qrCode.deleteMany({ where: { type: "GROUP", refId: b.groupId } });
+  await prisma.handlingGroup.deleteMany({ where: { id: b.groupId } });
+  await prisma.lot.deleteMany({ where: { id: b.lotId } });
+  await prisma.receiptLine.deleteMany({ where: { id: b.lineId } });
+  await prisma.receipt.deleteMany({ where: { id: b.receiptId } });
+}
 
 async function provision() {
   companyId = (await prisma.company.findFirstOrThrow({ where: { slug: "rostagro" } })).id;
@@ -95,10 +126,13 @@ async function provision() {
   await ensureStandardZones(companyId, W);
   zStorage = (await prisma.warehouseZone.findFirstOrThrow({ where: { warehouseId: W, kind: "STORAGE" } })).id;
   zControl = (await prisma.warehouseZone.findFirstOrThrow({ where: { warehouseId: W, kind: "CONTROL" } })).id;
-  await createCellsInZone({ companyId, warehouseId: W, zoneId: zStorage, codes: ["OC-L1A", "OC-L1B", "OC-L1C", "OC-L1D", "OC-L1E", "OC-L1F"], level: 1 });
+  zDisc = (await prisma.warehouseZone.findFirst({ where: { warehouseId: W, kind: "DISCREPANCY" } }))?.id
+    ?? (await prisma.warehouseZone.create({ data: { companyId, warehouseId: W, code: "OC-DISC", name: "Расхождения", kind: "DISCREPANCY", isActive: true, sortOrder: 40 } })).id;
+  await createCellsInZone({ companyId, warehouseId: W, zoneId: zStorage, codes: ["OC-L1A", "OC-L1B", "OC-L1C", "OC-L1D", "OC-L1E", "OC-L1F", "OC-L1G", "OC-L1H"], level: 1 });
   const uom = await prisma.uom.create({ data: { companyId, name: "шт OC" } });
   itemA = (await prisma.item.create({ data: { companyId, name: "OC товар A", sku: "OC-A", uomId: uom.id, tracking: "LOT", isActive: true } })).id;
   itemB = (await prisma.item.create({ data: { companyId, name: "OC товар B", sku: "OC-B", uomId: uom.id, tracking: "LOT", isActive: true } })).id;
+  itemC = (await prisma.item.create({ data: { companyId, name: "OC товар C", sku: "OC-C", uomId: uom.id, tracking: "LOT", isActive: true } })).id;
   pk = await mkUser("oc_pk", companyId, "+79995560001", "PICKER", W);
   pk2 = await mkUser("oc_pk2", companyId, "+79995560002", "PICKER", W);
   ctl = await mkUser("oc_ctl", companyId, "+79995560003", "CONTROLLER", W);
@@ -139,7 +173,7 @@ async function cleanup() {
   await prisma.cell.deleteMany({ where: { warehouseId: { in: [W, DW] } } });
   await prisma.warehouseZone.deleteMany({ where: { warehouseId: { in: [W, DW] } } });
   await prisma.user.deleteMany({ where: { id: { in: UIDS } } });
-  await prisma.item.deleteMany({ where: { id: { in: [itemA, itemB] } } });
+  await prisma.item.deleteMany({ where: { id: { in: [itemA, itemB, itemC] } } });
   await prisma.warehouse.deleteMany({ where: { id: { in: [W, DW] } } });
   if (demoId) await prisma.company.deleteMany({ where: { id: demoId, slug: "oc-demo" } });
   await prisma.uom.deleteMany({ where: { companyId, name: "шт OC" } });
@@ -166,7 +200,7 @@ async function main() {
 
   console.log("3) happy path: отметить строку без расхождения → PASSED → CONTROL_PASSED, остаток не двигали");
   const l1 = (await orderLines(o1))[0];
-  await markOrderControlLine({ companyId, userId: ctl, taskId: t1, lineId: l1.id, countedQty: 5 });
+  await markScan(t1, o1, l1.id, 5);
   const fin1 = await finishOrderControl({ companyId, userId: ctl, taskId: t1 });
   ok("[3] контроль PASSED", fin1.status === "PASSED");
   ok("[3] заказ CONTROL_PASSED", (await orderStatus(o1)) === "CONTROL_PASSED", await orderStatus(o1));
@@ -184,8 +218,8 @@ async function main() {
   const t2 = await startControl(o2);
   await scanOrderForControl({ companyId, userId: ctl, taskId: t2, orderCode: await orderQr(o2) });
   const [o2a, o2b] = await orderLines(o2);
-  await markOrderControlLine({ companyId, userId: ctl, taskId: t2, lineId: o2a.id, countedQty: 3 }); // недостача
-  await markOrderControlLine({ companyId, userId: ctl, taskId: t2, lineId: o2b.id, countedQty: 5 }); // излишек
+  await markScan(t2, o2, o2a.id, 3); // недостача (itemA)
+  await markScan(t2, o2, o2b.id, 5); // излишек (itemB)
   const fin2 = await finishOrderControl({ companyId, userId: ctl, taskId: t2 });
   ok("[4] контроль FAILED", fin2.status === "FAILED");
   ok("[4] заказ CORRECTION_REQUIRED", (await orderStatus(o2)) === "CORRECTION_REQUIRED", await orderStatus(o2));
@@ -195,23 +229,31 @@ async function main() {
   const disc2 = await prisma.controlCheckLine.count({ where: { checkId: chk2.id, discrepancyType: { not: null } } });
   ok("[4] в проверке зафиксированы 2 расхождения (тип/строка/факт)", disc2 === 2, `disc=${disc2}`);
 
-  console.log("5) исправление → полный повторный контроль (attempt 2); история попытки 1 сохранена");
-  await startWorkflowTask(pk, companyId, corr2!.id);
-  const mvBefore2 = await lotMv((await prisma.handlingGroup.findFirstOrThrow({ where: { warehouseId: W, itemId: itemA, lotId: { not: lot1 } } })).lotId);
-  await completeOrderCorrection({ companyId, userId: pk, taskId: corr2!.id });
+  console.log("5) разрешение расхождений (недостача/излишек) → полный повторный контроль; история сохранена");
+  const cpk = corr2!.assignedUserId!;
+  await startWorkflowTask(cpk, companyId, corr2!.id);
+  const itemAlot2 = (await prisma.handlingGroup.findFirstOrThrow({ where: { warehouseId: W, itemId: itemA, lotId: { not: lot1 } } })).lotId;
+  const mvA0 = await lotMv(itemAlot2);
+  // недостача itemA → выравнивание к ledger, движения НЕ создаём (ALIGNED)
+  await resolveControlShortage({ companyId, userId: cpk, taskId: corr2!.id, checkLineId: await discLineId(o2, itemA), groupCode: await ctlGroupCode(o2, o2a.id), qty: 1 });
+  ok("[5] недостача выровнена без движения остатка (itemA)", (await lotMv(itemAlot2)) === mvA0);
+  const itemBlot2 = (await prisma.stockReservation.findFirstOrThrow({ where: { orderId: o2, lineId: o2b.id }, select: { lotId: true } })).lotId!;
+  const mvB0 = await lotMv(itemBlot2);
+  // излишек itemB → изоляция в DISCREPANCY через ядро (одно движение)
+  await resolveControlRemoval({ companyId, userId: cpk, taskId: corr2!.id, checkLineId: await discLineId(o2, itemB), groupCode: await ctlGroupCode(o2, o2b.id), qty: 2, disposition: "DISCREPANCY" });
+  ok("[5] излишек изолирован в DISCREPANCY через ядро (одно движение)", (await lotMv(itemBlot2)) === mvB0 + 1);
+  await completeOrderCorrection({ companyId, userId: cpk, taskId: corr2!.id });
   ok("[5] CORRECT_ORDER COMPLETED", (await prisma.workflowTask.findUniqueOrThrow({ where: { id: corr2!.id } })).status === "COMPLETED");
   ok("[5] заказ снова IN_CONTROL", (await orderStatus(o2)) === "IN_CONTROL", await orderStatus(o2));
-  const ct2new = await controlTask(o2, undefined);
+  const ct2new = await controlTask(o2);
   ok("[5] создана НОВАЯ задача контроля (полный повтор)", !!ct2new && ct2new.status !== "COMPLETED" && ct2new.id !== t2);
-  ok("[5] исправление остаток НЕ двигало (движения только через ядро/инвентаризацию, вне модуля)", (await lotMv((await prisma.handlingGroup.findFirstOrThrow({ where: { warehouseId: W, itemId: itemA, lotId: { not: lot1 } } })).lotId)) === mvBefore2);
-  // повторная полная проверка: все строки заново
   const t2b = await startControl(o2);
   const s2 = await scanOrderForControl({ companyId, userId: ctl, taskId: t2b, orderCode: await orderQr(o2) });
-  const chk2bLines = await prisma.controlCheckLine.count({ where: { checkId: s2.checkId, countedQty: null } });
-  ok("[5] повторная проверка НЕ засчитывает прежние строки (все не отмечены)", chk2bLines === 2, `unmarked=${chk2bLines}`);
+  const chk2bLines = await prisma.controlCheckLine.count({ where: { checkId: s2.checkId, lineId: { not: null }, countedQty: null } });
+  ok("[5] повторная проверка полная (прежние строки не засчитаны)", chk2bLines === 2, `unmarked=${chk2bLines}`);
   const [o2a2, o2b2] = await orderLines(o2);
-  await markOrderControlLine({ companyId, userId: ctl, taskId: t2b, lineId: o2a2.id, countedQty: 4 });
-  await markOrderControlLine({ companyId, userId: ctl, taskId: t2b, lineId: o2b2.id, countedQty: 3 });
+  await markScan(t2b, o2, o2a2.id, 4);
+  await markScan(t2b, o2, o2b2.id, 3);
   const fin2b = await finishOrderControl({ companyId, userId: ctl, taskId: t2b });
   ok("[5] повторный контроль PASSED → CONTROL_PASSED", fin2b.status === "PASSED" && (await orderStatus(o2)) === "CONTROL_PASSED");
   const checks2 = await prisma.controlCheck.findMany({ where: { orderId: o2 }, orderBy: { attempt: "asc" } });
@@ -238,14 +280,14 @@ async function main() {
   ok("[6] чужой исполнитель — отказ", /не ваша задача/.test(eForeignTask), eForeignTask);
   // корректный скан o3 доводим до конца для чистоты
   await scanOrderForControl({ companyId, userId: ctl, taskId: t3, orderCode: o3qr });
-  await markOrderControlLine({ companyId, userId: ctl, taskId: t3, lineId: (await orderLines(o3))[0].id, countedQty: 2 });
+  await markScan(t3, o3, (await orderLines(o3))[0].id, 2);
   await finishOrderControl({ companyId, userId: ctl, taskId: t3 });
 
   console.log("7) конкурентное завершение FAILED → ровно один переход и одна CORRECT_ORDER");
   const o4 = await pickToControl("OC-4", [{ externalLineId: "1", itemId: itemA, qty: 3, cell: "OC-L1E" }]);
   const t4 = await startControl(o4);
   await scanOrderForControl({ companyId, userId: ctl, taskId: t4, orderCode: await orderQr(o4) });
-  await markOrderControlLine({ companyId, userId: ctl, taskId: t4, lineId: (await orderLines(o4))[0].id, countedQty: 1 }); // недостача
+  await markScan(t4, o4, (await orderLines(o4))[0].id, 1); // недостача
   const parFin = await Promise.allSettled([
     finishOrderControl({ companyId, userId: ctl, taskId: t4 }),
     finishOrderControl({ companyId, userId: ctl, taskId: t4 }),
@@ -261,7 +303,7 @@ async function main() {
   const o5pk = await pickerOf(o5); // фактический сборщик o5 (pk или pk2)
   const t5 = await startControl(o5);
   await scanOrderForControl({ companyId, userId: ctl, taskId: t5, orderCode: await orderQr(o5) });
-  await markOrderControlLine({ companyId, userId: ctl, taskId: t5, lineId: (await orderLines(o5))[0].id, countedQty: 1 });
+  await markScan(t5, o5, (await orderLines(o5))[0].id, 1);
   await endShift(o5pk!); // исходный сборщик o5 уходит со смены; второй сборщик остаётся на смене
   const other = o5pk === pk ? pk2 : pk;
   await finishOrderControl({ companyId, userId: ctl, taskId: t5 });
@@ -275,6 +317,77 @@ async function main() {
   ok("[9] заказ IN_CONTROL", (await orderStatus(o6)) === "IN_CONTROL");
   ok("[9] задача контроля НЕ создана при выключенном флаге", !(await controlTask(o6)));
   process.env.ORDER_CONTROL_ENABLED = "true";
+
+  console.log("10) исправление по расхождениям: скан-валидация, неожиданный товар, разрешение через ядро, идемпотентность");
+  const o7 = await pickToControl("OC-7", [
+    { externalLineId: "1", itemId: itemA, qty: 4, cell: "OC-L1G" },
+    { externalLineId: "2", itemId: itemB, qty: 3, cell: "OC-L1H" },
+  ]);
+  const [o7a, o7b] = await orderLines(o7);
+  const t7 = await startControl(o7);
+  await scanOrderForControl({ companyId, userId: ctl, taskId: t7, orderCode: await orderQr(o7) });
+  // N3: скан чужого tenant / чужого склада при контроле — отказ
+  const ftg = await bareGroup(demoId, DW, itemA);
+  const eFT = await err(() => markOrderControlByScan({ companyId, userId: ctl, taskId: t7, groupCode: ftg.code, countedQty: 1, discrepancyType: "EXCESS" }));
+  ok("[10] N3 чужой tenant при контроле — отказ", /этой организации/.test(eFT), eFT);
+  const W2 = (await prisma.warehouse.create({ data: { companyId, name: "OC W2", isActive: true } })).id;
+  const fwg = await bareGroup(companyId, W2, itemA);
+  const eFW = await err(() => markOrderControlByScan({ companyId, userId: ctl, taskId: t7, groupCode: fwg.code, countedQty: 1, discrepancyType: "EXCESS" }));
+  ok("[10] N3 чужой склад при контроле — отказ", /не на складе этого заказа/.test(eFW), eFW);
+  await dropBare(ftg); await dropBare(fwg); await prisma.warehouse.deleteMany({ where: { id: W2 } });
+  // N4: неожиданный товар (itemC, не в заказе) → отдельная строка lineId=null
+  const cGrp = await seedGroup(itemC, await cellId("OC-L1A"), 2);
+  const cCode = await groupCode(cGrp.groupId);
+  await markOrderControlByScan({ companyId, userId: ctl, taskId: t7, groupCode: cCode, countedQty: 2, discrepancyType: "WRONG_ITEM" });
+  const chk7 = await prisma.controlCheck.findFirstOrThrow({ where: { orderId: o7 }, orderBy: { attempt: "desc" } });
+  const extraLine = await prisma.controlCheckLine.findFirst({ where: { checkId: chk7.id, lineId: null, itemId: itemC } });
+  ok("[10] N4 неожиданный товар зафиксирован строкой lineId=null", !!extraLine && extraLine.discrepancyType === "WRONG_ITEM");
+  // строки заказа: недостача itemA (2/4), излишек itemB (5/3)
+  await markScan(t7, o7, o7a.id, 2);
+  await markScan(t7, o7, o7b.id, 5);
+  const fin7 = await finishOrderControl({ companyId, userId: ctl, taskId: t7 });
+  ok("[10] контроль FAILED (2 строки + неожиданный товар)", fin7.status === "FAILED");
+  const corr7 = await correctTask(o7);
+  const p7 = corr7!.assignedUserId!;
+  await startWorkflowTask(p7, companyId, corr7!.id);
+  // N1: завершение без исправлений отклонено
+  const eNoFix = await err(() => completeOrderCorrection({ companyId, userId: p7, taskId: corr7!.id }));
+  ok("[10] N1 завершение без исправлений отклонено", /Разрешите все расхождения/.test(eNoFix), eNoFix);
+  // N5: недостача — скан не того товара отклонён
+  const slA = await discLineId(o7, itemA);
+  const wrongGc = await ctlGroupCode(o7, o7b.id);
+  const eWrong = await err(() => resolveControlShortage({ companyId, userId: p7, taskId: corr7!.id, checkLineId: slA, groupCode: wrongGc, qty: 1 }));
+  ok("[10] N5 недостача: скан не того товара — отказ", /не тот товар/.test(eWrong), eWrong);
+  // N7: корректный скан недостачи — выравнивание без движения
+  const itemAlot7 = (await prisma.stockReservation.findFirstOrThrow({ where: { orderId: o7, lineId: o7a.id }, select: { lotId: true } })).lotId!;
+  const mvA7 = await lotMv(itemAlot7);
+  await resolveControlShortage({ companyId, userId: p7, taskId: corr7!.id, checkLineId: slA, groupCode: await ctlGroupCode(o7, o7a.id), qty: 2 });
+  ok("[10] N7 недостача выровнена — без движения остатка", (await lotMv(itemAlot7)) === mvA7);
+  // N6: повтор разрешения идемпотентен (без второго движения)
+  const r6 = await resolveControlShortage({ companyId, userId: p7, taskId: corr7!.id, checkLineId: slA, groupCode: await ctlGroupCode(o7, o7a.id), qty: 2 });
+  ok("[10] N6 повтор разрешения идемпотентен, без второго движения", r6.alreadyResolved === true && (await lotMv(itemAlot7)) === mvA7);
+  // N2: частично исправленный список не завершается
+  const ePart = await err(() => completeOrderCorrection({ companyId, userId: p7, taskId: corr7!.id }));
+  ok("[10] N2 частично исправленный список не завершается", /Разрешите все расхождения/.test(ePart), ePart);
+  // N8: излишек itemB → изоляция в DISCREPANCY через ядро
+  const slB = await discLineId(o7, itemB);
+  const itemBlot7 = (await prisma.stockReservation.findFirstOrThrow({ where: { orderId: o7, lineId: o7b.id }, select: { lotId: true } })).lotId!;
+  const mvB7 = await lotMv(itemBlot7);
+  const discBal0 = await prisma.stockBalance.count({ where: { lotId: itemBlot7, zoneId: zDisc, qty: { gt: 0 } } });
+  await resolveControlRemoval({ companyId, userId: p7, taskId: corr7!.id, checkLineId: slB, groupCode: await ctlGroupCode(o7, o7b.id), qty: 2, disposition: "DISCREPANCY" });
+  ok("[10] N8 излишек изолирован в DISCREPANCY через ядро (движение + остаток в DISCREPANCY)",
+    (await lotMv(itemBlot7)) === mvB7 + 1 && (await prisma.stockBalance.count({ where: { lotId: itemBlot7, zoneId: zDisc, qty: { gt: 0 } } })) === discBal0 + 1);
+  // разрешить неожиданный товар itemC (изоляция в DISCREPANCY)
+  await resolveControlRemoval({ companyId, userId: p7, taskId: corr7!.id, checkLineId: extraLine!.id, groupCode: cCode, qty: 2, disposition: "DISCREPANCY" });
+  // N9: все расхождения разрешены → ровно одна полная повторная проверка
+  await completeOrderCorrection({ companyId, userId: p7, taskId: corr7!.id });
+  ok("[10] заказ снова IN_CONTROL после разрешения всех расхождений", (await orderStatus(o7)) === "IN_CONTROL");
+  const newCtls = await prisma.workflowTask.count({ where: { type: "CONTROL_ORDER", subjectId: o7, status: { not: "COMPLETED" } } });
+  ok("[10] N9 создана ровно одна новая полная CONTROL_ORDER", newCtls === 1, `count=${newCtls}`);
+  const t7b = await startControl(o7);
+  const s7b = await scanOrderForControl({ companyId, userId: ctl, taskId: t7b, orderCode: await orderQr(o7) });
+  const unmarked7 = await prisma.controlCheckLine.count({ where: { checkId: s7b.checkId, lineId: { not: null }, countedQty: null } });
+  ok("[10] N9 повторная проверка полная (все строки заново)", unmarked7 === 2, `unmarked=${unmarked7}`);
 
   console.log(failures === 0 ? "\nВСЕ ПРОВЕРКИ P7 ПРОЙДЕНЫ ✓" : `\nПРОВАЛ: ${failures} проверок`);
 }

@@ -1,8 +1,10 @@
 import "server-only";
-import { Prisma, type ControlDiscrepancyType, type WorkflowTask, type ExternalOrder } from "@prisma/client";
+import { Prisma, type ControlDiscrepancyType, type ControlResolutionMethod, type WorkflowTask, type ExternalOrder } from "@prisma/client";
 import { prisma } from "@/lib/db";
 import { parseScannedCode } from "@/lib/qr";
 import { logEvent } from "@/lib/events";
+import { applyLotMovement, type Loc } from "@/lib/stock";
+import { lockCell } from "@/lib/cells";
 import { TASK_TYPES } from "@/lib/workflow-task-types";
 import {
   lockCompany,
@@ -46,6 +48,39 @@ async function resolveScannedOrder(tx: Tx, companyId: string, raw: string): Prom
   const order = await tx.externalOrder.findFirst({ where: { id: qr.refId, companyId }, select: { id: true } });
   if (!order) throw new OrderControlError("Заказ не найден");
   return order.id;
+}
+
+// ── Резолвинг QR группы/партии: тип GROUP или LOT, своя организация → группа хранения + склад ──
+async function resolveScannedGroup(
+  tx: Tx,
+  companyId: string,
+  raw: string,
+): Promise<{ groupId: string; lotId: string; itemId: string; warehouseId: string }> {
+  const code = parseScannedCode(raw);
+  if (!code) throw new OrderControlError("Неверный QR группы/партии");
+  const qr = await tx.qrCode.findUnique({ where: { code } });
+  if (!qr || qr.companyId !== companyId) throw new OrderControlError("Это не QR этой организации");
+  const sel = { id: true, lotId: true, itemId: true, warehouseId: true } as const;
+  let group;
+  if (qr.type === "GROUP") group = await tx.handlingGroup.findFirst({ where: { id: qr.refId, companyId }, select: sel });
+  else if (qr.type === "LOT") group = await tx.handlingGroup.findFirst({ where: { lotId: qr.refId, companyId }, select: sel });
+  else throw new OrderControlError("Отсканируйте QR группы или партии товара");
+  if (!group) throw new OrderControlError("Группа хранения не найдена");
+  return { groupId: group.id, lotId: group.lotId, itemId: group.itemId, warehouseId: group.warehouseId };
+}
+
+async function markResolved(
+  tx: Tx,
+  clId: string,
+  method: ControlResolutionMethod,
+  userId: string,
+  comment: string | null | undefined,
+  fallback: string,
+): Promise<void> {
+  await tx.controlCheckLine.update({
+    where: { id: clId },
+    data: { resolutionStatus: "RESOLVED", resolutionMethod: method, resolvedById: userId, resolvedAt: new Date(), resolutionComment: comment?.trim() || fallback },
+  });
 }
 
 // ── Создание задачи контроля CONTROL_ORDER в ПЕРЕДАННОЙ tx (под lockCompany). Идемпотентно по
@@ -125,35 +160,63 @@ export async function scanOrderForControl(input: {
   });
 }
 
-// ── Контролёр отмечает строку: фактическое количество + (опц.) тип расхождения и комментарий ──
-export async function markOrderControlLine(input: {
+// ── Контролёр отмечает по СКАНУ QR группы/партии + количество. Сервер резолвит QR, проверяет
+// tenant (организация), склад (группа на складе заказа) и связь с заказом (резерв этого заказа на
+// эту группу → строка заказа). Неожиданный товар (не связан с заказом) фиксируется отдельной
+// строкой lineId=null с типом EXCESS/WRONG_ITEM. Ручной ввод кода — тот же путь (fallback). ──
+export async function markOrderControlByScan(input: {
   companyId: string;
   userId: string;
   taskId: string;
-  lineId: string;
+  groupCode: string;
   countedQty: number;
   discrepancyType?: string | null;
   comment?: string | null;
-}): Promise<void> {
-  await prisma.$transaction(async (tx) => {
+}): Promise<{ lineId: string | null; itemId: string; discrepancyType: ControlDiscrepancyType | null }> {
+  return prisma.$transaction(async (tx) => {
     await lockCompany(tx, input.companyId);
     const task = await requireControlTask(tx, input.companyId, input.taskId, input.userId);
     if (task.status !== "IN_PROGRESS") throw new OrderControlError("Задача контроля не в работе");
+    const order = await tx.externalOrder.findFirst({ where: { id: task.subjectId ?? "", companyId: input.companyId } });
+    if (!order) throw new OrderControlError("Заказ не найден");
     const check = await tx.controlCheck.findUnique({ where: { taskId: task.id } });
     if (!check) throw new OrderControlError("Сначала отсканируйте QR заказа");
     if (check.status !== "IN_PROGRESS") throw new OrderControlError("Проверка уже завершена");
-    const cl = await tx.controlCheckLine.findFirst({ where: { checkId: check.id, lineId: input.lineId } });
-    if (!cl) throw new OrderControlError("Строка не относится к этой проверке");
+    const scanned = await resolveScannedGroup(tx, input.companyId, input.groupCode);
+    if (scanned.warehouseId !== order.warehouseId) throw new OrderControlError("Группа не на складе этого заказа");
     const counted = D(input.countedQty);
     if (counted.lt(0)) throw new OrderControlError("Количество не может быть отрицательным");
-    // тип расхождения: явный (валидируем) либо авто по количеству; равенство → нет расхождения
-    let type = parseDiscrepancyType(input.discrepancyType);
-    if (!counted.equals(cl.expectedQty) && !type) type = counted.lt(cl.expectedQty) ? "SHORTAGE" : "EXCESS";
-    else if (counted.equals(cl.expectedQty) && (type === "SHORTAGE" || type === "EXCESS")) type = null;
-    await tx.controlCheckLine.update({
-      where: { id: cl.id },
-      data: { countedQty: counted, discrepancyType: type, comment: input.comment?.trim() || null, byUserId: input.userId, checkedAt: new Date() },
+    const explicit = parseDiscrepancyType(input.discrepancyType);
+    const comment = input.comment?.trim() || null;
+    // связь с заказом: резерв этого заказа на эту группу → строка заказа
+    const resv = await tx.stockReservation.findFirst({ where: { orderId: order.id, handlingGroupId: scanned.groupId }, select: { lineId: true } });
+    if (resv) {
+      const cl = await tx.controlCheckLine.findFirst({ where: { checkId: check.id, lineId: resv.lineId } });
+      if (!cl) throw new OrderControlError("Строка не относится к этой проверке");
+      let type = explicit;
+      if (!counted.equals(cl.expectedQty) && !type) type = counted.lt(cl.expectedQty) ? "SHORTAGE" : "EXCESS";
+      else if (counted.equals(cl.expectedQty) && (type === "SHORTAGE" || type === "EXCESS")) type = null;
+      await tx.controlCheckLine.update({
+        where: { id: cl.id },
+        data: { countedQty: counted, discrepancyType: type, handlingGroupId: scanned.groupId, comment, byUserId: input.userId, checkedAt: new Date() },
+      });
+      return { lineId: resv.lineId, itemId: scanned.itemId, discrepancyType: type };
+    }
+    // неожиданный товар: не связан с заказом → EXCESS/WRONG_ITEM обязателен
+    if (explicit !== "EXCESS" && explicit !== "WRONG_ITEM")
+      throw new OrderControlError("Неожиданный товар: укажите тип «излишек» или «не тот товар»");
+    const existing = await tx.controlCheckLine.findFirst({ where: { checkId: check.id, lineId: null, handlingGroupId: scanned.groupId } });
+    if (existing) {
+      await tx.controlCheckLine.update({
+        where: { id: existing.id },
+        data: { countedQty: counted, discrepancyType: explicit, comment, byUserId: input.userId, checkedAt: new Date() },
+      });
+      return { lineId: null, itemId: scanned.itemId, discrepancyType: explicit };
+    }
+    await tx.controlCheckLine.create({
+      data: { companyId: input.companyId, checkId: check.id, lineId: null, itemId: scanned.itemId, expectedQty: D(0), countedQty: counted, discrepancyType: explicit, handlingGroupId: scanned.groupId, comment, byUserId: input.userId, checkedAt: new Date() },
     });
+    return { lineId: null, itemId: scanned.itemId, discrepancyType: explicit };
   });
 }
 
@@ -229,6 +292,8 @@ export async function finishOrderControl(input: {
     }
     await tx.controlCheck.update({ where: { id: check.id }, data: { status: "FAILED", finishedAt: new Date() } });
     await tx.externalOrder.update({ where: { id: order.id }, data: { status: "CORRECTION_REQUIRED" } });
+    // каждое расхождение ждёт разрешения сборщиком (PENDING → RESOLVED)
+    await tx.controlCheckLine.updateMany({ where: { checkId: check.id, discrepancyType: { not: null } }, data: { resolutionStatus: "PENDING" } });
     const unblocked = await completeWorkflowTaskInTransaction(tx, task.id);
     const correctTask = await createCorrectTaskInTx(tx, { companyId: input.companyId, order, checkId: check.id });
     return { status: "FAILED" as const, alreadyFinished: false, order, task, unblocked, correctTask };
@@ -251,9 +316,119 @@ export async function finishOrderControl(input: {
   return { status: out.status, alreadyFinished: out.alreadyFinished };
 }
 
+// Контекст разрешения расхождения: валидная CORRECT_ORDER + строка расхождения последней FAILED-проверки.
+async function loadResolutionCtx(tx: Tx, companyId: string, userId: string, taskId: string, checkLineId: string) {
+  const task = await tx.workflowTask.findFirst({ where: { id: taskId, companyId } });
+  if (!task) throw new OrderControlError("Задача не найдена");
+  if (task.type !== TASK_TYPES.CORRECT_ORDER) throw new OrderControlError("Это не задача исправления");
+  if (task.assignedUserId !== userId) throw new OrderControlError("Это не ваша задача исправления");
+  if (task.status !== "IN_PROGRESS") throw new OrderControlError("Задача исправления не в работе");
+  const order = await tx.externalOrder.findFirst({ where: { id: task.subjectId ?? "", companyId } });
+  if (!order) throw new OrderControlError("Заказ не найден");
+  if (order.status !== "CORRECTION_REQUIRED") throw new OrderControlError("Заказ не в статусе исправления");
+  const check = await tx.controlCheck.findFirst({ where: { orderId: order.id, status: "FAILED" }, orderBy: { attempt: "desc" } });
+  if (!check) throw new OrderControlError("Нет проваленной проверки");
+  const cl = await tx.controlCheckLine.findFirst({ where: { id: checkLineId, checkId: check.id } });
+  if (!cl || !cl.discrepancyType) throw new OrderControlError("Строка расхождения не найдена");
+  return { order, cl };
+}
+
+// ── Разрешение НЕДОСТАЧИ: сборщик сканирует ожидаемый товар/группу и подтверждает добавленное
+// количество. Приводит фактический состав к уже проведённому ledger → движение НЕ создаём
+// (ALIGNED). Идемпотентно. ──
+export async function resolveControlShortage(input: {
+  companyId: string;
+  userId: string;
+  taskId: string;
+  checkLineId: string;
+  groupCode: string;
+  qty: number;
+  comment?: string | null;
+}): Promise<{ resolved: boolean; alreadyResolved: boolean }> {
+  return prisma.$transaction(async (tx) => {
+    await lockCompany(tx, input.companyId);
+    const { order, cl } = await loadResolutionCtx(tx, input.companyId, input.userId, input.taskId, input.checkLineId);
+    if (cl.discrepancyType !== "SHORTAGE") throw new OrderControlError("Эта строка не недостача");
+    if (cl.resolutionStatus === "RESOLVED") return { resolved: true, alreadyResolved: true };
+    const scanned = await resolveScannedGroup(tx, input.companyId, input.groupCode);
+    if (scanned.warehouseId !== order.warehouseId) throw new OrderControlError("Группа не на складе этого заказа");
+    if (scanned.itemId !== cl.itemId) throw new OrderControlError("Отсканирован не тот товар (ожидается товар недостающей строки)");
+    const q = D(input.qty);
+    if (q.lte(0)) throw new OrderControlError("Количество должно быть больше нуля");
+    // выравнивание к ledger — без движения остатка
+    await markResolved(tx, cl.id, "ALIGNED", input.userId, input.comment, `добавлено ${q.toString()}`);
+    return { resolved: true, alreadyResolved: false };
+  });
+}
+
+// ── Разрешение ИЗЛИШКА / НЕ ТОГО / ПОВРЕЖДЁННОГО: сборщик сканирует удаляемый товар/группу и
+// подтверждает возврат в хранение (RETURN) или изоляцию в зону DISCREPANCY. Движение — ТОЛЬКО
+// через ядро (stock.ts). DAMAGED/OTHER — только безопасный путь DISCREPANCY; при отсутствии зоны
+// DISCREPANCY строка остаётся PENDING (задачу не завершить). Идемпотентно. ──
+export async function resolveControlRemoval(input: {
+  companyId: string;
+  userId: string;
+  taskId: string;
+  checkLineId: string;
+  groupCode: string;
+  qty: number;
+  disposition: "RETURN" | "DISCREPANCY";
+  comment?: string | null;
+}): Promise<{ resolved: boolean; alreadyResolved: boolean; moved: boolean }> {
+  const res = await prisma.$transaction(async (tx) => {
+    await lockCompany(tx, input.companyId);
+    const { order, cl } = await loadResolutionCtx(tx, input.companyId, input.userId, input.taskId, input.checkLineId);
+    if (cl.discrepancyType === "SHORTAGE") throw new OrderControlError("Недостача исправляется добавлением, не удалением");
+    if (cl.resolutionStatus === "RESOLVED") return { alreadyResolved: true, moved: false, warehouseId: order.warehouseId };
+    if ((cl.discrepancyType === "DAMAGED" || cl.discrepancyType === "OTHER") && input.disposition !== "DISCREPANCY")
+      throw new OrderControlError("Повреждённый/прочий товар можно только изолировать в зону DISCREPANCY");
+    const scanned = await resolveScannedGroup(tx, input.companyId, input.groupCode);
+    if (scanned.warehouseId !== order.warehouseId) throw new OrderControlError("Группа не на складе этого заказа");
+    if (scanned.itemId !== cl.itemId) throw new OrderControlError("Отсканирован не тот товар этого расхождения");
+    const q = D(input.qty);
+    if (q.lte(0)) throw new OrderControlError("Количество должно быть больше нуля");
+    // источник перемещения: строка заказа → зона CONTROL (товар заказа там после сборки);
+    // неожиданный товар (lineId=null) → текущее место остатка отсканированной группы.
+    let from: Loc;
+    if (cl.lineId) {
+      const controlZone = await tx.warehouseZone.findFirst({ where: { companyId: input.companyId, warehouseId: order.warehouseId, kind: "CONTROL" }, select: { id: true } });
+      if (!controlZone) throw new OrderControlError("На складе нет зоны CONTROL");
+      from = { kind: "zone", warehouseId: order.warehouseId, zoneId: controlZone.id };
+    } else {
+      const bal = await tx.stockBalance.findFirst({ where: { companyId: input.companyId, lotId: scanned.lotId, qty: { gt: 0 } }, select: { cellId: true, zoneId: true } });
+      if (!bal) throw new OrderControlError("Нет остатка группы для перемещения");
+      if (bal.cellId) { await lockCell(tx, input.companyId, bal.cellId); from = { kind: "cell", warehouseId: order.warehouseId, cellId: bal.cellId }; }
+      else if (bal.zoneId) from = { kind: "zone", warehouseId: order.warehouseId, zoneId: bal.zoneId };
+      else throw new OrderControlError("Не определить место остатка группы");
+    }
+    if (input.disposition === "DISCREPANCY") {
+      const discZone = await tx.warehouseZone.findFirst({ where: { companyId: input.companyId, warehouseId: order.warehouseId, kind: "DISCREPANCY" }, select: { id: true } });
+      if (!discZone) throw new OrderControlError("На складе нет зоны DISCREPANCY — исправление невозможно, оставьте задачу незавершённой");
+      await applyLotMovement(tx, {
+        companyId: input.companyId, docType: "INVENTORY", docId: order.id, itemId: scanned.itemId, lotId: scanned.lotId, qty: q,
+        from, to: { kind: "zone", warehouseId: order.warehouseId, zoneId: discZone.id }, createdById: input.userId,
+      });
+      await markResolved(tx, cl.id, "ISOLATED_DISCREPANCY", input.userId, input.comment, `изолировано ${q.toString()} в DISCREPANCY`);
+    } else {
+      const src = cl.lineId
+        ? await tx.stockReservation.findFirst({ where: { orderId: order.id, lineId: cl.lineId, cellId: { not: null } }, select: { cellId: true } })
+        : null;
+      if (!src?.cellId) throw new OrderControlError("Не найдена ячейка возврата — используйте изоляцию в DISCREPANCY");
+      await lockCell(tx, input.companyId, src.cellId);
+      await applyLotMovement(tx, {
+        companyId: input.companyId, docType: "TRANSFER", docId: order.id, itemId: scanned.itemId, lotId: scanned.lotId, qty: q,
+        from, to: { kind: "cell", warehouseId: order.warehouseId, cellId: src.cellId }, createdById: input.userId,
+      });
+      await markResolved(tx, cl.id, "RETURNED", input.userId, input.comment, `возвращено ${q.toString()} в хранение`);
+    }
+    return { alreadyResolved: false, moved: true, warehouseId: order.warehouseId };
+  });
+  return { resolved: true, alreadyResolved: res.alreadyResolved, moved: res.moved };
+}
+
 // ── Сборщик завершает исправление: заказ → полный повторный контроль (новая CONTROL_ORDER).
-// Остаток здесь НЕ двигаем — физическая коррекция и любые движения остатка выполняются отдельно
-// через ядро/инвентаризацию (зона DISCREPANCY). Идемпотентно. ──
+// Требует, чтобы ВСЕ расхождения последней FAILED-проверки были RESOLVED (иначе отказ). Остаток
+// здесь НЕ двигаем — движения выполнены при разрешении каждого расхождения через ядро. Идемпотентно. ──
 export async function completeOrderCorrection(input: {
   companyId: string;
   userId: string;
@@ -271,6 +446,14 @@ export async function completeOrderCorrection(input: {
       return { alreadyDone: true, order, controlTask: null as TaskCreateResult | null, unblocked: [] as { id: string; title: string; warehouseId: string }[] };
     if (task.status !== "IN_PROGRESS") throw new OrderControlError("Задача исправления не в работе");
     if (order.status !== "CORRECTION_REQUIRED") throw new OrderControlError("Заказ не в статусе исправления");
+    // все расхождения последней FAILED-проверки должны быть RESOLVED
+    const failed = await tx.controlCheck.findFirst({ where: { orderId: order.id, status: "FAILED" }, orderBy: { attempt: "desc" } });
+    if (failed) {
+      const total = await tx.controlCheckLine.count({ where: { checkId: failed.id, discrepancyType: { not: null } } });
+      const pending = await tx.controlCheckLine.count({ where: { checkId: failed.id, discrepancyType: { not: null }, resolutionStatus: { not: "RESOLVED" } } });
+      if (total === 0) throw new OrderControlError("Нет зафиксированных расхождений для исправления");
+      if (pending > 0) throw new OrderControlError(`Разрешите все расхождения перед завершением (осталось ${pending})`);
+    }
     await tx.externalOrder.update({ where: { id: order.id }, data: { status: "IN_CONTROL" } });
     const unblocked = await completeWorkflowTaskInTransaction(tx, task.id);
     const controlTask = await createControlTaskInTx(tx, { companyId: input.companyId, order, dedupeKey: `control:${order.id}:recheck:${task.id}` });
@@ -309,6 +492,13 @@ export async function getControlOrderContext(companyId: string, taskId: string) 
       discrepancyType: c?.discrepancyType ?? null,
     };
   });
+  // неожиданные товары (lineId=null) — зафиксированы контролёром по скану
+  const extraItemIds = checkLines.filter((c) => !c.lineId).map((c) => c.itemId);
+  const extraItems = extraItemIds.length ? await prisma.item.findMany({ where: { id: { in: extraItemIds } }, select: { id: true, name: true } }) : [];
+  const extraName = new Map(extraItems.map((i) => [i.id, i.name]));
+  const extras = checkLines
+    .filter((c) => !c.lineId)
+    .map((c) => ({ item: extraName.get(c.itemId) ?? c.itemId, counted: c.countedQty?.toString() ?? "—", discrepancyType: c.discrepancyType ?? null }));
   const allMarked = lines.length > 0 && lines.every((l) => l.counted != null);
   const previous = await prisma.controlCheck.findMany({
     where: { orderId: order.id, id: check ? { not: check.id } : undefined },
@@ -322,6 +512,7 @@ export async function getControlOrderContext(companyId: string, taskId: string) 
     scanConfirmed: !!check,
     attempt: check?.attempt ?? previous.length + 1,
     lines,
+    extras,
     allMarked,
     previousChecks: previous.map((p) => ({ attempt: p.attempt, status: p.status })),
   };
@@ -341,16 +532,26 @@ export async function getCorrectOrderContext(companyId: string, taskId: string) 
     : [];
   const items = await prisma.item.findMany({ where: { id: { in: disc.map((d) => d.itemId) } }, select: { id: true, name: true } });
   const itemName = new Map(items.map((i) => [i.id, i.name]));
+  // код группы (для справки/ручного ввода при сканировании исправления)
+  const grpIds = disc.map((d) => d.handlingGroupId).filter((x): x is string => !!x);
+  const grpQrs = grpIds.length ? await prisma.qrCode.findMany({ where: { type: "GROUP", refId: { in: grpIds } }, select: { refId: true, code: true } }) : [];
+  const grpCode = new Map(grpQrs.map((q) => [q.refId, q.code]));
+  const discrepancies = disc.map((d) => ({
+    checkLineId: d.id,
+    item: itemName.get(d.itemId) ?? d.itemId,
+    type: d.discrepancyType,
+    expected: d.expectedQty.toString(),
+    counted: d.countedQty != null ? d.countedQty.toString() : "—",
+    comment: d.comment ?? null,
+    resolutionStatus: d.resolutionStatus ?? "PENDING",
+    resolutionMethod: d.resolutionMethod ?? null,
+    groupCode: d.handlingGroupId ? grpCode.get(d.handlingGroupId) ?? null : null,
+  }));
   return {
     taskId: task.id,
     orderId: order.id,
     externalId: order.externalId,
-    discrepancies: disc.map((d) => ({
-      item: itemName.get(d.itemId) ?? d.itemId,
-      type: d.discrepancyType,
-      expected: d.expectedQty.toString(),
-      counted: d.countedQty != null ? d.countedQty.toString() : "—",
-      comment: d.comment ?? null,
-    })),
+    discrepancies,
+    allResolved: discrepancies.length > 0 && discrepancies.every((d) => d.resolutionStatus === "RESOLVED"),
   };
 }

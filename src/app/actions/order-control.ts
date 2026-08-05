@@ -6,8 +6,10 @@ import { scoped } from "@/lib/tenant";
 import { orderControlEnabled } from "@/lib/roles";
 import {
   scanOrderForControl,
-  markOrderControlLine,
+  markOrderControlByScan,
   finishOrderControl,
+  resolveControlShortage,
+  resolveControlRemoval,
   completeOrderCorrection,
   OrderControlError,
 } from "@/lib/order-control";
@@ -45,25 +47,69 @@ export async function scanOrderControlAction(_prev: ControlActionState, formData
   return { ok: true };
 }
 
-// Контролёр отмечает строку: фактическое количество + опц. тип расхождения и комментарий.
-export async function markControlLineAction(_prev: ControlActionState, formData: FormData): Promise<ControlActionState> {
+// Контролёр отмечает по СКАНУ QR группы/партии + количество (ручной ввод кода — fallback).
+export async function markControlScanAction(_prev: ControlActionState, formData: FormData): Promise<ControlActionState> {
   if (!orderControlEnabled()) return OFF;
   const session = await requireUser();
   const s = scoped(session);
   const taskId = String(formData.get("taskId") ?? "").trim();
-  const lineId = String(formData.get("lineId") ?? "").trim();
+  const groupCode = String(formData.get("groupCode") ?? "").trim();
   const countedQty = Number(String(formData.get("countedQty") ?? "").trim().replace(",", "."));
   const discrepancyType = String(formData.get("discrepancyType") ?? "").trim() || null;
   const comment = String(formData.get("comment") ?? "").trim() || null;
-  if (!lineId) return { error: "Не указана строка" };
+  if (!groupCode) return { error: "Отсканируйте QR группы/партии" };
   if (!Number.isFinite(countedQty)) return { error: "Укажите фактическое количество" };
   try {
-    await markOrderControlLine({ companyId: s.companyId, userId: session.userId, taskId, lineId, countedQty, discrepancyType, comment });
+    await markOrderControlByScan({ companyId: s.companyId, userId: session.userId, taskId, groupCode, countedQty, discrepancyType, comment });
   } catch (e) {
     return { error: msg(e) };
   }
   revalidatePath("/warehouse/tasks");
   return { ok: true };
+}
+
+// Сборщик разрешает НЕДОСТАЧУ: скан ожидаемого товара/группы + добавленное количество (без движения).
+export async function resolveShortageAction(_prev: ControlActionState, formData: FormData): Promise<ControlActionState> {
+  if (!orderControlEnabled()) return OFF;
+  const session = await requireUser();
+  const s = scoped(session);
+  const taskId = String(formData.get("taskId") ?? "").trim();
+  const checkLineId = String(formData.get("checkLineId") ?? "").trim();
+  const groupCode = String(formData.get("groupCode") ?? "").trim();
+  const qty = Number(String(formData.get("qty") ?? "").trim().replace(",", "."));
+  const comment = String(formData.get("comment") ?? "").trim() || null;
+  if (!checkLineId || !groupCode) return { error: "Отсканируйте QR товара недостающей строки" };
+  if (!Number.isFinite(qty)) return { error: "Укажите количество" };
+  try {
+    await resolveControlShortage({ companyId: s.companyId, userId: session.userId, taskId, checkLineId, groupCode, qty, comment });
+    revalidatePath("/warehouse/tasks");
+    return { ok: true };
+  } catch (e) {
+    return { error: msg(e) };
+  }
+}
+
+// Сборщик разрешает ИЗЛИШЕК/НЕ ТОТ/ПОВРЕЖДЁННЫЙ: скан удаляемого товара/группы + возврат (RETURN)
+// или изоляция в DISCREPANCY (движение через ядро).
+export async function resolveRemovalAction(_prev: ControlActionState, formData: FormData): Promise<ControlActionState> {
+  if (!orderControlEnabled()) return OFF;
+  const session = await requireUser();
+  const s = scoped(session);
+  const taskId = String(formData.get("taskId") ?? "").trim();
+  const checkLineId = String(formData.get("checkLineId") ?? "").trim();
+  const groupCode = String(formData.get("groupCode") ?? "").trim();
+  const qty = Number(String(formData.get("qty") ?? "").trim().replace(",", "."));
+  const disposition = String(formData.get("disposition") ?? "").trim() === "RETURN" ? "RETURN" : "DISCREPANCY";
+  const comment = String(formData.get("comment") ?? "").trim() || null;
+  if (!checkLineId || !groupCode) return { error: "Отсканируйте QR удаляемого товара/группы" };
+  if (!Number.isFinite(qty)) return { error: "Укажите количество" };
+  try {
+    await resolveControlRemoval({ companyId: s.companyId, userId: session.userId, taskId, checkLineId, groupCode, qty, disposition, comment });
+    revalidatePath("/warehouse/tasks");
+    return { ok: true };
+  } catch (e) {
+    return { error: msg(e) };
+  }
 }
 
 // Контролёр завершает проверку: PASSED (нет расхождений) / FAILED (создаётся исправление).

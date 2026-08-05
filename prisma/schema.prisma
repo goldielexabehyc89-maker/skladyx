@@ -1193,6 +1193,19 @@ enum ControlDiscrepancyType {
   OTHER
 }
 
+// Пакет 7 (коррекция): состояние разрешения расхождения сборщиком в CORRECT_ORDER.
+enum ControlLineResolution {
+  PENDING // расхождение зафиксировано, ждёт исправления
+  RESOLVED // сборщик исправил (способ — resolutionMethod)
+}
+
+// Способ физического исправления расхождения.
+enum ControlResolutionMethod {
+  ALIGNED // факт приведён к уже проведённому ledger — движения НЕ создаём (недостача добавлена физически)
+  RETURNED // излишек/не тот товар возвращён в хранение (движение через ядро)
+  ISOLATED_DISCREPANCY // изолирован в зону DISCREPANCY (движение через ядро)
+}
+
 model ControlCheck {
   id           String             @id @default(cuid())
   companyId    String
@@ -1225,6 +1238,14 @@ model ControlCheckLine {
   comment         String?
   byUserId        String?
   checkedAt       DateTime?
+  handlingGroupId String? // группа/паллета, отсканированная при контроле (связь с заказом/товаром)
+
+  // Пакет 7 (коррекция): разрешение расхождения сборщиком (PENDING → RESOLVED)
+  resolutionStatus  ControlLineResolution? // null — расхождения нет; PENDING/RESOLVED — есть
+  resolutionMethod  ControlResolutionMethod?
+  resolvedById      String?
+  resolvedAt        DateTime?
+  resolutionComment String?
 
   check ControlCheck @relation(fields: [checkId], references: [id], onDelete: Cascade)
 
