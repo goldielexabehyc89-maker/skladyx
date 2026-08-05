@@ -3,10 +3,11 @@ import { redirect } from "next/navigation";
 import { requireUser } from "@/lib/auth";
 import { scoped } from "@/lib/tenant";
 import { prisma } from "@/lib/db";
-import { hasRole, isWorkRole, workflowTasksEnabled, groupReceivingEnabled, coolingWorkflowEnabled, externalOrderPickingEnabled, orderControlEnabled } from "@/lib/roles";
+import { hasRole, isWorkRole, workflowTasksEnabled, groupReceivingEnabled, coolingWorkflowEnabled, externalOrderPickingEnabled, orderControlEnabled, orderIssueEnabled } from "@/lib/roles";
 import { eligibleCellsForGroup } from "@/lib/group-receiving";
 import { getPickOrderContext, getMoveGroupContext } from "@/lib/external-orders";
 import { getControlOrderContext, getCorrectOrderContext } from "@/lib/order-control";
+import { getIssueOrderContext, getDeliverOrderContext } from "@/lib/order-issue";
 import { DueActivator } from "./due-activator";
 import { allowedWarehouses } from "@/lib/warehouse-access";
 import { getActiveShift } from "@/lib/work-shift";
@@ -208,6 +209,14 @@ export default async function TasksPage({
     else if (current.type === "CORRECT_ORDER") correctOrder = await getCorrectOrderContext(s.companyId, current.id);
   }
 
+  // Пакет 8: контекст текущей задачи размещения (ISSUE_ORDER) и выдачи (DELIVER_ORDER).
+  let issueOrder = null as Awaited<ReturnType<typeof getIssueOrderContext>> | null;
+  let deliverOrder = null as Awaited<ReturnType<typeof getDeliverOrderContext>> | null;
+  if (current && current.status === "IN_PROGRESS" && orderIssueEnabled()) {
+    if (current.type === "ISSUE_ORDER") issueOrder = await getIssueOrderContext(s.companyId, current.id);
+    else if (current.type === "DELIVER_ORDER") deliverOrder = await getDeliverOrderContext(s.companyId, current.id);
+  }
+
   return (
     <div className="mx-auto flex w-full max-w-lg flex-col gap-4">
       <DueActivator />
@@ -225,6 +234,8 @@ export default async function TasksPage({
         moveGroup={moveGroup}
         controlOrder={controlOrder}
         correctOrder={correctOrder}
+        issueOrder={issueOrder}
+        deliverOrder={deliverOrder}
       />
     </div>
   );

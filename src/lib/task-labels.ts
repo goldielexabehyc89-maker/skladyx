@@ -31,7 +31,8 @@ export const TASK_TYPE_LABEL: Record<string, string> = {
   PICK_ORDER: "Сборка заказа",
   CONTROL_ORDER: "Контроль заказа",
   CORRECT_ORDER: "Исправление заказа",
-  ISSUE_ORDER: "Выдача заказа",
+  ISSUE_ORDER: "Размещение в выдаче",
+  DELIVER_ORDER: "Выдача водителю",
   RETRIEVE_COOLING: "Забрать из охлаждения",
 };
 

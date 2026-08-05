@@ -8,7 +8,8 @@ export const TASK_TYPES = {
   PICK_ORDER: "PICK_ORDER", // сборка заказа (PICKER)
   CONTROL_ORDER: "CONTROL_ORDER", // контроль заказа (CONTROLLER, Пакет 7)
   CORRECT_ORDER: "CORRECT_ORDER", // исправление заказа после контроля (PICKER, срочная, Пакет 7)
-  ISSUE_ORDER: "ISSUE_ORDER", // размещение в зоне выдачи/выдача (LOADER)
+  ISSUE_ORDER: "ISSUE_ORDER", // размещение заказа в ячейки зоны ISSUE, CONTROL→ISSUE (LOADER, срочная, Пакет 8)
+  DELIVER_ORDER: "DELIVER_ORDER", // выдача заказа водителю из ячеек выдачи (LOADER, Пакет 8)
   RETRIEVE_COOLING: "RETRIEVE_COOLING", // забрать группу из охлаждения (LOADER, срочная, Пакет 5)
 } as const;
 

@@ -17,6 +17,10 @@ const STATUS_RU: Record<ExternalOrderStatus, { label: string; tone: "neutral" | 
   IN_CONTROL: { label: "На контроле", tone: "green" },
   CORRECTION_REQUIRED: { label: "Требует исправления", tone: "red" },
   CONTROL_PASSED: { label: "Контроль пройден", tone: "green" },
+  AWAITING_ISSUE_CELL: { label: "Ожидает ячейку выдачи", tone: "orange" },
+  MOVING_TO_ISSUE: { label: "Перемещается в выдачу", tone: "blue" },
+  READY_FOR_DRIVER: { label: "Готов к выдаче", tone: "green" },
+  ISSUED: { label: "Выдан", tone: "green" },
   BLOCKED: { label: "Заблокирован", tone: "red" },
 };
 

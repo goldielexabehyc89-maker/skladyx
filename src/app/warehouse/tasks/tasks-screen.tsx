@@ -14,6 +14,7 @@ import { completeGroupPlacementAction, type PlacementState } from "@/app/actions
 import { reportShortageAction, pickScanAction, completeMoveGroupAction, type OrderActionState } from "@/app/actions/external-orders";
 import { PickOrderScanner, MoveGroupScanner } from "./order-scanners";
 import { ControlOrderPanel, CorrectOrderPanel, type ControlOrderCtx, type CorrectOrderCtx } from "./control-panels";
+import { IssueOrderPanel, DeliverOrderPanel, type IssueOrderCtx, type DeliverOrderCtx } from "./issue-panels";
 import { Button, Card, CardTitle, Badge, EmptyState } from "@/components/ui";
 import { TASK_STATUS_TONE, taskStatusLabel, taskTypeLabel } from "@/lib/task-labels";
 
@@ -288,6 +289,8 @@ export function WorkerTasks({
   moveGroup,
   controlOrder,
   correctOrder,
+  issueOrder,
+  deliverOrder,
 }: {
   current: TaskDTO | null;
   urgent: TaskDTO[];
@@ -300,6 +303,8 @@ export function WorkerTasks({
   moveGroup?: MoveGroupCtx | null;
   controlOrder?: ControlOrderCtx | null;
   correctOrder?: CorrectOrderCtx | null;
+  issueOrder?: IssueOrderCtx | null;
+  deliverOrder?: DeliverOrderCtx | null;
 }) {
   return (
     <div className="flex flex-col gap-4">
@@ -350,6 +355,8 @@ export function WorkerTasks({
               )}
               {controlOrder && current.status === "IN_PROGRESS" && <ControlOrderPanel ctx={controlOrder} />}
               {correctOrder && current.status === "IN_PROGRESS" && <CorrectOrderPanel ctx={correctOrder} />}
+              {issueOrder && current.status === "IN_PROGRESS" && <IssueOrderPanel ctx={issueOrder} />}
+              {deliverOrder && current.status === "IN_PROGRESS" && <DeliverOrderPanel ctx={deliverOrder} />}
               {current.status === "IN_PROGRESS" && <HandoffForm taskId={current.id} mates={mates} />}
               {current.status === "HANDOFF_PENDING" && (
                 <p className="text-xs text-orange-600">Ожидает принятия передачи получателем.</p>

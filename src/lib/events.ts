@@ -44,7 +44,10 @@ export type EventType =
   | "task_handoff_rejected"
   // Этап 5/Пакет 7: контроль заказа
   | "order_control_passed"
-  | "order_correction_required";
+  | "order_correction_required"
+  // Этап 5/Пакет 8: выдача заказа
+  | "order_ready_for_driver"
+  | "order_issued";
 
 // Карта «событие журнала → realtime-сущность и действие» для онлайн-обновлений.
 // stock: true — изменение затрагивает остатки, клиентам дополнительно уходит stock.updated.
@@ -84,6 +87,8 @@ const REALTIME_MAP: Record<EventType, { entity: RealtimeEntity; action: string; 
   task_handoff_rejected: { entity: "task", action: "updated" },
   order_control_passed: { entity: "order", action: "updated" },
   order_correction_required: { entity: "order", action: "updated" },
+  order_ready_for_driver: { entity: "order", action: "updated" },
+  order_issued: { entity: "order", action: "updated", stock: true },
 };
 
 export async function logEvent(args: {

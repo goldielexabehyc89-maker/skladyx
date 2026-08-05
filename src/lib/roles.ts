@@ -73,6 +73,12 @@ export function externalOrderPickingEnabled(): boolean {
 export function orderControlEnabled(): boolean {
   return process.env.ORDER_CONTROL_ENABLED === "true";
 }
+// Этап 5/Пакет 8: размещение проверенного заказа в ячейки выдачи (ISSUE) и выдача водителю. false —
+// после CONTROL_PASSED заказ остаётся в этом статусе (Пакет 7 заканчивается на контроле); действия
+// размещения/выдачи запрещены. true — авто-резерв ячейки выдачи, задачи размещения и выдачи.
+export function orderIssueEnabled(): boolean {
+  return process.env.ORDER_ISSUE_ENABLED === "true";
+}
 
 // Эффективный набор ролей.
 // При TENANT_AUTH=true роли всегда берутся из session.roles (их наполняет свежая

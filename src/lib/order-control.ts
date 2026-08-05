@@ -5,6 +5,8 @@ import { parseScannedCode } from "@/lib/qr";
 import { logEvent } from "@/lib/events";
 import { applyLotMovement, type Loc } from "@/lib/stock";
 import { lockCell } from "@/lib/cells";
+import { orderIssueEnabled } from "@/lib/roles";
+import { assignIssueCellInTx } from "@/lib/order-issue";
 import { TASK_TYPES } from "@/lib/workflow-task-types";
 import {
   lockCompany,
@@ -278,7 +280,7 @@ export async function finishOrderControl(input: {
     if (!check) throw new OrderControlError("Сначала отсканируйте QR заказа");
     // идемпотентность: проверка уже завершена → тот же результат без второго перехода
     if (check.status !== "IN_PROGRESS") {
-      return { status: check.status as "PASSED" | "FAILED", alreadyFinished: true, order, task, unblocked: [] as { id: string; title: string; warehouseId: string }[], correctTask: null as TaskCreateResult | null };
+      return { status: check.status as "PASSED" | "FAILED", alreadyFinished: true, order, task, unblocked: [] as { id: string; title: string; warehouseId: string }[], correctTask: null as TaskCreateResult | null, issueTask: null as TaskCreateResult | null };
     }
     if (task.status !== "IN_PROGRESS") throw new OrderControlError("Задача контроля не в работе");
     const unmarked = await tx.controlCheckLine.count({ where: { checkId: check.id, lineId: { not: null }, countedQty: null } });
@@ -288,7 +290,10 @@ export async function finishOrderControl(input: {
       await tx.controlCheck.update({ where: { id: check.id }, data: { status: "PASSED", finishedAt: new Date() } });
       await tx.externalOrder.update({ where: { id: order.id }, data: { status: "CONTROL_PASSED" } });
       const unblocked = await completeWorkflowTaskInTransaction(tx, task.id);
-      return { status: "PASSED" as const, alreadyFinished: false, order, task, unblocked, correctTask: null as TaskCreateResult | null };
+      // Пакет 8: при включённом флаге — авто-резерв ячейки выдачи (MOVING_TO_ISSUE + задача) или
+      // AWAITING_ISSUE_CELL, если свободной ячейки нет. Флаг OFF → заказ остаётся CONTROL_PASSED.
+      const issueTask = orderIssueEnabled() ? await assignIssueCellInTx(tx, input.companyId, order) : null;
+      return { status: "PASSED" as const, alreadyFinished: false, order, task, unblocked, correctTask: null as TaskCreateResult | null, issueTask };
     }
     await tx.controlCheck.update({ where: { id: check.id }, data: { status: "FAILED", finishedAt: new Date() } });
     await tx.externalOrder.update({ where: { id: order.id }, data: { status: "CORRECTION_REQUIRED" } });
@@ -296,12 +301,13 @@ export async function finishOrderControl(input: {
     await tx.controlCheckLine.updateMany({ where: { checkId: check.id, discrepancyType: { not: null } }, data: { resolutionStatus: "PENDING" } });
     const unblocked = await completeWorkflowTaskInTransaction(tx, task.id);
     const correctTask = await createCorrectTaskInTx(tx, { companyId: input.companyId, order, checkId: check.id });
-    return { status: "FAILED" as const, alreadyFinished: false, order, task, unblocked, correctTask };
+    return { status: "FAILED" as const, alreadyFinished: false, order, task, unblocked, correctTask, issueTask: null as TaskCreateResult | null };
   });
 
   if (!out.alreadyFinished) {
     await emitTaskCompleted({ companyId: input.companyId, warehouseId: out.order.warehouseId, title: out.task.title, taskId: out.task.id, unblocked: out.unblocked });
     if (out.correctTask) await emitTaskCreated(out.correctTask);
+    if (out.issueTask) await emitTaskCreated(out.issueTask);
     await logEvent({
       companyId: input.companyId,
       type: out.status === "PASSED" ? "order_control_passed" : "order_correction_required",

@@ -1092,7 +1092,11 @@ enum ExternalOrderStatus {
   PICKING // сборщик взял задачу
   IN_CONTROL // сборка завершена, товар в зоне CONTROL (ожидает/проходит контроль — Пакет 7)
   CORRECTION_REQUIRED // контроль нашёл расхождения — создана срочная задача исправления (Пакет 7)
-  CONTROL_PASSED // контроль пройден без расхождений (терминально до выдачи — Пакет 8) (Пакет 7)
+  CONTROL_PASSED // контроль пройден без расхождений; при флаге выдачи — маршрут в выдачу (Пакет 7/8)
+  AWAITING_ISSUE_CELL // нет свободной ячейки выдачи; товар в CONTROL, задача не создаётся (Пакет 8)
+  MOVING_TO_ISSUE // ячейка выдачи зарезервирована, погрузчик перемещает CONTROL → ISSUE (Пакет 8)
+  READY_FOR_DRIVER // размещён в ячейках выдачи, ждёт водителя (Пакет 8)
+  ISSUED // передан водителю, ячейки освобождены (Пакет 8)
   BLOCKED // полное покрытие, но нет безопасной цепочки перестановки/места — без невыполнимой задачи
 }
 
@@ -1120,6 +1124,8 @@ model ExternalOrder {
   lines        ExternalOrderLine[]
   reservations StockReservation[]
   checks       ControlCheck[]
+  issueCells   OrderIssueCell[]
+  shipment     OrderShipment?
 
   @@unique([companyId, externalId]) // идемпотентность импорта (дизайн §3)
   @@index([companyId, status])
@@ -1251,4 +1257,64 @@ model ControlCheckLine {
 
   @@unique([checkId, lineId]) // одна строка проверки на строку заказа (NULL — лишние товары допускаются)
   @@index([checkId])
+}
+
+// Этап 5/Пакет 8: размещение проверенного заказа в ячейки выдачи (зона ISSUE) и выдача водителю.
+// ExternalOrder остаётся единственным владельцем состояния заказа. Один заказ — одна/несколько
+// ячеек выдачи; одна активная ячейка выдачи принадлежит только одному заказу (partial unique).
+enum OrderIssueCellStatus {
+  RESERVED // ячейка забронирована под заказ, товар ещё не перемещён
+  PLACED // товар заказа размещён в ячейке
+  RELEASED // ячейка освобождена (после выдачи водителю)
+}
+
+model OrderIssueCell {
+  id          String               @id @default(cuid())
+  companyId   String
+  orderId     String
+  warehouseId String
+  cellId      String
+  status      OrderIssueCellStatus @default(RESERVED)
+  reservedAt  DateTime             @default(now())
+  placedAt    DateTime?
+  releasedAt  DateTime?
+
+  order      ExternalOrder         @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  placements OrderIssuePlacement[]
+
+  @@index([companyId, status])
+  @@index([orderId])
+  @@index([cellId])
+  // partial unique (cellId) WHERE status <> 'RELEASED' — руками в migration.sql: одна активная
+  // ячейка выдачи — только под один заказ.
+}
+
+model OrderIssuePlacement {
+  id          String   @id @default(cuid())
+  companyId   String
+  issueCellId String
+  orderId     String
+  lotId       String
+  itemId      String
+  qty         Decimal  @db.Decimal(14, 3)
+  createdAt   DateTime @default(now())
+
+  issueCell OrderIssueCell @relation(fields: [issueCellId], references: [id], onDelete: Cascade)
+
+  @@unique([orderId, lotId]) // партия размещается один раз (идемпотентность размещения)
+  @@index([issueCellId])
+}
+
+model OrderShipment {
+  id          String   @id @default(cuid())
+  companyId   String
+  orderId     String   @unique // одна выдача на заказ (идемпотентность передачи водителю)
+  warehouseId String
+  issuedById  String
+  issuedAt    DateTime @default(now())
+  createdAt   DateTime @default(now())
+
+  order ExternalOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([companyId])
 }
