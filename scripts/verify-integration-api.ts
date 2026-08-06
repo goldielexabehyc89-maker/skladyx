@@ -61,6 +61,10 @@ const EAN_B = ean13("460000100002");
 const EAN_C = ean13("460000100003");
 const EAN_UNKNOWN = ean13("460000100099");
 const EAN_BAD = "4600001000015"; // неверная контрольная цифра
+const EAN_CONC = ean13("460000100077"); // для конкурентного upsert
+// Вторая реальная тестовая организация (для проверки привязки токена к slug).
+const SLUG2 = process.env.INTEGRATION_TEST_SLUG2 || "acme10test";
+const FOREIGN_HOST = HOST.replace(SLUG, SLUG2); // тот же контур (префикс сохраняется), другой slug
 
 // SAFE-режим (staging): НЕ трогаем существующие склады (в т.ч. «Тестовый») — используем единственный
 // активный как есть, не создаём/не выключаем его, пропускаем деструктивную под-проверку «0 складов».
@@ -84,6 +88,24 @@ async function setup() {
   WT = (await prisma.warehouse.create({ data: { companyId, name: `${P}WH`, isActive: true } })).id;
 }
 
+// Вторая реальная тестовая организация — для проверки привязки токена к slug (создаётся и в SAFE).
+async function ensureCompany2(): Promise<string> {
+  const c = await prisma.company.upsert({ where: { slug: SLUG2 }, update: {}, create: { name: `${P}Org2`, slug: SLUG2, settings: {} } });
+  return c.id;
+}
+async function dropCompany2() {
+  const c = await prisma.company.findUnique({ where: { slug: SLUG2 } });
+  if (!c) return;
+  const items = await prisma.item.findMany({ where: { companyId: c.id }, select: { id: true } });
+  const ids = items.map((i) => i.id);
+  if (ids.length) {
+    await prisma.itemBarcode.deleteMany({ where: { itemId: { in: ids } } });
+    await prisma.item.deleteMany({ where: { id: { in: ids } } });
+  }
+  await prisma.uom.deleteMany({ where: { companyId: c.id } });
+  await prisma.company.delete({ where: { id: c.id } });
+}
+
 async function cleanup() {
   // заказы теста
   const orders = await prisma.externalOrder.findMany({ where: { companyId, externalId: { startsWith: P } }, select: { id: true } });
@@ -103,6 +125,7 @@ async function cleanup() {
   // тестовые склады + восстановление ранее активных
   await prisma.warehouse.deleteMany({ where: { companyId, name: { startsWith: P } } });
   if (deactivated.length) await prisma.warehouse.updateMany({ where: { id: { in: deactivated } }, data: { isActive: true } });
+  await dropCompany2();
 }
 
 async function main() {
@@ -218,6 +241,36 @@ async function main() {
     ok("неизвестный host → 404", r.status === 404, JSON.stringify(r.json));
     const foreignAfter = await prisma.item.count({ where: { externalId: `${P}FOREIGN` } });
     ok("ничего не записано ни в одну организацию", foreignBefore === 0 && foreignAfter === 0);
+  }
+
+  console.log("14) привязка токена к организации: верный токен + host ДРУГОЙ реальной организации → отказ");
+  {
+    const c2 = await ensureCompany2();
+    const before = await prisma.item.count({ where: { companyId: c2 } });
+    const r = await post("/api/integration/v1/items", { items: [{ externalId: `${P}X2`, name: "Чужая орг", ean: ean13("460000100088") }] }, { host: FOREIGN_HOST });
+    ok("host другой организации (slug ≠ INTEGRATION_API_ORG_SLUG) → 404", r.status === 404, JSON.stringify(r.json));
+    const after = await prisma.item.count({ where: { companyId: c2 } });
+    ok("во второй организации данные НЕ созданы", before === 0 && after === 0);
+  }
+
+  console.log("15) некорректный arrivalAt → 400 без создания заказа (без 500)");
+  {
+    const r = await post("/api/integration/v1/orders", { externalId: `${P}ORDBAD`, arrivalAt: "не-дата", lines: [{ externalLineId: "L1", ean: EAN_A, quantity: 1 }] });
+    ok("400", r.status === 400, JSON.stringify(r.json));
+    ok("заказ не создан", (await prisma.externalOrder.count({ where: { companyId, externalId: `${P}ORDBAD` } })) === 0);
+  }
+
+  console.log("16) конкурентный upsert одинаковых товаров → один Item/EAN, без 409/500");
+  {
+    const body = { items: [{ externalId: `${P}CONC`, name: "Конкурент", ean: EAN_CONC }] };
+    const [r1, r2] = await Promise.all([
+      post("/api/integration/v1/items", body),
+      post("/api/integration/v1/items", body),
+    ]);
+    ok("оба ответа 200", r1.status === 200 && r2.status === 200, `r1=${r1.status} r2=${r2.status}`);
+    ok("нет 409/500", ![r1.status, r2.status].some((s) => s === 409 || s >= 500));
+    ok("ровно один Item", (await prisma.item.count({ where: { companyId, externalId: `${P}CONC` } })) === 1);
+    ok("ровно один ItemBarcode", (await prisma.itemBarcode.count({ where: { companyId, code: EAN_CONC } })) === 1);
   }
 }
 

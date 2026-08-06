@@ -36,6 +36,7 @@ jobs:
       SEED_ADMIN_EMAIL: "ci@skladyx.ru"
       SEED_ADMIN_PASSWORD: "ci-admin-pass-01"
       INTEGRATION_API_TOKEN: "ci-integration-token-2f9c1a7b5e"
+      INTEGRATION_API_ORG_SLUG: "rostagro"
       VERIFY_HOST: "rostagro.skladyx.ru"
 
     steps:
@@ -71,6 +72,7 @@ jobs:
           WORKFLOW_TASKS_ENABLED=true EXTERNAL_ORDER_PICKING_ENABLED=true $V scripts/verify-external-orders.ts
           WORKFLOW_TASKS_ENABLED=true EXTERNAL_ORDER_PICKING_ENABLED=true $V scripts/verify-order-control.ts
           WORKFLOW_TASKS_ENABLED=true EXTERNAL_ORDER_PICKING_ENABLED=true $V scripts/verify-order-issue.ts
+          $V scripts/verify-launch-readiness.ts
 
       - name: Build
         run: npm run build
@@ -79,7 +81,7 @@ jobs:
       - name: Phase A — http/stock/workflow-tasks + integration API
         run: |
           TENANT_AUTH=false WAREHOUSE_ZONES_ENABLED=false WORKFLOW_TASKS_ENABLED=true \
-            INTEGRATION_API_ENABLED=true INTEGRATION_API_TOKEN="$INTEGRATION_API_TOKEN" \
+            INTEGRATION_API_ENABLED=true INTEGRATION_API_TOKEN="$INTEGRATION_API_TOKEN" INTEGRATION_API_ORG_SLUG=rostagro \
             node_modules/.bin/next start -p 3000 >/tmp/srvA.log 2>&1 &
           SRV=$!
           for i in $(seq 1 40); do

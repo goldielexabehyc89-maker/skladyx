@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { integrationApiEnabled } from "@/lib/roles";
 import { resolveHostCompany } from "@/lib/tenant-auth";
-import { bearerTokenValid, upsertApiItems, IntegrationError } from "@/lib/integration";
+import { bearerTokenValid, integrationOrgSlugMatches, upsertApiItems, IntegrationError } from "@/lib/integration";
 
 // Этап 5/Пакет 10: POST /api/integration/v1/items — идемпотентный upsert номенклатуры из интеграции.
 // Организация — по host; companyId из payload не принимается. Токен — Bearer, безопасное сравнение.
@@ -14,6 +14,8 @@ export async function POST(req: Request) {
 
   const { company, error } = await resolveHostCompany();
   if (!company) return NextResponse.json({ error: error ?? "Организация не определена по host" }, { status: 404 });
+  // Токен привязан к организации: работаем только с разрешённым slug (иначе — 404, существование скрыто).
+  if (!integrationOrgSlugMatches(company.slug)) return NextResponse.json({ error: "NOT_FOUND" }, { status: 404 });
 
   let body: unknown;
   try {

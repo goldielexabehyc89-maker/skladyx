@@ -4,6 +4,7 @@ import { prisma } from "@/lib/db";
 import { parseEan } from "@/lib/ean";
 import { findItemByEan } from "@/lib/barcodes";
 import { importExternalOrder, ExternalOrderError } from "@/lib/external-orders";
+import { lockCompany } from "@/lib/workflow-tasks";
 
 // Этап 5/Пакет 10: нейтральный API интеграции. Формат конкретной 1С НЕ зашивается — это общий
 // контракт (наименование + заводской EAN для товаров; externalId/EAN/quantity для заказов).
@@ -28,6 +29,15 @@ export function bearerTokenValid(authHeader: string | null): boolean {
   const b = Buffer.from(expected);
   if (a.length !== b.length) return false;
   return crypto.timingSafeEqual(a, b);
+}
+
+// Пакет 10 (коррекция): токен привязан к организации. Организацию определяет host, но API разрешён
+// ТОЛЬКО если slug этой организации совпадает с INTEGRATION_API_ORG_SLUG. Пустой slug при включённом
+// API → доступ закрыт. Значит токен РостАгро не сработает на host другого существующего tenant'а.
+export function integrationOrgSlugMatches(slug: string): boolean {
+  const allowed = (process.env.INTEGRATION_API_ORG_SLUG || "").trim();
+  if (!allowed) return false;
+  return allowed === slug;
 }
 
 // ── Номенклатура: идемпотентный upsert по [companyId, externalId] ──
@@ -64,6 +74,9 @@ export async function upsertApiItems(
   let created = 0;
   let updated = 0;
   await prisma.$transaction(async (tx) => {
+    // Пакет 10 (коррекция): advisory-лок компании в начале транзакции — сериализует конкурентные
+    // выгрузки одного tenant'а (одинаковые запросы не дают дубль item/EAN и не падают в 409/500).
+    await lockCompany(tx, companyId);
     // Единица «шт» — get-or-create (пользователю/интеграции выбор не даём); tracking всегда LOT.
     const uom = await tx.uom.upsert({
       where: { companyId_name: { companyId, name: "шт" } },
@@ -105,7 +118,15 @@ export async function importApiOrder(companyId: string, raw: unknown): Promise<{
   const o = (raw ?? {}) as Record<string, unknown>;
   const externalId = typeof o.externalId === "string" ? o.externalId.trim() : "";
   if (!externalId) throw new IntegrationError("externalId обязателен", 400);
-  const arrivalAt = typeof o.arrivalAt === "string" && o.arrivalAt.trim() ? o.arrivalAt.trim() : null;
+  // Пакет 10 (коррекция): arrivalAt валидируем ДО importExternalOrder — только корректный ISO-8601,
+  // иначе new Date(...).toISOString() внутри импорта бросил бы неконтролируемый 500.
+  let arrivalAt: string | null = null;
+  if (o.arrivalAt != null && o.arrivalAt !== "") {
+    if (typeof o.arrivalAt !== "string") throw new IntegrationError("arrivalAt должен быть строкой ISO-8601", 400);
+    const d = new Date(o.arrivalAt);
+    if (Number.isNaN(d.getTime())) throw new IntegrationError("arrivalAt: некорректная дата (нужен формат ISO-8601)", 400);
+    arrivalAt = o.arrivalAt;
+  }
   if (!Array.isArray(o.lines) || o.lines.length === 0) throw new IntegrationError("lines обязательны и не пусты", 400);
 
   // Единственный активный склад организации (иначе — понятная ошибка конфигурации).

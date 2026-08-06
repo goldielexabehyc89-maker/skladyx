@@ -1,7 +1,6 @@
 import Link from "next/link";
 import { requireAdminPage } from "@/lib/auth";
 import { scoped } from "@/lib/tenant";
-import { prisma } from "@/lib/db";
 import { getSettings } from "@/lib/settings";
 import {
   legacyWarehouseUiEnabled,
@@ -13,6 +12,7 @@ import {
   integrationApiEnabled,
 } from "@/lib/roles";
 import { updateCompanySettingsAction, updateWarehouseRateAction } from "@/app/actions/settings";
+import { getLaunchReadiness } from "@/lib/launch-readiness";
 import { ActionForm } from "@/components/action-form";
 import { Card, CardTitle, Field, PageTitle, Badge } from "@/components/ui";
 
@@ -27,36 +27,10 @@ export default async function SettingsPage() {
   const settings = await getSettings(companyId);
   const legacyUi = legacyWarehouseUiEnabled();
 
-  const WORK_ROLES = ["RECEIVER", "LOADER", "PICKER", "CONTROLLER"] as const;
-
-  const [activeWarehouses, storageLevels, coolingCells, issueCells, bufferCells, itemsWithEan, roleRows] =
-    await Promise.all([
-      prisma.warehouse.findMany({ where: { companyId, isActive: true }, orderBy: { name: "asc" } }),
-      prisma.cell.groupBy({ by: ["level"], where: { companyId, isActive: true, zone: { kind: "STORAGE" } }, _count: true }),
-      prisma.cell.count({ where: { companyId, isActive: true, zone: { kind: "COOLING" } } }),
-      prisma.cell.count({ where: { companyId, isActive: true, zone: { kind: "ISSUE" } } }),
-      prisma.cell.count({ where: { companyId, isActive: true, zone: { kind: "BUFFER" } } }),
-      prisma.item.count({ where: { companyId, isActive: true, barcodes: { some: { isActive: true } } } }),
-      prisma.userRole.groupBy({ by: ["role"], where: { role: { in: [...WORK_ROLES] }, user: { companyId, isActive: true } }, _count: true }),
-    ]);
-
-  const singleWarehouse = activeWarehouses.length === 1 ? activeWarehouses[0] : null;
-  const hasLevel = (pred: (l: number) => boolean) => storageLevels.some((g) => g.level != null && pred(g.level));
-  const roleCount = (r: string) => roleRows.find((g) => g.role === r)?._count ?? 0;
-
-  const xFilled = settings.tempThresholdX !== null;
-  const rFilled = singleWarehouse?.coolingRate != null;
-
-  // ── Read-only чек-лист готовности ──
-  const checks: { label: string; ok: boolean; detail: string }[] = [
-    { label: "Ровно один активный склад", ok: activeWarehouses.length === 1, detail: `активных складов: ${activeWarehouses.length}` },
-    { label: "Порог температуры X задан", ok: xFilled, detail: xFilled ? `X = ${settings.tempThresholdX} °C` : "не задан" },
-    { label: "Скорость охлаждения R задана", ok: rFilled, detail: singleWarehouse ? (rFilled ? `R = ${singleWarehouse.coolingRate} °C/час` : "не задана") : "нужен один склад" },
-    { label: "STORAGE-ячейки уровней 1, 2 и 3+", ok: hasLevel((l) => l === 1) && hasLevel((l) => l === 2) && hasLevel((l) => l >= 3), detail: `ур.1: ${hasLevel((l) => l === 1) ? "есть" : "нет"}, ур.2: ${hasLevel((l) => l === 2) ? "есть" : "нет"}, ур.3+: ${hasLevel((l) => l >= 3) ? "есть" : "нет"}` },
-    { label: "Физические ячейки COOLING, ISSUE, BUFFER", ok: coolingCells > 0 && issueCells > 0 && bufferCells > 0, detail: `COOLING: ${coolingCells}, ISSUE: ${issueCells}, BUFFER: ${bufferCells}` },
-    { label: "Активная номенклатура с активными EAN", ok: itemsWithEan > 0, detail: `товаров с EAN: ${itemsWithEan}` },
-    ...WORK_ROLES.map((r) => ({ label: `Сотрудник с ролью ${r}`, ok: roleCount(r) > 0, detail: `${roleCount(r)} чел.` })),
-  ];
+  // Пакет 10 (коррекция): готовность считается строго по единственному активному складу.
+  const readiness = await getLaunchReadiness(companyId, settings.tempThresholdX);
+  const singleWarehouse = readiness.singleWarehouse;
+  const checks = readiness.checks;
 
   const businessFlags: { label: string; on: boolean }[] = [
     { label: "Групповая приёмка (GROUP_RECEIVING)", on: groupReceivingEnabled() },
