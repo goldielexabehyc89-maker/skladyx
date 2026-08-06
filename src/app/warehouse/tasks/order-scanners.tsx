@@ -5,21 +5,23 @@ import { useRouter } from "next/navigation";
 import { ScanLine } from "lucide-react";
 import { pickScanAction, completeMoveGroupAction } from "@/app/actions/external-orders";
 import { Button, Badge } from "@/components/ui";
-import { WorkflowSheet } from "@/components/workflow-sheet";
+import { WorkflowSheet, type ScanFormat } from "@/components/workflow-sheet";
 import type { PickOrderCtx, MoveGroupCtx } from "./tasks-screen";
 
-// Этап 5/Пакет 6 (коррекция): НАСТОЯЩЕЕ сканирование через штатный QrScanner/WorkflowSheet.
-// PICK_ORDER: QR ячейки → QR группы/партии → количество. MOVE_GROUP: QR группы → QR целевой ячейки.
-// Серверная сверка (ячейка/группа/товар/резерв ↔ заказ/задача) — в actions/external-orders.
+// Этап 5/Пакет 9B: товар сканируется по заводскому EAN, группа/партия выводится сервером из контекста
+// (задача/заказ/ячейка/резервы). PICK_ORDER: ячейка → EAN товара → количество. MOVE_GROUP: исходная
+// ячейка → EAN товара → целевая ячейка. Форматы сканера переключаются по шагу.
+const CELL: ScanFormat[] = ["qr_code", "code_128"];
+const PRODUCT: ScanFormat[] = ["ean_8", "ean_13"];
 
 // ── Сборка заказа ──
 export function PickOrderScanner({ ctx, taskId }: { ctx: PickOrderCtx; taskId: string }) {
   const router = useRouter();
   const [open, setOpen] = useState(false);
   const [scanning, setScanning] = useState(false);
-  const [step, setStep] = useState<"cell" | "group" | "qty">("cell");
+  const [step, setStep] = useState<"cell" | "product" | "qty">("cell");
   const [cellRaw, setCellRaw] = useState("");
-  const [groupRaw, setGroupRaw] = useState("");
+  const [eanRaw, setEanRaw] = useState("");
   const [qty, setQty] = useState("");
   const [busy, startTransition] = useTransition();
   const [error, setError] = useState<string | null>(null);
@@ -29,13 +31,13 @@ export function PickOrderScanner({ ctx, taskId }: { ctx: PickOrderCtx; taskId: s
   const pickedLines = ctx.lines.filter((l) => Number(l.picked) >= Number(l.required)).length;
   const pct = ctx.lines.length ? Math.round((pickedLines / ctx.lines.length) * 100) : 0;
 
-  function reset() { setStep("cell"); setCellRaw(""); setGroupRaw(""); setQty(""); setNotice(null); }
+  function reset() { setStep("cell"); setCellRaw(""); setEanRaw(""); setQty(""); setNotice(null); }
   function closeAll() { setOpen(false); setScanning(false); reset(); setError(null); setFinished(false); router.refresh(); }
 
   function handleScan(raw: string) {
     if (busy) return;
-    if (step === "cell") { setCellRaw(raw); setStep("group"); setNotice("Ячейка отсканирована — сканируйте QR группы"); return; }
-    if (step === "group") { setGroupRaw(raw); setScanning(false); setStep("qty"); setNotice("Группа отсканирована — введите количество"); return; }
+    if (step === "cell") { setCellRaw(raw); setStep("product"); setNotice("Ячейка отсканирована — сканируйте EAN товара"); return; }
+    if (step === "product") { setEanRaw(raw); setScanning(false); setStep("qty"); setNotice("Товар отсканирован — введите количество"); return; }
   }
 
   function submitQty() {
@@ -43,7 +45,7 @@ export function PickOrderScanner({ ctx, taskId }: { ctx: PickOrderCtx; taskId: s
     if (!Number.isFinite(n) || n <= 0) { setError("Укажите количество"); return; }
     startTransition(async () => {
       const fd = new FormData();
-      fd.set("taskId", taskId); fd.set("cellCode", cellRaw); fd.set("groupCode", groupRaw); fd.set("qty", String(n));
+      fd.set("taskId", taskId); fd.set("cellCode", cellRaw); fd.set("ean", eanRaw); fd.set("qty", String(n));
       const res = await pickScanAction({}, fd);
       if (res.error) { setError(res.error); return; }
       if (res.status === "IN_CONTROL") { setFinished(true); return; }
@@ -64,7 +66,8 @@ export function PickOrderScanner({ ctx, taskId }: { ctx: PickOrderCtx; taskId: s
       subtitle={`Строк собрано ${pickedLines} из ${ctx.lines.length}`}
       progressPct={pct}
       scanning={scanning}
-      scanHint={step === "cell" ? "Сканируйте QR ячейки (уровень 1-2)" : "Сканируйте QR группы/партии"}
+      scanHint={step === "cell" ? "Сканируйте ячейку (QR/Code 128, уровень 1-2)" : "Сканируйте EAN товара"}
+      scanFormats={step === "cell" ? CELL : PRODUCT}
       onScan={handleScan}
       scanPaused={busy}
       busy={busy}
@@ -106,6 +109,7 @@ export function PickOrderScanner({ ctx, taskId }: { ctx: PickOrderCtx; taskId: s
           ))}
         </>
       )}
+      <div className="pt-1 text-xs text-neutral-400">Без камеры: коды ниже, в списке задач — ручной ввод.</div>
     </WorkflowSheet>
   );
 }
@@ -115,22 +119,25 @@ export function MoveGroupScanner({ ctx }: { ctx: MoveGroupCtx }) {
   const router = useRouter();
   const [open, setOpen] = useState(false);
   const [scanning, setScanning] = useState(false);
-  const [step, setStep] = useState<"group" | "cell">("group");
-  const [groupRaw, setGroupRaw] = useState("");
+  const [step, setStep] = useState<"from" | "product" | "to">("from");
+  const [fromRaw, setFromRaw] = useState("");
+  const [eanRaw, setEanRaw] = useState("");
   const [busy, startTransition] = useTransition();
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [finished, setFinished] = useState(false);
 
-  function closeAll() { setOpen(false); setScanning(false); setStep("group"); setGroupRaw(""); setNotice(null); setError(null); setFinished(false); router.refresh(); }
+  function reset() { setStep("from"); setFromRaw(""); setEanRaw(""); setNotice(null); }
+  function closeAll() { setOpen(false); setScanning(false); reset(); setError(null); setFinished(false); router.refresh(); }
 
   function handleScan(raw: string) {
     if (busy) return;
-    if (step === "group") { setGroupRaw(raw); setStep("cell"); setNotice("Группа отсканирована — сканируйте QR целевой ячейки"); return; }
-    // step === "cell": финализируем перестановку
+    if (step === "from") { setFromRaw(raw); setStep("product"); setNotice("Исходная ячейка — сканируйте EAN товара"); return; }
+    if (step === "product") { setEanRaw(raw); setStep("to"); setNotice("Товар отсканирован — сканируйте целевую ячейку"); return; }
+    // step === "to": финализируем перестановку
     startTransition(async () => {
       const fd = new FormData();
-      fd.set("taskId", ctx.taskId); fd.set("groupCode", groupRaw); fd.set("cellCode", raw);
+      fd.set("taskId", ctx.taskId); fd.set("fromCellCode", fromRaw); fd.set("ean", eanRaw); fd.set("cellCode", raw);
       const res = await completeMoveGroupAction({}, fd);
       if (res.error) { setError(res.error); return; }
       setScanning(false); setFinished(true);
@@ -149,7 +156,8 @@ export function MoveGroupScanner({ ctx }: { ctx: MoveGroupCtx }) {
       title="Перестановка группы"
       subtitle={`${ctx.item} · ${ctx.qty} шт`}
       scanning={scanning}
-      scanHint={step === "group" ? "Сканируйте QR перемещаемой группы" : "Сканируйте QR целевой ячейки"}
+      scanHint={step === "from" ? "Сканируйте исходную ячейку" : step === "product" ? "Сканируйте EAN товара" : "Сканируйте целевую ячейку"}
+      scanFormats={step === "product" ? PRODUCT : CELL}
       onScan={handleScan}
       scanPaused={busy}
       busy={busy}
@@ -157,11 +165,11 @@ export function MoveGroupScanner({ ctx }: { ctx: MoveGroupCtx }) {
       onClose={closeAll}
       error={error}
       onErrorRetry={() => setError(null)}
-      onErrorExit={() => { setError(null); setScanning(false); setStep("group"); setGroupRaw(""); }}
+      onErrorExit={() => { setError(null); setScanning(false); reset(); }}
       modal={finished ? { title: "Группа переставлена", body: `→ ячейка ${ctx.toCell}`, actions: (<Button type="button" variant="primary" onClick={closeAll} className="w-full">Ок</Button>) } : null}
       footer={
-        <Button type="button" variant="primary" onClick={() => { setScanning(true); setStep("group"); setNotice(null); }} className="w-full">
-          <ScanLine size={18} /> Сканировать группу
+        <Button type="button" variant="primary" onClick={() => { setScanning(true); reset(); }} className="w-full">
+          <ScanLine size={18} /> Сканировать исходную ячейку
         </Button>
       }
     >

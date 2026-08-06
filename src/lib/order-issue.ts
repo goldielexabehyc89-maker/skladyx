@@ -5,6 +5,7 @@ import { parseScannedCode } from "@/lib/qr";
 import { logEvent } from "@/lib/events";
 import { applyLotMovement } from "@/lib/stock";
 import { lockCell } from "@/lib/cells";
+import { eanItemIdInTx } from "@/lib/barcodes";
 import { TASK_TYPES } from "@/lib/workflow-task-types";
 import {
   lockCompany,
@@ -88,6 +89,16 @@ async function reserveFreeIssueCell(tx: Tx, companyId: string, warehouseId: stri
   return null;
 }
 
+// Пакет 9B: партии заданного товара, собранные заказом (FULFILLED-резервы), в детерминированном
+// порядке (старейшая Lot.createdAt первой). Товар определяется EAN; конкретная партия — из резервов.
+async function orderFulfilledLotsForItem(tx: Tx, orderId: string, itemId: string): Promise<string[]> {
+  const resvs = await tx.stockReservation.findMany({ where: { orderId, status: "FULFILLED" }, select: { lotId: true }, distinct: ["lotId"] });
+  const lotIds = resvs.map((r) => r.lotId).filter((l): l is string => !!l);
+  if (lotIds.length === 0) return [];
+  const lots = await tx.lot.findMany({ where: { id: { in: lotIds }, itemId }, select: { id: true }, orderBy: [{ createdAt: "asc" }, { id: "asc" }] });
+  return lots.map((l) => l.id);
+}
+
 // Количество, собранное ЭТИМ заказом из партии (FULFILLED-резервы order+lot). Пакет 6 допускает
 // несколько заказов на одну партию, поэтому берём долю ЗАКАЗА, а не весь остаток общей зоны CONTROL.
 async function orderLotPickedQty(tx: Tx, orderId: string, lotId: string): Promise<Prisma.Decimal> {
@@ -158,7 +169,7 @@ async function requireIssueTask(tx: Tx, companyId: string, taskId: string, userI
 // ── Размещение: скан QR заказа + зарезервированной ячейки ISSUE + группы/партии. Перемещает всю
 // CONTROL-часть партии в ячейку через ядро. Идемпотентно по (order, lot). ──
 export async function placeOrderGroup(input: {
-  companyId: string; userId: string; taskId: string; orderCode: string; cellCode: string; groupCode: string;
+  companyId: string; userId: string; taskId: string; orderCode: string; cellCode: string; ean: string;
 }): Promise<{ placed: boolean; alreadyPlaced: boolean }> {
   return prisma.$transaction(async (tx) => {
     await lockCompany(tx, input.companyId);
@@ -168,27 +179,31 @@ export async function placeOrderGroup(input: {
     const cellId = await resolveScannedCell(tx, input.companyId, order.warehouseId, input.cellCode);
     const ic = await tx.orderIssueCell.findFirst({ where: { orderId: order.id, cellId, status: { not: "RELEASED" } } });
     if (!ic) throw new OrderIssueError("Эта ячейка не зарезервирована под заказ (сначала «Добавить ячейку»)");
-    const scanned = await resolveScannedGroup(tx, input.companyId, input.groupCode);
-    if (scanned.warehouseId !== order.warehouseId) throw new OrderIssueError("Группа не на складе этого заказа");
-    // количество ИМЕННО этого заказа из партии (Пакет 6: несколько заказов на одну партию); заодно
-    // связь с заказом — при отсутствии FULFILLED-резерва order+lot доля = 0.
-    const qty = await orderLotPickedQty(tx, order.id, scanned.lotId);
+    // Пакет 9B: товар по EAN. Сервер берёт ещё НЕ размещённую долю FULFILLED-резерва этого заказа для
+    // данного товара (детерминированно, старейшая партия). Всё уже размещено → идемпотентный успех.
+    const itemId = await eanItemIdInTx(tx, input.companyId, input.ean);
+    if (!itemId) throw new OrderIssueError("Неизвестный, неактивный или чужой EAN — размещение отклонено");
+    // партии этого товара, собранные заказом (FULFILLED), старейшая первой
+    const lotIds = await orderFulfilledLotsForItem(tx, order.id, itemId);
+    if (lotIds.length === 0) throw new OrderIssueError("Этот товар не собран для заказа");
+    const placed = await tx.orderIssuePlacement.findMany({ where: { orderId: order.id, lotId: { in: lotIds } }, select: { lotId: true } });
+    const placedSet = new Set(placed.map((p) => p.lotId));
+    const lotId = lotIds.find((l) => !placedSet.has(l));
+    if (!lotId) return { placed: true, alreadyPlaced: true }; // весь товар этого EAN уже размещён — идемпотентно
+    const qty = await orderLotPickedQty(tx, order.id, lotId);
     if (qty.lte(0)) throw new OrderIssueError("Эта партия не собрана для заказа");
-    // идемпотентность: партия уже размещена
-    const already = await tx.orderIssuePlacement.findFirst({ where: { orderId: order.id, lotId: scanned.lotId } });
-    if (already) return { placed: true, alreadyPlaced: true };
     await lockCell(tx, input.companyId, cellId);
     const zoneCtl = await controlZoneId(tx, input.companyId, order.warehouseId);
     // в общей зоне CONTROL должно быть не меньше доли ЗАКАЗА (чужие количества той же партии не трогаем)
-    const bal = await tx.stockBalance.aggregate({ where: { lotId: scanned.lotId, locKey: `Z:${zoneCtl}`, qty: { gt: 0 } }, _sum: { qty: true } });
+    const bal = await tx.stockBalance.aggregate({ where: { lotId, locKey: `Z:${zoneCtl}`, qty: { gt: 0 } }, _sum: { qty: true } });
     if (D(bal._sum.qty ?? 0).lt(qty)) throw new OrderIssueError("В зоне контроля недостаточно остатка партии для заказа");
     await applyLotMovement(tx, {
-      companyId: input.companyId, docType: "TRANSFER", docId: order.id, itemId: scanned.itemId, lotId: scanned.lotId, qty,
+      companyId: input.companyId, docType: "TRANSFER", docId: order.id, itemId, lotId, qty,
       from: { kind: "zone", warehouseId: order.warehouseId, zoneId: zoneCtl },
       to: { kind: "cell", warehouseId: order.warehouseId, cellId },
       createdById: input.userId,
     });
-    await tx.orderIssuePlacement.create({ data: { companyId: input.companyId, issueCellId: ic.id, orderId: order.id, lotId: scanned.lotId, itemId: scanned.itemId, qty } });
+    await tx.orderIssuePlacement.create({ data: { companyId: input.companyId, issueCellId: ic.id, orderId: order.id, lotId, itemId, qty } });
     if (ic.status === "RESERVED") await tx.orderIssueCell.update({ where: { id: ic.id }, data: { status: "PLACED", placedAt: new Date() } });
     return { placed: true, alreadyPlaced: false };
   });

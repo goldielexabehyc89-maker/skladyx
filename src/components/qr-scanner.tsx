@@ -25,9 +25,16 @@ export function QrScanner({
   const [error, setError] = useState<string | null>(null);
   const pausedRef = useRef(paused);
   const onScanRef = useRef(onScan);
-  const formatsRef = useRef(formats);
+  const detectorRef = useRef<BarcodeDetector | null>(null);
   pausedRef.current = paused;
   onScanRef.current = onScan;
+
+  // Пакет 9B: детектор ПЕРЕСОЗДаётся при смене набора форматов между шагами (ячейка → товар → заказ),
+  // иначе сканер продолжил бы искать старые форматы. Камера/поток при этом не перезапускаются.
+  const formatsKey = formats.join(",");
+  useEffect(() => {
+    detectorRef.current = new BarcodeDetector({ formats: formatsKey.split(",") as ScanFormat[] });
+  }, [formatsKey]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -36,13 +43,12 @@ export function QrScanner({
     let stopped = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
     const lastSeen = { value: "", at: 0 };
-    const detector = new BarcodeDetector({ formats: formatsRef.current });
 
     async function tick() {
       if (stopped) return;
-      if (!pausedRef.current && video && video.readyState >= 2) {
+      if (!pausedRef.current && video && video.readyState >= 2 && detectorRef.current) {
         try {
-          const codes = await detector.detect(video);
+          const codes = await detectorRef.current.detect(video);
           if (codes.length > 0) {
             const raw = codes[0].rawValue;
             const now = Date.now();

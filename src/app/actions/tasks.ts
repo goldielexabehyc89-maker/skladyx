@@ -11,10 +11,12 @@ import {
   rejectTaskHandoff,
   rebalanceQueuedTasks,
 } from "@/lib/workflow-tasks";
-import { completeCoolingRetrieval, CoolingError } from "@/lib/cooling";
+import { prepareCoolingRetrieval, placeCoolingRetrieval, CoolingError } from "@/lib/cooling";
 
 export interface TaskActionState {
   error?: string;
+  ready?: boolean;
+  targetCellCode?: string | null;
 }
 
 const DISABLED: TaskActionState = { error: "Очередь задач сейчас отключена" };
@@ -63,15 +65,38 @@ export async function rejectHandoffAction(_prev: TaskActionState, formData: Form
 }
 
 // Пакет 5: завершение срочной задачи «Забрать из охлаждения» — погрузчик вводит фактическую температуру.
-export async function completeCoolingRetrievalAction(_prev: TaskActionState, formData: FormData): Promise<TaskActionState> {
+export async function prepareCoolingRetrievalAction(_prev: TaskActionState, formData: FormData): Promise<TaskActionState> {
   if (!coolingWorkflowEnabled()) return { error: "Охлаждение сейчас отключено" };
   const session = await requireUser();
   const s = scoped(session);
   const taskId = String(formData.get("taskId") ?? "");
+  const fromCellCode = String(formData.get("fromCellCode") ?? "").trim();
+  const ean = String(formData.get("ean") ?? "").trim();
   const temperature = Number(String(formData.get("temperature") ?? "").trim().replace(",", "."));
+  if (!fromCellCode || !ean) return { error: "Отсканируйте ячейку охлаждения и EAN товара" };
   if (!Number.isFinite(temperature)) return { error: "Укажите фактическую температуру" };
   try {
-    await completeCoolingRetrieval({ companyId: s.companyId, userId: session.userId, taskId, temperature });
+    const r = await prepareCoolingRetrieval({ companyId: s.companyId, userId: session.userId, taskId, fromCellCode, ean, temperature });
+    revalidatePath("/warehouse/tasks");
+    return { ready: r.ready, targetCellCode: r.targetCellCode };
+  } catch (e) {
+    if (e instanceof CoolingError) return { error: e.message };
+    throw e;
+  }
+}
+
+// Пакет 9B, Фаза 2: скан назначенной целевой ячейки → физическое размещение (движение через ядро).
+export async function placeCoolingRetrievalAction(_prev: TaskActionState, formData: FormData): Promise<TaskActionState> {
+  if (!coolingWorkflowEnabled()) return { error: "Охлаждение сейчас отключено" };
+  const session = await requireUser();
+  const s = scoped(session);
+  const taskId = String(formData.get("taskId") ?? "");
+  const fromCellCode = String(formData.get("fromCellCode") ?? "").trim();
+  const ean = String(formData.get("ean") ?? "").trim();
+  const targetCellCode = String(formData.get("targetCellCode") ?? "").trim();
+  if (!fromCellCode || !ean || !targetCellCode) return { error: "Отсканируйте ячейку охлаждения, EAN и целевую ячейку" };
+  try {
+    await placeCoolingRetrieval({ companyId: s.companyId, userId: session.userId, taskId, fromCellCode, ean, targetCellCode });
   } catch (e) {
     if (e instanceof CoolingError) return { error: e.message };
     throw e;

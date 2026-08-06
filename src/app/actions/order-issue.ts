@@ -35,10 +35,10 @@ export async function placeGroupAction(_prev: IssueActionState, formData: FormDa
   const taskId = String(formData.get("taskId") ?? "").trim();
   const orderCode = String(formData.get("orderCode") ?? "").trim();
   const cellCode = String(formData.get("cellCode") ?? "").trim();
-  const groupCode = String(formData.get("groupCode") ?? "").trim();
-  if (!orderCode || !cellCode || !groupCode) return { error: "Отсканируйте QR заказа, ячейки и группы" };
+  const ean = String(formData.get("ean") ?? "").trim();
+  if (!orderCode || !cellCode || !ean) return { error: "Отсканируйте QR заказа, ячейку и EAN товара" };
   try {
-    await placeOrderGroup({ companyId: s.companyId, userId: session.userId, taskId, orderCode, cellCode, groupCode });
+    await placeOrderGroup({ companyId: s.companyId, userId: session.userId, taskId, orderCode, cellCode, ean });
     revalidatePath("/warehouse/tasks");
     return { ok: true };
   } catch (e) {

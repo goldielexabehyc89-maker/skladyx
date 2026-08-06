@@ -74,7 +74,7 @@ async function pickToControl(externalId: string, lines: { externalLineId: string
   for (let i = 0; i < 50; i++) {
     const r = await prisma.stockReservation.findFirst({ where: { orderId: imp.orderId, status: "ACTIVE" } });
     if (!r) break;
-    await pickOrderScan({ companyId, userId: picker, taskId: t.id, cellCode: await cellCode(r.cellId!), groupCode: await groupCode(r.handlingGroupId!), qty: r.qty.toNumber() });
+    await pickOrderScan({ companyId, userId: picker, taskId: t.id, cellCode: await cellCode(r.cellId!), ean: await groupEan(r.handlingGroupId!), qty: r.qty.toNumber() });
   }
   return imp.orderId;
 }
@@ -93,9 +93,16 @@ const orderLines = (orderId: string) => prisma.externalOrderLine.findMany({ wher
 // код группы, зарезервированной заказом под строку (её сканирует контролёр/сборщик)
 const ctlGroupCode = async (orderId: string, lineId: string) =>
   groupCode((await prisma.stockReservation.findFirstOrThrow({ where: { orderId, lineId }, select: { handlingGroupId: true } })).handlingGroupId!);
+// Пакет 9B: EAN товара
+const itemEan = new Map<string, string>();
+const eanOf = (itemId: string) => itemEan.get(itemId)!;
+const lineEan = async (orderId: string, lineId: string) => eanOf((await prisma.externalOrderLine.findFirstOrThrow({ where: { id: lineId, orderId } })).itemId);
+const groupEan = async (gid: string) => eanOf((await prisma.handlingGroup.findFirstOrThrow({ where: { id: gid } })).itemId);
+function ean13(b12: string): string { let s = 0; for (let i = b12.length - 1, k = 0; i >= 0; i--, k++) s += Number(b12[i]) * (k % 2 === 0 ? 3 : 1); return b12 + String((10 - (s % 10)) % 10); }
+async function seedEan(itemId: string, b12: string) { const code = ean13(b12); await prisma.itemBarcode.create({ data: { companyId, itemId, code, symbology: "EAN13", source: "MANUAL" } }); itemEan.set(itemId, code); }
 // контроль по СКАНУ группы строки заказа
 async function markScan(taskId: string, orderId: string, lineId: string, qty: number, type?: string) {
-  await markOrderControlByScan({ companyId, userId: ctl, taskId, groupCode: await ctlGroupCode(orderId, lineId), countedQty: qty, discrepancyType: type ?? null });
+  await markOrderControlByScan({ companyId, userId: ctl, taskId, ean: await lineEan(orderId, lineId), countedQty: qty, discrepancyType: type ?? null });
 }
 // строка расхождения (checkLineId) по товару в последней FAILED-проверке заказа
 async function discLineId(orderId: string, itemId: string): Promise<string> {
@@ -133,6 +140,9 @@ async function provision() {
   itemA = (await prisma.item.create({ data: { companyId, name: "OC товар A", sku: "OC-A", uomId: uom.id, tracking: "LOT", isActive: true } })).id;
   itemB = (await prisma.item.create({ data: { companyId, name: "OC товар B", sku: "OC-B", uomId: uom.id, tracking: "LOT", isActive: true } })).id;
   itemC = (await prisma.item.create({ data: { companyId, name: "OC товар C", sku: "OC-C", uomId: uom.id, tracking: "LOT", isActive: true } })).id;
+  await seedEan(itemA, "460772000001");
+  await seedEan(itemB, "460772000002");
+  await seedEan(itemC, "460772000003");
   pk = await mkUser("oc_pk", companyId, "+79995560001", "PICKER", W);
   pk2 = await mkUser("oc_pk2", companyId, "+79995560002", "PICKER", W);
   ctl = await mkUser("oc_ctl", companyId, "+79995560003", "CONTROLLER", W);
@@ -173,6 +183,7 @@ async function cleanup() {
   await prisma.cell.deleteMany({ where: { warehouseId: { in: [W, DW] } } });
   await prisma.warehouseZone.deleteMany({ where: { warehouseId: { in: [W, DW] } } });
   await prisma.user.deleteMany({ where: { id: { in: UIDS } } });
+  await prisma.itemBarcode.deleteMany({ where: { itemId: { in: [itemA, itemB, itemC] } } });
   await prisma.item.deleteMany({ where: { id: { in: [itemA, itemB, itemC] } } });
   await prisma.warehouse.deleteMany({ where: { id: { in: [W, DW] } } });
   if (demoId) await prisma.company.deleteMany({ where: { id: demoId, slug: "oc-demo" } });
@@ -235,12 +246,12 @@ async function main() {
   const itemAlot2 = (await prisma.handlingGroup.findFirstOrThrow({ where: { warehouseId: W, itemId: itemA, lotId: { not: lot1 } } })).lotId;
   const mvA0 = await lotMv(itemAlot2);
   // недостача itemA → выравнивание к ledger, движения НЕ создаём (ALIGNED)
-  await resolveControlShortage({ companyId, userId: cpk, taskId: corr2!.id, checkLineId: await discLineId(o2, itemA), groupCode: await ctlGroupCode(o2, o2a.id), qty: 1 });
+  await resolveControlShortage({ companyId, userId: cpk, taskId: corr2!.id, checkLineId: await discLineId(o2, itemA), ean: await lineEan(o2, o2a.id), qty: 1 });
   ok("[5] недостача выровнена без движения остатка (itemA)", (await lotMv(itemAlot2)) === mvA0);
   const itemBlot2 = (await prisma.stockReservation.findFirstOrThrow({ where: { orderId: o2, lineId: o2b.id }, select: { lotId: true } })).lotId!;
   const mvB0 = await lotMv(itemBlot2);
   // излишек itemB → изоляция в DISCREPANCY через ядро (одно движение)
-  await resolveControlRemoval({ companyId, userId: cpk, taskId: corr2!.id, checkLineId: await discLineId(o2, itemB), groupCode: await ctlGroupCode(o2, o2b.id), qty: 2, disposition: "DISCREPANCY" });
+  await resolveControlRemoval({ companyId, userId: cpk, taskId: corr2!.id, checkLineId: await discLineId(o2, itemB), ean: await lineEan(o2, o2b.id), qty: 2, disposition: "DISCREPANCY" });
   ok("[5] излишек изолирован в DISCREPANCY через ядро (одно движение)", (await lotMv(itemBlot2)) === mvB0 + 1);
   await completeOrderCorrection({ companyId, userId: cpk, taskId: corr2!.id });
   ok("[5] CORRECT_ORDER COMPLETED", (await prisma.workflowTask.findUniqueOrThrow({ where: { id: corr2!.id } })).status === "COMPLETED");
@@ -326,19 +337,15 @@ async function main() {
   const [o7a, o7b] = await orderLines(o7);
   const t7 = await startControl(o7);
   await scanOrderForControl({ companyId, userId: ctl, taskId: t7, orderCode: await orderQr(o7) });
-  // N3: скан чужого tenant / чужого склада при контроле — отказ
-  const ftg = await bareGroup(demoId, DW, itemA);
-  const eFT = await err(() => markOrderControlByScan({ companyId, userId: ctl, taskId: t7, groupCode: ftg.code, countedQty: 1, discrepancyType: "EXCESS" }));
-  ok("[10] N3 чужой tenant при контроле — отказ", /этой организации/.test(eFT), eFT);
-  const W2 = (await prisma.warehouse.create({ data: { companyId, name: "OC W2", isActive: true } })).id;
-  const fwg = await bareGroup(companyId, W2, itemA);
-  const eFW = await err(() => markOrderControlByScan({ companyId, userId: ctl, taskId: t7, groupCode: fwg.code, countedQty: 1, discrepancyType: "EXCESS" }));
-  ok("[10] N3 чужой склад при контроле — отказ", /не на складе этого заказа/.test(eFW), eFW);
-  await dropBare(ftg); await dropBare(fwg); await prisma.warehouse.deleteMany({ where: { id: W2 } });
+  // N3 (Пакет 9B): неизвестный EAN и EAN с неверной контрольной цифрой при контроле — отказ (fail-closed)
+  const eFT = await err(() => markOrderControlByScan({ companyId, userId: ctl, taskId: t7, ean: ean13("999888777001"), countedQty: 1, discrepancyType: "EXCESS" }));
+  ok("[10] N3 неизвестный/чужой EAN при контроле — отказ", /EAN/.test(eFT), eFT);
+  const eFW = await err(() => markOrderControlByScan({ companyId, userId: ctl, taskId: t7, ean: "1234567890123", countedQty: 1, discrepancyType: "EXCESS" }));
+  ok("[10] N3 неверный EAN (контрольная цифра) при контроле — отказ", /EAN/.test(eFW), eFW);
   // N4: неожиданный товар (itemC, не в заказе) → отдельная строка lineId=null
   const cGrp = await seedGroup(itemC, await cellId("OC-L1A"), 2);
-  const cCode = await groupCode(cGrp.groupId);
-  await markOrderControlByScan({ companyId, userId: ctl, taskId: t7, groupCode: cCode, countedQty: 2, discrepancyType: "WRONG_ITEM" });
+  const cCode = eanOf(itemC); // EAN неожиданного товара
+  await markOrderControlByScan({ companyId, userId: ctl, taskId: t7, ean: cCode, countedQty: 2, discrepancyType: "WRONG_ITEM" });
   const chk7 = await prisma.controlCheck.findFirstOrThrow({ where: { orderId: o7 }, orderBy: { attempt: "desc" } });
   const extraLine = await prisma.controlCheckLine.findFirst({ where: { checkId: chk7.id, lineId: null, itemId: itemC } });
   ok("[10] N4 неожиданный товар зафиксирован строкой lineId=null", !!extraLine && extraLine.discrepancyType === "WRONG_ITEM");
@@ -355,16 +362,16 @@ async function main() {
   ok("[10] N1 завершение без исправлений отклонено", /Разрешите все расхождения/.test(eNoFix), eNoFix);
   // N5: недостача — скан не того товара отклонён
   const slA = await discLineId(o7, itemA);
-  const wrongGc = await ctlGroupCode(o7, o7b.id);
-  const eWrong = await err(() => resolveControlShortage({ companyId, userId: p7, taskId: corr7!.id, checkLineId: slA, groupCode: wrongGc, qty: 1 }));
+  const wrongEan = eanOf(itemB);
+  const eWrong = await err(() => resolveControlShortage({ companyId, userId: p7, taskId: corr7!.id, checkLineId: slA, ean: wrongEan, qty: 1 }));
   ok("[10] N5 недостача: скан не того товара — отказ", /не тот товар/.test(eWrong), eWrong);
   // N7: корректный скан недостачи — выравнивание без движения
   const itemAlot7 = (await prisma.stockReservation.findFirstOrThrow({ where: { orderId: o7, lineId: o7a.id }, select: { lotId: true } })).lotId!;
   const mvA7 = await lotMv(itemAlot7);
-  await resolveControlShortage({ companyId, userId: p7, taskId: corr7!.id, checkLineId: slA, groupCode: await ctlGroupCode(o7, o7a.id), qty: 2 });
+  await resolveControlShortage({ companyId, userId: p7, taskId: corr7!.id, checkLineId: slA, ean: await lineEan(o7, o7a.id), qty: 2 });
   ok("[10] N7 недостача выровнена — без движения остатка", (await lotMv(itemAlot7)) === mvA7);
   // N6: повтор разрешения идемпотентен (без второго движения)
-  const r6 = await resolveControlShortage({ companyId, userId: p7, taskId: corr7!.id, checkLineId: slA, groupCode: await ctlGroupCode(o7, o7a.id), qty: 2 });
+  const r6 = await resolveControlShortage({ companyId, userId: p7, taskId: corr7!.id, checkLineId: slA, ean: await lineEan(o7, o7a.id), qty: 2 });
   ok("[10] N6 повтор разрешения идемпотентен, без второго движения", r6.alreadyResolved === true && (await lotMv(itemAlot7)) === mvA7);
   // N2: частично исправленный список не завершается
   const ePart = await err(() => completeOrderCorrection({ companyId, userId: p7, taskId: corr7!.id }));
@@ -374,11 +381,11 @@ async function main() {
   const itemBlot7 = (await prisma.stockReservation.findFirstOrThrow({ where: { orderId: o7, lineId: o7b.id }, select: { lotId: true } })).lotId!;
   const mvB7 = await lotMv(itemBlot7);
   const discBal0 = await prisma.stockBalance.count({ where: { lotId: itemBlot7, zoneId: zDisc, qty: { gt: 0 } } });
-  await resolveControlRemoval({ companyId, userId: p7, taskId: corr7!.id, checkLineId: slB, groupCode: await ctlGroupCode(o7, o7b.id), qty: 2, disposition: "DISCREPANCY" });
+  await resolveControlRemoval({ companyId, userId: p7, taskId: corr7!.id, checkLineId: slB, ean: await lineEan(o7, o7b.id), qty: 2, disposition: "DISCREPANCY" });
   ok("[10] N8 излишек изолирован в DISCREPANCY через ядро (движение + остаток в DISCREPANCY)",
     (await lotMv(itemBlot7)) === mvB7 + 1 && (await prisma.stockBalance.count({ where: { lotId: itemBlot7, zoneId: zDisc, qty: { gt: 0 } } })) === discBal0 + 1);
   // разрешить неожиданный товар itemC (изоляция в DISCREPANCY)
-  await resolveControlRemoval({ companyId, userId: p7, taskId: corr7!.id, checkLineId: extraLine!.id, groupCode: cCode, qty: 2, disposition: "DISCREPANCY" });
+  await resolveControlRemoval({ companyId, userId: p7, taskId: corr7!.id, checkLineId: extraLine!.id, ean: cCode, qty: 2, disposition: "DISCREPANCY" });
   // N9: все расхождения разрешены → ровно одна полная повторная проверка
   await completeOrderCorrection({ companyId, userId: p7, taskId: corr7!.id });
   ok("[10] заказ снова IN_CONTROL после разрешения всех расхождений", (await orderStatus(o7)) === "IN_CONTROL");

@@ -5,6 +5,7 @@ import { prisma } from "@/lib/db";
 import { applyLotMovement } from "@/lib/stock";
 import { lockCell } from "@/lib/cells";
 import { createQrIn, parseScannedCode } from "@/lib/qr";
+import { eanItemIdInTx } from "@/lib/barcodes";
 import { logEvent } from "@/lib/events";
 import { isPickableLevel } from "@/lib/placement";
 import { orderControlEnabled } from "@/lib/roles";
@@ -53,6 +54,17 @@ async function resolveScannedGroup(tx: Tx, companyId: string, raw: string): Prom
   else throw new ExternalOrderError("Отсканируйте QR группы или партии товара");
   if (!group) throw new ExternalOrderError("Группа хранения не найдена");
   return { groupId: group.id, lotId: group.lotId, itemId: group.itemId };
+}
+
+// Пакет 9B: однозначная группа заказа в ячейке по товару EAN. Одна физическая ячейка = одна группа,
+// поэтому резервы заказа в этой ячейке указывают на одну группу; сверяем её товар с EAN.
+// null — если группы этого товара по резервам заказа в ячейке нет или их несколько (fail-closed).
+async function pickGroupInCellForOrder(tx: Tx, orderId: string, cellId: string, itemId: string): Promise<string | null> {
+  const resvs = await tx.stockReservation.findMany({ where: { orderId, cellId }, select: { handlingGroupId: true }, distinct: ["handlingGroupId"] });
+  const groupIds = resvs.map((r) => r.handlingGroupId).filter((g): g is string => !!g);
+  if (groupIds.length === 0) return null;
+  const groups = await tx.handlingGroup.findMany({ where: { id: { in: groupIds }, itemId }, select: { id: true } });
+  return groups.length === 1 ? groups[0].id : null;
 }
 
 export interface ImportLine {
@@ -386,7 +398,8 @@ export async function completeMoveGroup(input: {
   companyId: string;
   userId: string;
   taskId: string;
-  groupCode: string;
+  fromCellCode: string;
+  ean: string;
   cellCode: string;
 }): Promise<{ warehouseId: string }> {
   const res = await prisma.$transaction(async (tx) => {
@@ -404,9 +417,10 @@ export async function completeMoveGroup(input: {
     if (!reservation) throw new ExternalOrderError("Целевая ячейка перестановки не найдена (бронь снята)");
     const targetCellId = reservation.cellId;
 
-    // сверка отсканированных QR: группа = субъект задачи; ячейка = целевая бронь
-    const scanned = await resolveScannedGroup(tx, input.companyId, input.groupCode);
-    if (scanned.groupId !== group.id) throw new ExternalOrderError("Отсканирована не та группа для этой задачи");
+    // Пакет 9B: группа однозначна из задачи; EAN подтверждает её товар; исходная и целевая ячейки — сканами.
+    const scannedItemId = await eanItemIdInTx(tx, input.companyId, input.ean);
+    if (!scannedItemId) throw new ExternalOrderError("Неизвестный, неактивный или чужой EAN — перестановка отклонена");
+    if (scannedItemId !== group.itemId) throw new ExternalOrderError("Отсканирован не тот товар (EAN не совпадает с группой)");
     const scannedCellId = await resolveScannedCell(tx, input.companyId, group.warehouseId, input.cellCode);
     if (scannedCellId !== targetCellId) throw new ExternalOrderError("Отсканирована не та целевая ячейка");
 
@@ -416,6 +430,9 @@ export async function completeMoveGroup(input: {
     });
     if (!curBal?.cellId) throw new ExternalOrderError("Текущее размещение группы не найдено");
     const fromCellId = curBal.cellId;
+    // фактическое нахождение группы в исходной ячейке: скан исходной ячейки обязан совпасть
+    const scannedFromCellId = await resolveScannedCell(tx, input.companyId, group.warehouseId, input.fromCellCode);
+    if (scannedFromCellId !== fromCellId) throw new ExternalOrderError("Отсканирована не та исходная ячейка (группа находится в другой)");
 
     if (fromCellId === targetCellId) {
       // уже на месте — снять бронь и завершить (идемпотентно)
@@ -464,7 +481,7 @@ export async function pickOrderScan(input: {
   userId: string;
   taskId: string;
   cellCode: string;
-  groupCode: string;
+  ean: string;
   qty: number;
 }): Promise<{ done: boolean; alreadyPicked: boolean }> {
   type Brief = { id: string; title: string; warehouseId: string };
@@ -483,12 +500,17 @@ export async function pickOrderScan(input: {
     const cellId = await resolveScannedCell(tx, input.companyId, order.warehouseId, input.cellCode);
     const cell = await tx.cell.findFirst({ where: { id: cellId }, select: { level: true } });
     if (!isPickableLevel(cell?.level ?? null)) throw new ExternalOrderError("Сборка только с нижних уровней (1-2)");
-    const scanned = await resolveScannedGroup(tx, input.companyId, input.groupCode);
+    // Пакет 9B: товар — по EAN; группа/партия выводится из ячейки и резервов ЭТОГО заказа (одна
+    // физическая ячейка = одна группа, поэтому по (заказ, ячейка, товар) группа однозначна).
+    const itemId = await eanItemIdInTx(tx, input.companyId, input.ean);
+    if (!itemId) throw new ExternalOrderError("Неизвестный, неактивный или чужой EAN — сборка отклонена");
+    const groupId = await pickGroupInCellForOrder(tx, order.id, cellId, itemId);
+    if (!groupId) throw new ExternalOrderError("В этой ячейке нет группы этого товара по резервам заказа");
 
     // Точная идемпотентность повтора финального скана: при IN_CONTROL успех alreadyPicked ТОЛЬКО если
     // есть FULFILLED-резерв этого заказа именно с этой группой и этой (исходной) ячейкой; иначе — отказ.
     if (order.status === "IN_CONTROL") {
-      const done = await tx.stockReservation.findFirst({ where: { orderId: order.id, handlingGroupId: scanned.groupId, cellId, status: "FULFILLED" }, select: { id: true } });
+      const done = await tx.stockReservation.findFirst({ where: { orderId: order.id, handlingGroupId: groupId, cellId, status: "FULFILLED" }, select: { id: true } });
       if (done) return { ...base, done: true, alreadyPicked: true, justCompleted: false, unblocked: [] as Brief[], controlTask: null as TaskCreateResult | null };
       throw new ExternalOrderError("Скан не соответствует собранному заказу");
     }
@@ -497,13 +519,13 @@ export async function pickOrderScan(input: {
     await lockCell(tx, input.companyId, cellId);
     // резерв ЭТОГО заказа для этой группы в этой ячейке — связывает заказ+группу+товар+ячейку+резерв
     const reservations = await tx.stockReservation.findMany({
-      where: { orderId: order.id, cellId, handlingGroupId: scanned.groupId, status: "ACTIVE" },
+      where: { orderId: order.id, cellId, handlingGroupId: groupId, status: "ACTIVE" },
       orderBy: { createdAt: "asc" },
     });
     const remaining = reservations.reduce((s, r) => s.plus(r.qty), D(0));
     if (remaining.lte(0)) {
       // нет активного резерва: повтор уже собранного (заказ, группа, ячейка) → alreadyPicked; иначе — чужой скан
-      const already = await tx.stockReservation.findFirst({ where: { orderId: order.id, cellId, handlingGroupId: scanned.groupId, status: "FULFILLED" }, select: { id: true } });
+      const already = await tx.stockReservation.findFirst({ where: { orderId: order.id, cellId, handlingGroupId: groupId, status: "FULFILLED" }, select: { id: true } });
       if (already) return { ...base, done: await orderFullyPicked(tx, order.id), alreadyPicked: true, justCompleted: false, unblocked: [] as Brief[], controlTask: null as TaskCreateResult | null };
       throw new ExternalOrderError("Нет активного резерва этого заказа для этой группы в этой ячейке");
     }
@@ -519,7 +541,7 @@ export async function pickOrderScan(input: {
     for (const r of reservations) {
       if (!r.lotId) continue;
       await applyLotMovement(tx, {
-        companyId: input.companyId, docType: "PICKLIST", docId: order.id, itemId: scanned.itemId, lotId: r.lotId, qty: r.qty,
+        companyId: input.companyId, docType: "PICKLIST", docId: order.id, itemId, lotId: r.lotId, qty: r.qty,
         from: { kind: "cell", warehouseId: order.warehouseId, cellId },
         to: { kind: "zone", warehouseId: order.warehouseId, zoneId: control.id },
         createdById: input.userId,

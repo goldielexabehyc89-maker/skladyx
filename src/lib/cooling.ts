@@ -3,6 +3,8 @@ import { Prisma, type HandlingGroup } from "@prisma/client";
 import { prisma } from "@/lib/db";
 import { applyLotMovement } from "@/lib/stock";
 import { lockCell } from "@/lib/cells";
+import { parseScannedCode } from "@/lib/qr";
+import { eanItemIdInTx } from "@/lib/barcodes";
 import { isCoolingFallbackLevel } from "@/lib/placement";
 import { fmtDateTime } from "@/lib/format";
 import { TASK_TYPES } from "@/lib/workflow-task-types";
@@ -149,40 +151,67 @@ export async function startCoolingInTx(
   return { taskRes, sessionId: session.id };
 }
 
-// Завершение срочной задачи забора: погрузчик вводит фактическую температуру.
-// temp > X: группа остаётся, пересчёт срока, следующая отложенная задача, резерв сохранён.
-// temp <= X: атомарный вывоз всей группы COOLING→резерв, IN_STORAGE, сессия COMPLETED, бронь RELEASED.
-export async function completeCoolingRetrieval(input: {
-  companyId: string;
-  userId: string;
-  taskId: string;
-  temperature: number;
-}): Promise<{ warehouseId: string; placed: boolean }> {
-  if (!Number.isFinite(input.temperature) || input.temperature < -100 || input.temperature > 100)
-    throw new CoolingError("Некорректная температура");
+// Пакет 9B: резолвинг QR/Code128 ячейки → cellId (по внутреннему коду), scoped компанией+складом.
+async function resolveCoolingCell(tx: Tx, companyId: string, warehouseId: string, raw: string): Promise<string> {
+  const code = parseScannedCode(raw);
+  if (!code) throw new CoolingError("Неверный код ячейки");
+  const qr = await tx.qrCode.findUnique({ where: { code } });
+  if (!qr || qr.companyId !== companyId || qr.type !== "CELL") throw new CoolingError("Это не код ячейки этой организации");
+  const cell = await tx.cell.findFirst({ where: { id: qr.refId, companyId, warehouseId }, select: { id: true } });
+  if (!cell) throw new CoolingError("Ячейка не найдена на этом складе");
+  return cell.id;
+}
 
-  const res = await prisma.$transaction(async (tx) => {
+// последнее измерение сессии
+async function lastMeasurement(tx: Tx, sessionId: string) {
+  return tx.temperatureMeasurement.findFirst({ where: { sessionId }, orderBy: { measuredAt: "desc" } });
+}
+
+// ── Пакет 9B, Фаза 1 — замер и подготовка. Погрузчик сканирует исходную COOLING-ячейку, EAN и вводит
+// температуру. temp > X: замер + следующая отложенная задача, группа не двигается, резерв сохранён.
+// temp <= X: выбор цели (ур.1→2→резерв 3+), перевод активной CellReservation на выбранную ячейку и
+// возврат её кода (движения/завершения нет). Повтор при уже подготовленном вывозе возвращает ту же
+// цель без второго замера и новой брони. ──
+export async function prepareCoolingRetrieval(input: {
+  companyId: string; userId: string; taskId: string; fromCellCode: string; ean: string; temperature: number;
+}): Promise<{ warehouseId: string; ready: boolean; targetCellCode: string | null }> {
+  const out = await prisma.$transaction(async (tx) => {
     await lockCompany(tx, input.companyId);
     const task = await tx.workflowTask.findFirst({ where: { id: input.taskId, companyId: input.companyId } });
     if (!task) throw new CoolingError("Задача не найдена");
     if (task.type !== TASK_TYPES.RETRIEVE_COOLING) throw new CoolingError("Это не задача забора из охлаждения");
     if (task.assignedUserId !== input.userId || task.status !== "IN_PROGRESS")
-      throw new CoolingError("Завершить может только назначенный исполнитель с задачей «в работе»");
+      throw new CoolingError("Только назначенный исполнитель с задачей «в работе»");
     const session = await tx.coolingSession.findFirst({ where: { id: task.subjectId ?? "", companyId: input.companyId } });
     if (!session || session.status !== "ACTIVE") throw new CoolingError("Сессия охлаждения не найдена или уже завершена");
     const group = await tx.handlingGroup.findFirst({ where: { id: session.handlingGroupId, companyId: input.companyId } });
     if (!group) throw new CoolingError("Группа не найдена");
-
-    await tx.temperatureMeasurement.create({
-      data: { companyId: input.companyId, sessionId: session.id, temperature: input.temperature, byUserId: input.userId },
-    });
-
     const X = session.thresholdX.toNumber();
+    const reservation = await tx.cellReservation.findFirst({ where: { sessionId: session.id, status: "ACTIVE" } });
+
+    // идемпотентность: если уже подготовлено к вывозу (последнее измерение <= X) — вернуть ту же цель
+    const last = await lastMeasurement(tx, session.id);
+    if (last && last.temperature.toNumber() <= X) {
+      if (!reservation) throw new CoolingError("Резерв целевой ячейки не найден");
+      const cell = await tx.cell.findFirst({ where: { id: reservation.cellId }, select: { code: true } });
+      return { warehouseId: group.warehouseId, ready: true, targetCellCode: cell?.code ?? null, nextTaskRes: null as TaskCreateResult | null };
+    }
+
+    // новый замер — подтверждаем исходную COOLING-ячейку и EAN товара
+    if (!Number.isFinite(input.temperature) || input.temperature < -100 || input.temperature > 100)
+      throw new CoolingError("Некорректная температура");
+    const fromCellId = await resolveCoolingCell(tx, input.companyId, group.warehouseId, input.fromCellCode);
+    if (fromCellId !== session.coolingCellId) throw new CoolingError("Отсканирована не та ячейка охлаждения");
+    const scannedItemId = await eanItemIdInTx(tx, input.companyId, input.ean);
+    if (!scannedItemId) throw new CoolingError("Неизвестный, неактивный или чужой EAN — операция отклонена");
+    if (scannedItemId !== group.itemId) throw new CoolingError("Отсканирован не тот товар (EAN не совпадает с группой)");
+    if (!reservation) throw new CoolingError("Активный резерв ячейки не найден");
+
+    await tx.temperatureMeasurement.create({ data: { companyId: input.companyId, sessionId: session.id, temperature: input.temperature, byUserId: input.userId } });
     const R = session.coolingRate.toNumber();
     const now = new Date();
 
     if (input.temperature > X) {
-      // ещё тёплая — новый цикл, резерв сохраняется
       const nextReady = estimateReadyAt(now, input.temperature, X, R);
       await tx.coolingSession.update({ where: { id: session.id }, data: { estimatedReadyAt: nextReady } });
       await completeWorkflowTaskInTransaction(tx, task.id);
@@ -194,15 +223,67 @@ export async function completeCoolingRetrieval(input: {
         subjectType: "CoolingSession", subjectId: session.id,
         dedupeKey: `cooling:${session.id}:retrieve:${cycle + 1}`, availableAt: nextReady,
       });
-      return { companyId: input.companyId, warehouseId: group.warehouseId, title: task.title, taskId: task.id, unblocked: [] as { id: string; title: string; warehouseId: string }[], nextTaskRes: next, placed: false };
+      return { warehouseId: group.warehouseId, ready: false, targetCellCode: null, nextTaskRes: next };
     }
 
-    // temp <= X — вывоз всей группы. Приоритет: свободная ячейка ур.1 → ур.2 → верхний резерв (ур.3+).
-    const reservation = await tx.cellReservation.findFirst({ where: { sessionId: session.id, status: "ACTIVE" } });
-    if (!reservation) throw new CoolingError("Активный резерв ячейки не найден");
+    // temp <= X — выбрать цель (ур.1→2→резерв 3+), перевести активную бронь на выбранную ячейку
     await lockCell(tx, input.companyId, session.coolingCellId);
     const destCellId = await pickRetrievalCell(tx, input.companyId, group.warehouseId, reservation.cellId);
-    // финальная перепроверка целевой ячейки под локом (гарантия «одна ячейка = одна группа»)
+    if (destCellId !== reservation.cellId) {
+      // перепроверка свободности новой цели под локом (pickRetrievalCell уже взял lockCell на кандидатов)
+      const [dbal, dunit] = await Promise.all([
+        tx.stockBalance.findFirst({ where: { cellId: destCellId, qty: { gt: 0 } }, select: { id: true } }),
+        tx.itemUnit.findFirst({ where: { cellId: destCellId }, select: { id: true } }),
+      ]);
+      if (dbal || dunit) throw new CoolingError("Выбранная ячейка занята — повторите");
+      await tx.cellReservation.update({ where: { id: reservation.id }, data: { cellId: destCellId } });
+    }
+    const cell = await tx.cell.findFirst({ where: { id: destCellId }, select: { code: true } });
+    return { warehouseId: group.warehouseId, ready: true, targetCellCode: cell?.code ?? null, nextTaskRes: null as TaskCreateResult | null };
+  });
+  if (out.nextTaskRes) {
+    await emitTaskCompleted({ companyId: input.companyId, warehouseId: out.warehouseId, title: "Замер охлаждения", taskId: input.taskId, unblocked: [] });
+    await emitTaskCreated(out.nextTaskRes);
+    await rebalanceQueuedTasks(input.companyId, { warehouseId: out.warehouseId });
+  }
+  return { warehouseId: out.warehouseId, ready: out.ready, targetCellCode: out.targetCellCode };
+}
+
+// ── Пакет 9B, Фаза 2 — физическое размещение. UI показывает назначенную целевую ячейку; погрузчик
+// сканирует её QR/Code128. Сервер сверяет задачу, готовность (последнее измерение <= X), исходную
+// ячейку+EAN, совпадение цели с активной бронью сессии, свободность цели и точный неделимый остаток;
+// затем движение через ядро, IN_STORAGE, COMPLETED, бронь RELEASED. Повтор — без второго движения. ──
+export async function placeCoolingRetrieval(input: {
+  companyId: string; userId: string; taskId: string; fromCellCode: string; ean: string; targetCellCode: string;
+}): Promise<{ warehouseId: string; placed: boolean; alreadyPlaced: boolean }> {
+  const res = await prisma.$transaction(async (tx) => {
+    await lockCompany(tx, input.companyId);
+    const task = await tx.workflowTask.findFirst({ where: { id: input.taskId, companyId: input.companyId } });
+    if (!task) throw new CoolingError("Задача не найдена");
+    if (task.type !== TASK_TYPES.RETRIEVE_COOLING) throw new CoolingError("Это не задача забора из охлаждения");
+    if (task.assignedUserId !== input.userId) throw new CoolingError("Это не ваша задача");
+    const session = await tx.coolingSession.findFirst({ where: { id: task.subjectId ?? "", companyId: input.companyId } });
+    if (!session) throw new CoolingError("Сессия охлаждения не найдена");
+    const group = await tx.handlingGroup.findFirst({ where: { id: session.handlingGroupId, companyId: input.companyId } });
+    if (!group) throw new CoolingError("Группа не найдена");
+    // идемпотентность: уже размещено
+    if (session.status === "COMPLETED" || group.status === "IN_STORAGE")
+      return { companyId: input.companyId, warehouseId: group.warehouseId, title: task.title, taskId: task.id, unblocked: [] as { id: string; title: string; warehouseId: string }[], alreadyPlaced: true };
+    if (task.status !== "IN_PROGRESS") throw new CoolingError("Задача не в работе");
+    const last = await lastMeasurement(tx, session.id);
+    if (!last || last.temperature.toNumber() > session.thresholdX.toNumber())
+      throw new CoolingError("Сначала выполните замер (Фаза 1): группа ещё не готова к вывозу");
+    const fromCellId = await resolveCoolingCell(tx, input.companyId, group.warehouseId, input.fromCellCode);
+    if (fromCellId !== session.coolingCellId) throw new CoolingError("Отсканирована не та ячейка охлаждения");
+    const scannedItemId = await eanItemIdInTx(tx, input.companyId, input.ean);
+    if (!scannedItemId || scannedItemId !== group.itemId) throw new CoolingError("Отсканирован не тот товар (EAN не совпадает с группой)");
+    const reservation = await tx.cellReservation.findFirst({ where: { sessionId: session.id, status: "ACTIVE" } });
+    if (!reservation) throw new CoolingError("Активный резерв целевой ячейки не найден");
+    const destCellId = await resolveCoolingCell(tx, input.companyId, group.warehouseId, input.targetCellCode);
+    if (destCellId !== reservation.cellId) throw new CoolingError("Отсканирована не та целевая ячейка (не совпадает с назначенной)");
+
+    await lockCell(tx, input.companyId, session.coolingCellId);
+    await lockCell(tx, input.companyId, destCellId);
     const [dbal, dunit] = await Promise.all([
       tx.stockBalance.findFirst({ where: { cellId: destCellId, qty: { gt: 0 } }, select: { id: true } }),
       tx.itemUnit.findFirst({ where: { cellId: destCellId }, select: { id: true } }),
@@ -219,14 +300,13 @@ export async function completeCoolingRetrieval(input: {
     });
     await tx.handlingGroup.update({ where: { id: group.id }, data: { status: "IN_STORAGE" } });
     await tx.coolingSession.update({ where: { id: session.id }, data: { status: "COMPLETED" } });
-    // верхний резерв освобождаем НЕЗАВИСИМО от того, положили в нижнюю ячейку или в него.
-    await tx.cellReservation.update({ where: { id: reservation.id }, data: { status: "RELEASED", releasedAt: now } });
+    await tx.cellReservation.update({ where: { id: reservation.id }, data: { status: "RELEASED", releasedAt: new Date() } });
     const unblocked = await completeWorkflowTaskInTransaction(tx, task.id);
-    return { companyId: input.companyId, warehouseId: group.warehouseId, title: task.title, taskId: task.id, unblocked, nextTaskRes: null as TaskCreateResult | null, placed: true };
+    return { companyId: input.companyId, warehouseId: group.warehouseId, title: task.title, taskId: task.id, unblocked, alreadyPlaced: false };
   });
-
-  await emitTaskCompleted({ companyId: res.companyId, warehouseId: res.warehouseId, title: res.title, taskId: res.taskId, unblocked: res.unblocked });
-  if (res.nextTaskRes) await emitTaskCreated(res.nextTaskRes);
-  await rebalanceQueuedTasks(res.companyId, { warehouseId: res.warehouseId });
-  return { warehouseId: res.warehouseId, placed: res.placed };
+  if (!res.alreadyPlaced) {
+    await emitTaskCompleted({ companyId: res.companyId, warehouseId: res.warehouseId, title: res.title, taskId: res.taskId, unblocked: res.unblocked });
+    await rebalanceQueuedTasks(res.companyId, { warehouseId: res.warehouseId });
+  }
+  return { warehouseId: res.warehouseId, placed: true, alreadyPlaced: res.alreadyPlaced };
 }

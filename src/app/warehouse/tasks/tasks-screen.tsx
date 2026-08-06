@@ -7,7 +7,8 @@ import {
   requestHandoffAction,
   acceptHandoffAction,
   rejectHandoffAction,
-  completeCoolingRetrievalAction,
+  prepareCoolingRetrievalAction,
+  placeCoolingRetrievalAction,
   type TaskActionState,
 } from "@/app/actions/tasks";
 import { completeGroupPlacementAction, type PlacementState } from "@/app/actions/group-receiving";
@@ -190,6 +191,8 @@ function PlacementForm({ placement }: { placement: Placement }) {
           </option>
         ))}
       </select>
+      <label className="text-xs font-medium text-neutral-500">EAN товара (подтверждение)</label>
+      <input name="ean" required inputMode="numeric" placeholder="EAN товара (8/13 цифр)" className="rounded-lg border border-[#e4e4f0] px-3 py-2 text-sm" />
       {state.error && <p className="text-xs text-red-600">{state.error}</p>}
       <Button type="submit" disabled={pending} className="w-full">
         {pending ? "…" : "Разместить группу"}
@@ -198,32 +201,37 @@ function PlacementForm({ placement }: { placement: Placement }) {
   );
 }
 
-// Пакет 5: завершение срочной задачи «Забрать из охлаждения» — ввод фактической температуры.
+// Пакет 9B: двухфазный забор из охлаждения. Фаза 1 — скан ячейки охлаждения + EAN + температура;
+// если готово (≤ X) — Фаза 2: показать назначенную ячейку и подтвердить её сканом (движение через ядро).
+const coolInput = "rounded-lg border border-[#e4e4f0] px-3 py-2 text-sm";
 function CoolingRetrievalForm({ cooling }: { cooling: Cooling }) {
-  const [state, action, pending] = useActionState<TaskActionState, FormData>(completeCoolingRetrievalAction, {});
+  const [prep, prepAction, prepPending] = useActionState<TaskActionState, FormData>(prepareCoolingRetrievalAction, {});
+  const [plc, plcAction, plcPending] = useActionState<TaskActionState, FormData>(placeCoolingRetrievalAction, {});
   return (
-    <form action={action} className="flex flex-col gap-2">
-      <input type="hidden" name="taskId" value={cooling.taskId} />
-      <label className="text-xs font-medium text-neutral-500">
-        Фактическая температура, °C (порог X = {cooling.thresholdX})
-      </label>
-      <input
-        name="temperature"
-        type="number"
-        inputMode="decimal"
-        step="0.1"
-        required
-        placeholder="напр. 4"
-        className="rounded-lg border border-[#e4e4f0] px-3 py-2 text-sm"
-      />
-      {state.error && <p className="text-xs text-red-600">{state.error}</p>}
-      <Button type="submit" disabled={pending} className="w-full">
-        {pending ? "…" : "Записать замер"}
-      </Button>
-      <p className="text-xs text-neutral-400">
-        ≤ X — группа уедет в зарезервированную ячейку хранения; выше X — новый цикл охлаждения.
-      </p>
-    </form>
+    <div className="flex flex-col gap-3">
+      <form action={prepAction} className="flex flex-col gap-2">
+        <input type="hidden" name="taskId" value={cooling.taskId} />
+        <label className="text-xs font-medium text-neutral-500">Фаза 1 · замер (порог X = {cooling.thresholdX})</label>
+        <input name="fromCellCode" required placeholder="Ячейка охлаждения (QR/Code 128)" className={coolInput} />
+        <input name="ean" required inputMode="numeric" placeholder="EAN товара (8/13 цифр)" className={coolInput} />
+        <input name="temperature" type="number" inputMode="decimal" step="0.1" required placeholder="Температура, °C" className={coolInput} />
+        {prep.error && <p className="text-xs text-red-600">{prep.error}</p>}
+        {prep.ready === false && <p className="text-xs text-neutral-500">Выше X — записан новый цикл охлаждения.</p>}
+        <Button type="submit" disabled={prepPending} className="w-full">{prepPending ? "…" : "Записать замер"}</Button>
+      </form>
+      {prep.ready && prep.targetCellCode && (
+        <form action={plcAction} className="flex flex-col gap-2 border-t border-[#eee] pt-2">
+          <input type="hidden" name="taskId" value={cooling.taskId} />
+          <p className="text-xs font-medium text-green-700">Готово к вывозу → ячейка <b>{prep.targetCellCode}</b>. Отсканируйте ячейку охлаждения, EAN и целевую ячейку.</p>
+          <input name="fromCellCode" required placeholder="Ячейка охлаждения (QR/Code 128)" className={coolInput} />
+          <input name="ean" required inputMode="numeric" placeholder="EAN товара (8/13 цифр)" className={coolInput} />
+          <input name="targetCellCode" required placeholder="Целевая ячейка (QR/Code 128)" className={coolInput} />
+          {plc.error && <p className="text-xs text-red-600">{plc.error}</p>}
+          <Button type="submit" disabled={plcPending} className="w-full">{plcPending ? "…" : "Разместить в назначенную ячейку"}</Button>
+        </form>
+      )}
+      <p className="text-xs text-neutral-400">≤ X — Фаза 2 (скан назначенной ячейки → размещение); выше X — новый цикл охлаждения.</p>
+    </div>
   );
 }
 
@@ -237,7 +245,7 @@ function ManualPickForm({ taskId }: { taskId: string }) {
       <form action={action} className="mt-2 flex flex-col gap-2">
         <input type="hidden" name="taskId" value={taskId} />
         <input name="cellCode" required placeholder="Код QR ячейки (1-2)" className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm" />
-        <input name="groupCode" required placeholder="Код QR группы/партии" className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm" />
+        <input name="ean" required inputMode="numeric" placeholder="EAN товара (8/13 цифр)" className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm" />
         <input name="qty" required type="number" inputMode="decimal" step="1" placeholder="Количество" className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm" />
         {state.error && <p className="text-red-600">{state.error}</p>}
         <Button type="submit" variant="ghost" disabled={pending}>{pending ? "…" : "Собрать по кодам"}</Button>
@@ -252,8 +260,9 @@ function ManualMoveForm({ taskId }: { taskId: string }) {
       <summary className="cursor-pointer">Ввести коды вручную (без камеры)</summary>
       <form action={action} className="mt-2 flex flex-col gap-2">
         <input type="hidden" name="taskId" value={taskId} />
-        <input name="groupCode" required placeholder="Код QR группы" className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm" />
-        <input name="cellCode" required placeholder="Код QR целевой ячейки" className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm" />
+        <input name="fromCellCode" required placeholder="Код исходной ячейки (QR/Code 128)" className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm" />
+        <input name="ean" required inputMode="numeric" placeholder="EAN товара (8/13 цифр)" className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm" />
+        <input name="cellCode" required placeholder="Код целевой ячейки (QR/Code 128)" className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm" />
         {state.error && <p className="text-red-600">{state.error}</p>}
         <Button type="submit" variant="ghost" disabled={pending}>{pending ? "…" : "Переставить по кодам"}</Button>
       </form>

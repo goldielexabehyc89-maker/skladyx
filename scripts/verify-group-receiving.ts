@@ -20,6 +20,9 @@ const err = async (fn: () => Promise<unknown>): Promise<string> => {
 let companyId = "", demoId = "", W = "", DW = "";
 let zRecv = "", zStorage = "", zCooling = "";
 let lotItem = "", unitItem = "", inactiveItem = "", demoItem = "";
+const itemEan = new Map<string, string>();
+const eanOf = (itemId: string) => itemEan.get(itemId)!;
+function ean13(b12: string): string { let s = 0; for (let i = b12.length - 1, k = 0; i >= 0; i--, k++) s += Number(b12[i]) * (k % 2 === 0 ? 3 : 1); return b12 + String((10 - (s % 10)) % 10); }
 let RUSER = "", L1 = "", L2 = "";
 const UIDS: string[] = [];
 let seq = 0;
@@ -68,7 +71,7 @@ async function place(loader: string, groupId: string, cellId: string): Promise<s
   const t = await taskOf(groupId);
   if (!t) return "нет задачи";
   await startWorkflowTask(loader, companyId, t.id); // ASSIGNED → IN_PROGRESS
-  return err(() => completeGroupPlacement({ companyId, userId: loader, taskId: t.id, cellId }));
+  return err(() => completeGroupPlacement({ companyId, userId: loader, taskId: t.id, cellId, ean: eanOf(lotItem) }));
 }
 
 async function provision() {
@@ -80,6 +83,7 @@ async function provision() {
   zCooling = (await prisma.warehouseZone.findFirstOrThrow({ where: { warehouseId: W, kind: "COOLING" } })).id;
   const uom = await prisma.uom.create({ data: { companyId, name: "шт P4" } });
   lotItem = (await prisma.item.create({ data: { companyId, name: "P4 партионный", sku: "P4-LOT", uomId: uom.id, tracking: "LOT", isActive: true } })).id;
+  { const code = ean13("460774000001"); await prisma.itemBarcode.create({ data: { companyId, itemId: lotItem, code, symbology: "EAN13", source: "MANUAL" } }); itemEan.set(lotItem, code); }
   unitItem = (await prisma.item.create({ data: { companyId, name: "P4 поштучный", uomId: uom.id, tracking: "UNIT", isActive: true } })).id;
   inactiveItem = (await prisma.item.create({ data: { companyId, name: "P4 неактивный", uomId: uom.id, tracking: "LOT", isActive: false } })).id;
   const demo = await prisma.company.upsert({ where: { slug: "p4-demo" }, update: {}, create: { name: "P4 Demo", slug: "p4-demo", settings: {} } });
@@ -116,6 +120,7 @@ async function cleanup() {
   await prisma.cell.deleteMany({ where: { warehouseId: { in: whs } } });
   await prisma.warehouseZone.deleteMany({ where: { warehouseId: { in: whs } } });
   await prisma.user.deleteMany({ where: { id: { in: UIDS } } });
+  await prisma.itemBarcode.deleteMany({ where: { itemId: { in: [lotItem, unitItem, inactiveItem] } } });
   await prisma.item.deleteMany({ where: { id: { in: [lotItem, unitItem, inactiveItem] } } });
   await prisma.warehouse.deleteMany({ where: { id: W } });
   if (demoId) {
@@ -141,7 +146,10 @@ async function main() {
   await updateSettings(companyId, { tempThresholdX: 5 }); // X = 5°C
 
   console.log("2–4) маршрут по температуре (X=5, равенство → STORAGE)");
-  ok("temp<X → AWAITING_STORAGE", (await G(3)).status === "AWAITING_STORAGE");
+  // Пакет 9B: новая группа приёмки НЕ получает собственный GROUP QR (товар определяется EAN).
+  const gNoQr = await G(3);
+  ok("temp<X → AWAITING_STORAGE", gNoQr.status === "AWAITING_STORAGE");
+  ok("Пакет 9B: у новой группы нет GROUP QR", (await prisma.qrCode.count({ where: { type: "GROUP", refId: gNoQr.groupId } })) === 0 && gNoQr.qrCode === null);
   ok("temp==X → AWAITING_STORAGE", (await G(5)).status === "AWAITING_STORAGE");
   ok("temp>X → AWAITING_COOLING", (await G(8)).status === "AWAITING_COOLING");
 
@@ -227,8 +235,8 @@ async function main() {
   await startWorkflowTask(L1, companyId, ta!.id);
   await startWorkflowTask(L2, companyId, tb!.id);
   const [ra, rb] = await Promise.all([
-    err(() => completeGroupPlacement({ companyId, userId: L1, taskId: ta!.id, cellId: C2 })),
-    err(() => completeGroupPlacement({ companyId, userId: L2, taskId: tb!.id, cellId: C2 })),
+    err(() => completeGroupPlacement({ companyId, userId: L1, taskId: ta!.id, cellId: C2, ean: eanOf(lotItem) })),
+    err(() => completeGroupPlacement({ companyId, userId: L2, taskId: tb!.id, cellId: C2, ean: eanOf(lotItem) })),
   ]);
   ok("одна конкурентная попытка успешна, вторая отклонена", (ra === "") !== (rb === ""), `ra="${ra}" rb="${rb}"`);
   ok("в ячейке ровно одна группа", (await prisma.stockBalance.count({ where: { locKey: `C:${C2}`, qty: { gt: 0 } } })) === 1);
@@ -247,7 +255,7 @@ async function main() {
   const before = await bal((await prisma.handlingGroup.findUniqueOrThrow({ where: { id: g19.groupId } })).lotId, `Z:${zRecv}`);
   const t19 = await taskOf(g19.groupId);
   await startWorkflowTask(L1, companyId, t19!.id);
-  const r19 = await err(() => completeGroupPlacement({ companyId, userId: L1, taskId: t19!.id, cellId: S1 })); // S1 занята
+  const r19 = await err(() => completeGroupPlacement({ companyId, userId: L1, taskId: t19!.id, cellId: S1, ean: eanOf(lotItem) })); // S1 занята
   const after = await bal((await prisma.handlingGroup.findUniqueOrThrow({ where: { id: g19.groupId } })).lotId, `Z:${zRecv}`);
   const g19row = await prisma.handlingGroup.findUniqueOrThrow({ where: { id: g19.groupId } });
   const t19row = await prisma.workflowTask.findUniqueOrThrow({ where: { id: t19!.id } });
@@ -275,7 +283,7 @@ async function main() {
   await prisma.stockBalance.updateMany({ where: { lotId: g22row.lotId, locKey: `Z:${zRecv}` }, data: { qty: 4 } });
   const t22 = await taskOf(g22.groupId);
   await startWorkflowTask(L1, companyId, t22!.id);
-  const r22 = await err(() => completeGroupPlacement({ companyId, userId: L1, taskId: t22!.id, cellId: emptyCell }));
+  const r22 = await err(() => completeGroupPlacement({ companyId, userId: L1, taskId: t22!.id, cellId: emptyCell, ean: eanOf(lotItem) }));
   ok("несовпадение остатка → размещение отклонено", r22.includes("не совпадает"), r22);
   ok("после отказа: группа AWAITING, в ячейку ничего не перенесено",
     (await prisma.handlingGroup.findUniqueOrThrow({ where: { id: g22.groupId } })).status === "AWAITING_STORAGE" &&
@@ -290,7 +298,7 @@ async function main() {
   await startWorkflowTask(L1, companyId, tRace!.id);
   const LL = await mkWarehouseLot(2);
   const [rGroup, rOld] = await Promise.all([
-    err(() => completeGroupPlacement({ companyId, userId: L1, taskId: tRace!.id, cellId: CC })),
+    err(() => completeGroupPlacement({ companyId, userId: L1, taskId: tRace!.id, cellId: CC, ean: eanOf(lotItem) })),
     oldOpPlace(CC, LL),
   ]);
   ok("успешна ровно одна операция (вторая отклонена)", (rGroup === "") !== (rOld === ""), `group="${rGroup}" old="${rOld}"`);

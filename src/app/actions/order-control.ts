@@ -53,14 +53,14 @@ export async function markControlScanAction(_prev: ControlActionState, formData:
   const session = await requireUser();
   const s = scoped(session);
   const taskId = String(formData.get("taskId") ?? "").trim();
-  const groupCode = String(formData.get("groupCode") ?? "").trim();
+  const ean = String(formData.get("ean") ?? "").trim();
   const countedQty = Number(String(formData.get("countedQty") ?? "").trim().replace(",", "."));
   const discrepancyType = String(formData.get("discrepancyType") ?? "").trim() || null;
   const comment = String(formData.get("comment") ?? "").trim() || null;
-  if (!groupCode) return { error: "Отсканируйте QR группы/партии" };
+  if (!ean) return { error: "Отсканируйте заводской штрихкод товара (EAN)" };
   if (!Number.isFinite(countedQty)) return { error: "Укажите фактическое количество" };
   try {
-    await markOrderControlByScan({ companyId: s.companyId, userId: session.userId, taskId, groupCode, countedQty, discrepancyType, comment });
+    await markOrderControlByScan({ companyId: s.companyId, userId: session.userId, taskId, ean, countedQty, discrepancyType, comment });
   } catch (e) {
     return { error: msg(e) };
   }
@@ -75,13 +75,13 @@ export async function resolveShortageAction(_prev: ControlActionState, formData:
   const s = scoped(session);
   const taskId = String(formData.get("taskId") ?? "").trim();
   const checkLineId = String(formData.get("checkLineId") ?? "").trim();
-  const groupCode = String(formData.get("groupCode") ?? "").trim();
+  const ean = String(formData.get("ean") ?? "").trim();
   const qty = Number(String(formData.get("qty") ?? "").trim().replace(",", "."));
   const comment = String(formData.get("comment") ?? "").trim() || null;
-  if (!checkLineId || !groupCode) return { error: "Отсканируйте QR товара недостающей строки" };
+  if (!checkLineId || !ean) return { error: "Отсканируйте EAN товара недостающей строки" };
   if (!Number.isFinite(qty)) return { error: "Укажите количество" };
   try {
-    await resolveControlShortage({ companyId: s.companyId, userId: session.userId, taskId, checkLineId, groupCode, qty, comment });
+    await resolveControlShortage({ companyId: s.companyId, userId: session.userId, taskId, checkLineId, ean, qty, comment });
     revalidatePath("/warehouse/tasks");
     return { ok: true };
   } catch (e) {
@@ -97,14 +97,14 @@ export async function resolveRemovalAction(_prev: ControlActionState, formData: 
   const s = scoped(session);
   const taskId = String(formData.get("taskId") ?? "").trim();
   const checkLineId = String(formData.get("checkLineId") ?? "").trim();
-  const groupCode = String(formData.get("groupCode") ?? "").trim();
+  const ean = String(formData.get("ean") ?? "").trim();
   const qty = Number(String(formData.get("qty") ?? "").trim().replace(",", "."));
   const disposition = String(formData.get("disposition") ?? "").trim() === "RETURN" ? "RETURN" : "DISCREPANCY";
   const comment = String(formData.get("comment") ?? "").trim() || null;
-  if (!checkLineId || !groupCode) return { error: "Отсканируйте QR удаляемого товара/группы" };
+  if (!checkLineId || !ean) return { error: "Отсканируйте EAN удаляемого товара" };
   if (!Number.isFinite(qty)) return { error: "Укажите количество" };
   try {
-    await resolveControlRemoval({ companyId: s.companyId, userId: session.userId, taskId, checkLineId, groupCode, qty, disposition, comment });
+    await resolveControlRemoval({ companyId: s.companyId, userId: session.userId, taskId, checkLineId, ean, qty, disposition, comment });
     revalidatePath("/warehouse/tasks");
     return { ok: true };
   } catch (e) {

@@ -1,4 +1,5 @@
 import "server-only";
+import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/db";
 import { parseEan } from "@/lib/ean";
 
@@ -49,6 +50,20 @@ export async function setItemBarcodeActive(companyId: string, barcodeId: string,
   if (!bc) throw new BarcodeError("Штрихкод не найден");
   if (bc.source === "API") throw new BarcodeError("Штрихкод из интеграции — только для чтения");
   await prisma.itemBarcode.update({ where: { id: bc.id }, data: { isActive } });
+}
+
+// Пакет 9B: EAN → itemId в ПЕРЕДАННОЙ транзакции (для операций Пакетов 4–8). Возвращает itemId
+// только для валидного EAN активного штрихкода активного товара этой организации; иначе null
+// (вызывающий бросает свою доменную ошибку «неизвестный/неактивный/чужой EAN»). Товар определяется
+// EAN однозначно; конкретная группа/партия/ячейка выводится вызывающим из контекста задачи/заказа.
+export async function eanItemIdInTx(tx: Prisma.TransactionClient, companyId: string, raw: string): Promise<string | null> {
+  const parsed = parseEan(raw);
+  if (!parsed) return null;
+  const bc = await tx.itemBarcode.findFirst({
+    where: { companyId, code: parsed.code, isActive: true },
+    include: { item: { select: { id: true, isActive: true } } },
+  });
+  return bc && bc.item.isActive ? bc.itemId : null;
 }
 
 export function barcodeErrorMessage(e: unknown): string {

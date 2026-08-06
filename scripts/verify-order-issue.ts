@@ -50,6 +50,14 @@ const cellBal = async (lotId: string, cid: string) =>
 const totalBal = async (lotId: string) =>
   Number((await prisma.stockBalance.aggregate({ where: { lotId, qty: { gt: 0 } }, _sum: { qty: true } }))._sum.qty ?? 0);
 
+// Пакет 9B: EAN товара — товар сканируется по заводскому штрихкоду, группа выводится из контекста.
+const itemEan = new Map<string, string>();
+const eanOf = (itemId: string) => itemEan.get(itemId)!;
+const lineEan = async (orderId: string, lineId: string) => eanOf((await prisma.externalOrderLine.findFirstOrThrow({ where: { id: lineId, orderId } })).itemId);
+const groupEan = async (gid: string) => eanOf((await prisma.handlingGroup.findFirstOrThrow({ where: { id: gid } })).itemId);
+function ean13(b12: string): string { let s = 0; for (let i = b12.length - 1, k = 0; i >= 0; i--, k++) s += Number(b12[i]) * (k % 2 === 0 ? 3 : 1); return b12 + String((10 - (s % 10)) % 10); }
+async function seedEan(itemId: string, b12: string) { const code = ean13(b12); await prisma.itemBarcode.create({ data: { companyId, itemId, code, symbology: "EAN13", source: "MANUAL" } }); itemEan.set(itemId, code); }
+
 async function mkUser(id: string, phone: string, role: Role) {
   await prisma.user.deleteMany({ where: { id } });
   await prisma.user.create({ data: { id, companyId, phone, name: id, role, isActive: true, allWarehouses: false, passwordHash: await bcrypt.hash("oi", 10), userRoles: { create: { role } }, warehouseLinks: { create: { warehouseId: W } } } });
@@ -83,7 +91,7 @@ async function pickToControl(externalId: string, lines: { externalLineId: string
   for (let i = 0; i < 50; i++) {
     const r = await prisma.stockReservation.findFirst({ where: { orderId: imp.orderId, status: "ACTIVE" } });
     if (!r) break;
-    await pickOrderScan({ companyId, userId: picker, taskId: t.id, cellCode: await cellCode(r.cellId!), groupCode: await groupCode(r.handlingGroupId!), qty: r.qty.toNumber() });
+    await pickOrderScan({ companyId, userId: picker, taskId: t.id, cellCode: await cellCode(r.cellId!), ean: await groupEan(r.handlingGroupId!), qty: r.qty.toNumber() });
   }
   return imp.orderId;
 }
@@ -96,7 +104,7 @@ async function toControlPassed(externalId: string, lines: { externalLineId: stri
   if (t.status === "QUEUED") { await rebalanceQueuedTasks(companyId, { warehouseId: W }); t = await prisma.workflowTask.findUniqueOrThrow({ where: { id: t.id } }); }
   if (t.status === "ASSIGNED" && t.assignedUserId === ctl) await startWorkflowTask(ctl, companyId, t.id);
   await scanOrderForControl({ companyId, userId: ctl, taskId: t.id, orderCode: await orderQr(orderId) });
-  for (const l of await orderLines(orderId)) await markOrderControlByScan({ companyId, userId: ctl, taskId: t.id, groupCode: await ctlGroupCode(orderId, l.id), countedQty: l.requiredQty.toNumber(), discrepancyType: null });
+  for (const l of await orderLines(orderId)) await markOrderControlByScan({ companyId, userId: ctl, taskId: t.id, ean: await lineEan(orderId, l.id), countedQty: l.requiredQty.toNumber(), discrepancyType: null });
   await finishOrderControl({ companyId, userId: ctl, taskId: t.id });
   return orderId;
 }
@@ -121,7 +129,7 @@ async function fullyIssue(orderId: string) {
   const uid = await taskAssignee(tid);
   const firstCell = await reservedCellCode(orderId);
   const oc = await orderQr(orderId);
-  for (const l of await orderLines(orderId)) await placeOrderGroup({ companyId, userId: uid, taskId: tid, orderCode: oc, cellCode: firstCell, groupCode: await ctlGroupCode(orderId, l.id) });
+  for (const l of await orderLines(orderId)) await placeOrderGroup({ companyId, userId: uid, taskId: tid, orderCode: oc, cellCode: firstCell, ean: await lineEan(orderId, l.id) });
   await finishIssuePlacement({ companyId, userId: uid, taskId: tid });
   const dtid = await startLoaderTask(orderId, "DELIVER_ORDER");
   const duid = await taskAssignee(dtid);
@@ -145,6 +153,8 @@ async function provision() {
   const uom = await prisma.uom.create({ data: { companyId, name: "шт OI" } });
   itemA = (await prisma.item.create({ data: { companyId, name: "OI товар A", sku: "OI-A", uomId: uom.id, tracking: "LOT", isActive: true } })).id;
   itemB = (await prisma.item.create({ data: { companyId, name: "OI товар B", sku: "OI-B", uomId: uom.id, tracking: "LOT", isActive: true } })).id;
+  await seedEan(itemA, "460771000001");
+  await seedEan(itemB, "460771000002");
   pk = await mkUser("oi_pk", "+79995570001", "PICKER");
   ctl = await mkUser("oi_ctl", "+79995570002", "CONTROLLER");
   lo = await mkUser("oi_lo", "+79995570003", "LOADER");
@@ -188,6 +198,7 @@ async function cleanup() {
   await prisma.cell.deleteMany({ where: { warehouseId: { in: [W, DW] } } });
   await prisma.warehouseZone.deleteMany({ where: { warehouseId: { in: [W, DW] } } });
   await prisma.user.deleteMany({ where: { id: { in: UIDS } } });
+  await prisma.itemBarcode.deleteMany({ where: { itemId: { in: [itemA, itemB] } } });
   await prisma.item.deleteMany({ where: { id: { in: [itemA, itemB] } } });
   await prisma.warehouse.deleteMany({ where: { id: { in: [W, DW] } } });
   if (demoId) await prisma.company.deleteMany({ where: { id: demoId, slug: "oi-demo" } });
@@ -212,7 +223,7 @@ async function main() {
   const t1 = await startLoaderTask(o1, "ISSUE_ORDER");
   const cc1 = await cellCode(cells1[0].cellId);
   const mvBeforePlace = await lotMv(lotA1);
-  const r1 = await placeOrderGroup({ companyId, userId: lo, taskId: t1, orderCode: await orderQr(o1), cellCode: cc1, groupCode: await ctlGroupCode(o1, (await orderLines(o1))[0].id) });
+  const r1 = await placeOrderGroup({ companyId, userId: lo, taskId: t1, orderCode: await orderQr(o1), cellCode: cc1, ean: await lineEan(o1, (await orderLines(o1))[0].id) });
   ok("[S1] размещено (не повтор)", r1.placed && !r1.alreadyPlaced);
   ok("[S11] товар перемещён в ячейку (ядро, +1 движение): в ячейке 5, в CONTROL 0", (await cellBal(lotA1, cells1[0].cellId)) === 5 && (await zoneBal(lotA1, zControl)) === 0 && (await lotMv(lotA1)) === mvBeforePlace + 1);
   ok("[S1] ячейка стала PLACED", (await prisma.orderIssueCell.findUniqueOrThrow({ where: { id: cells1[0].id } })).status === "PLACED");
@@ -221,7 +232,7 @@ async function main() {
 
   console.log("S10) идемпотентность размещения: повтор скана → без второго движения/строки");
   const mvAfterPlace = await lotMv(lotA1);
-  const r1r = await placeOrderGroup({ companyId, userId: lo, taskId: t1, orderCode: await orderQr(o1), cellCode: cc1, groupCode: await ctlGroupCode(o1, (await orderLines(o1))[0].id) });
+  const r1r = await placeOrderGroup({ companyId, userId: lo, taskId: t1, orderCode: await orderQr(o1), cellCode: cc1, ean: await lineEan(o1, (await orderLines(o1))[0].id) });
   ok("[S10] повтор размещения идемпотентен (alreadyPlaced, без движения, без дубля строки)", r1r.alreadyPlaced && (await lotMv(lotA1)) === mvAfterPlace && (await prisma.orderIssuePlacement.count({ where: { orderId: o1 } })) === 1);
 
   console.log("S1) «Готово» → READY_FOR_DRIVER + задача выдачи (DELIVER_ORDER)");
@@ -254,12 +265,12 @@ async function main() {
   const [o2a, o2b] = await orderLines(o2);
   const t2 = await startLoaderTask(o2, "ISSUE_ORDER");
   const cell2a = await reservedCellCode(o2);
-  await placeOrderGroup({ companyId, userId: lo, taskId: t2, orderCode: await orderQr(o2), cellCode: cell2a, groupCode: await ctlGroupCode(o2, o2a.id) });
+  await placeOrderGroup({ companyId, userId: lo, taskId: t2, orderCode: await orderQr(o2), cellCode: cell2a, ean: await lineEan(o2, o2a.id) });
   const eEarly = await err(() => finishIssuePlacement({ companyId, userId: lo, taskId: t2 }));
   ok("[S7] нельзя «Готово», пока не весь заказ перемещён из контроля", /Не весь заказ перемещён/.test(eEarly), eEarly);
   const addRes = await addIssueCell({ companyId, userId: lo, taskId: t2, cellCode: await cellCode(await cellId("OI-I2")) });
   ok("[S2] «Добавить ячейку» → вторая ячейка зарезервирована", addRes.added && !addRes.alreadyReserved && (await activeCells(o2)).length === 2);
-  await placeOrderGroup({ companyId, userId: lo, taskId: t2, orderCode: await orderQr(o2), cellCode: await cellCode(await cellId("OI-I2")), groupCode: await ctlGroupCode(o2, o2b.id) });
+  await placeOrderGroup({ companyId, userId: lo, taskId: t2, orderCode: await orderQr(o2), cellCode: await cellCode(await cellId("OI-I2")), ean: await lineEan(o2, o2b.id) });
   const lotB2 = await lotOfLine(o2, o2b.id);
   ok("[S2] itemB размещён во вторую ячейку", (await cellBal(lotB2, await cellId("OI-I2"))) === 3);
   const fin2 = await finishIssuePlacement({ companyId, userId: lo, taskId: t2 });
@@ -277,18 +288,18 @@ async function main() {
   const o3 = await toControlPassed("OI-3", [{ externalLineId: "1", itemId: itemA, qty: 2, cell: "OI-L1D" }]);
   const t3 = await startLoaderTask(o3, "ISSUE_ORDER");
   const cc3 = await reservedCellCode(o3);
-  const gc3 = await ctlGroupCode(o3, (await orderLines(o3))[0].id);
+  const gc3 = eanOf(itemA);
   const demoOrder = await prisma.externalOrder.create({ data: { companyId: demoId, warehouseId: DW, externalId: "OI-DEMO", status: "CONTROL_PASSED", payloadHash: "x", createdById: pk } });
   const demoQr = await prisma.$transaction((tx) => createQrIn(tx, { companyId: demoId, type: "ORDER", refId: demoOrder.id }));
-  const eForeign = await err(() => placeOrderGroup({ companyId, userId: lo, taskId: t3, orderCode: demoQr, cellCode: cc3, groupCode: gc3 }));
+  const eForeign = await err(() => placeOrderGroup({ companyId, userId: lo, taskId: t3, orderCode: demoQr, cellCode: cc3, ean: gc3 }));
   ok("[S8] чужой tenant (ORDER-QR другой организации) — отказ", /этой организации/.test(eForeign), eForeign);
   const o2qr2 = await orderQr(o2);
-  const eWrongOrder = await err(() => placeOrderGroup({ companyId, userId: lo, taskId: t3, orderCode: o2qr2, cellCode: cc3, groupCode: gc3 }));
+  const eWrongOrder = await err(() => placeOrderGroup({ companyId, userId: lo, taskId: t3, orderCode: o2qr2, cellCode: cc3, ean: gc3 }));
   ok("[S8] не тот заказ — отказ", /не тот заказ/.test(eWrongOrder), eWrongOrder);
-  const eBadQr = await err(() => placeOrderGroup({ companyId, userId: lo, taskId: t3, orderCode: "ZZZZZZZZZZ", cellCode: cc3, groupCode: gc3 }));
+  const eBadQr = await err(() => placeOrderGroup({ companyId, userId: lo, taskId: t3, orderCode: "ZZZZZZZZZZ", cellCode: cc3, ean: gc3 }));
   ok("[S8] неверный QR заказа — отказ", eBadQr.length > 0, eBadQr);
   const o3qr = await orderQr(o3);
-  const eForeignTask = await err(() => placeOrderGroup({ companyId, userId: pk, taskId: t3, orderCode: o3qr, cellCode: cc3, groupCode: gc3 }));
+  const eForeignTask = await err(() => placeOrderGroup({ companyId, userId: pk, taskId: t3, orderCode: o3qr, cellCode: cc3, ean: gc3 }));
   ok("[S8] чужой исполнитель (не назначен) — отказ", /не ваша задача/.test(eForeignTask), eForeignTask);
   await fullyIssue(o3); // довести до ISSUED (освободить ячейку)
 
@@ -346,7 +357,7 @@ async function main() {
   const aCellId = (await activeCells(oSA))[0].cellId;
   const tSA = await startLoaderTask(oSA, "ISSUE_ORDER"); const uSA = await taskAssignee(tSA);
   const ccSA = await cellCode(aCellId);
-  await placeOrderGroup({ companyId, userId: uSA, taskId: tSA, orderCode: await orderQr(oSA), cellCode: ccSA, groupCode: await ctlGroupCode(oSA, laA.id) });
+  await placeOrderGroup({ companyId, userId: uSA, taskId: tSA, orderCode: await orderQr(oSA), cellCode: ccSA, ean: await lineEan(oSA, laA.id) });
   ok("[P1.1] A разместил РОВНО 4 в свою ячейку (не 8)", (await cellBal(shLot, aCellId)) === 4);
   ok("[P1.1] доля B в CONTROL не тронута (осталось 4)", (await zoneBal(shLot, zControl)) === 4);
   ok("[P1.1] OrderIssuePlacement A = 4", Number((await prisma.orderIssuePlacement.aggregate({ where: { orderId: oSA }, _sum: { qty: true } }))._sum.qty ?? 0) === 4);
@@ -355,7 +366,7 @@ async function main() {
   const ctxB0 = await getIssueOrderContext(companyId, (await issueTaskOf(oSB))!.id);
   ok("[P1.1] remaining(B)=4 (не тронут размещением A)", ctxB0?.remainingInControl === "4");
   const mvSh1 = await lotMv(shLot);
-  const repA = await placeOrderGroup({ companyId, userId: uSA, taskId: tSA, orderCode: await orderQr(oSA), cellCode: ccSA, groupCode: await ctlGroupCode(oSA, laA.id) });
+  const repA = await placeOrderGroup({ companyId, userId: uSA, taskId: tSA, orderCode: await orderQr(oSA), cellCode: ccSA, ean: await lineEan(oSA, laA.id) });
   ok("[P1.1] повтор размещения A идемпотентен (без второго движения)", repA.alreadyPlaced && (await lotMv(shLot)) === mvSh1);
   await finishIssuePlacement({ companyId, userId: uSA, taskId: tSA });
   const dSA = await startLoaderTask(oSA, "DELIVER_ORDER"); const duSA = await taskAssignee(dSA);

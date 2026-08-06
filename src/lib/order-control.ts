@@ -5,6 +5,7 @@ import { parseScannedCode } from "@/lib/qr";
 import { logEvent } from "@/lib/events";
 import { applyLotMovement, type Loc } from "@/lib/stock";
 import { lockCell } from "@/lib/cells";
+import { eanItemIdInTx } from "@/lib/barcodes";
 import { orderIssueEnabled } from "@/lib/roles";
 import { assignIssueCellInTx } from "@/lib/order-issue";
 import { TASK_TYPES } from "@/lib/workflow-task-types";
@@ -170,7 +171,7 @@ export async function markOrderControlByScan(input: {
   companyId: string;
   userId: string;
   taskId: string;
-  groupCode: string;
+  ean: string;
   countedQty: number;
   discrepancyType?: string | null;
   comment?: string | null;
@@ -184,41 +185,42 @@ export async function markOrderControlByScan(input: {
     const check = await tx.controlCheck.findUnique({ where: { taskId: task.id } });
     if (!check) throw new OrderControlError("Сначала отсканируйте QR заказа");
     if (check.status !== "IN_PROGRESS") throw new OrderControlError("Проверка уже завершена");
-    const scanned = await resolveScannedGroup(tx, input.companyId, input.groupCode);
-    if (scanned.warehouseId !== order.warehouseId) throw new OrderControlError("Группа не на складе этого заказа");
+    // Пакет 9B: товар — по EAN. Ожидаемая строка определяется заказом и товаром.
+    const itemId = await eanItemIdInTx(tx, input.companyId, input.ean);
+    if (!itemId) throw new OrderControlError("Неизвестный, неактивный или чужой EAN — контроль отклонён");
     const counted = D(input.countedQty);
     if (counted.lt(0)) throw new OrderControlError("Количество не может быть отрицательным");
     const explicit = parseDiscrepancyType(input.discrepancyType);
     const comment = input.comment?.trim() || null;
-    // связь с заказом: резерв этого заказа на эту группу → строка заказа
-    const resv = await tx.stockReservation.findFirst({ where: { orderId: order.id, handlingGroupId: scanned.groupId }, select: { lineId: true } });
-    if (resv) {
-      const cl = await tx.controlCheckLine.findFirst({ where: { checkId: check.id, lineId: resv.lineId } });
-      if (!cl) throw new OrderControlError("Строка не относится к этой проверке");
+    // строки заказа этого товара в проверке — детерминированно по id; берём первую ещё не отмеченную,
+    // иначе первую (перепроверка). Несколько строк одного товара обрабатываются без случайного выбора.
+    const itemLines = await tx.controlCheckLine.findMany({ where: { checkId: check.id, lineId: { not: null }, itemId }, orderBy: { id: "asc" } });
+    const cl = itemLines.find((l) => l.countedQty === null) ?? itemLines[0] ?? null;
+    if (cl) {
       let type = explicit;
       if (!counted.equals(cl.expectedQty) && !type) type = counted.lt(cl.expectedQty) ? "SHORTAGE" : "EXCESS";
       else if (counted.equals(cl.expectedQty) && (type === "SHORTAGE" || type === "EXCESS")) type = null;
       await tx.controlCheckLine.update({
         where: { id: cl.id },
-        data: { countedQty: counted, discrepancyType: type, handlingGroupId: scanned.groupId, comment, byUserId: input.userId, checkedAt: new Date() },
+        data: { countedQty: counted, discrepancyType: type, comment, byUserId: input.userId, checkedAt: new Date() },
       });
-      return { lineId: resv.lineId, itemId: scanned.itemId, discrepancyType: type };
+      return { lineId: cl.lineId, itemId, discrepancyType: type };
     }
-    // неожиданный товар: не связан с заказом → EXCESS/WRONG_ITEM обязателен
+    // неожиданный товар: нет строки заказа с этим товаром → EXCESS/WRONG_ITEM обязателен
     if (explicit !== "EXCESS" && explicit !== "WRONG_ITEM")
       throw new OrderControlError("Неожиданный товар: укажите тип «излишек» или «не тот товар»");
-    const existing = await tx.controlCheckLine.findFirst({ where: { checkId: check.id, lineId: null, handlingGroupId: scanned.groupId } });
+    const existing = await tx.controlCheckLine.findFirst({ where: { checkId: check.id, lineId: null, itemId } });
     if (existing) {
       await tx.controlCheckLine.update({
         where: { id: existing.id },
         data: { countedQty: counted, discrepancyType: explicit, comment, byUserId: input.userId, checkedAt: new Date() },
       });
-      return { lineId: null, itemId: scanned.itemId, discrepancyType: explicit };
+      return { lineId: null, itemId, discrepancyType: explicit };
     }
     await tx.controlCheckLine.create({
-      data: { companyId: input.companyId, checkId: check.id, lineId: null, itemId: scanned.itemId, expectedQty: D(0), countedQty: counted, discrepancyType: explicit, handlingGroupId: scanned.groupId, comment, byUserId: input.userId, checkedAt: new Date() },
+      data: { companyId: input.companyId, checkId: check.id, lineId: null, itemId, expectedQty: D(0), countedQty: counted, discrepancyType: explicit, comment, byUserId: input.userId, checkedAt: new Date() },
     });
-    return { lineId: null, itemId: scanned.itemId, discrepancyType: explicit };
+    return { lineId: null, itemId, discrepancyType: explicit };
   });
 }
 
@@ -347,18 +349,19 @@ export async function resolveControlShortage(input: {
   userId: string;
   taskId: string;
   checkLineId: string;
-  groupCode: string;
+  ean: string;
   qty: number;
   comment?: string | null;
 }): Promise<{ resolved: boolean; alreadyResolved: boolean }> {
   return prisma.$transaction(async (tx) => {
     await lockCompany(tx, input.companyId);
-    const { order, cl } = await loadResolutionCtx(tx, input.companyId, input.userId, input.taskId, input.checkLineId);
+    const { cl } = await loadResolutionCtx(tx, input.companyId, input.userId, input.taskId, input.checkLineId);
     if (cl.discrepancyType !== "SHORTAGE") throw new OrderControlError("Эта строка не недостача");
     if (cl.resolutionStatus === "RESOLVED") return { resolved: true, alreadyResolved: true };
-    const scanned = await resolveScannedGroup(tx, input.companyId, input.groupCode);
-    if (scanned.warehouseId !== order.warehouseId) throw new OrderControlError("Группа не на складе этого заказа");
-    if (scanned.itemId !== cl.itemId) throw new OrderControlError("Отсканирован не тот товар (ожидается товар недостающей строки)");
+    // строка известна из checkLineId; EAN лишь подтверждает товар недостающей строки
+    const itemId = await eanItemIdInTx(tx, input.companyId, input.ean);
+    if (!itemId) throw new OrderControlError("Неизвестный, неактивный или чужой EAN — исправление отклонено");
+    if (itemId !== cl.itemId) throw new OrderControlError("Отсканирован не тот товар (ожидается товар недостающей строки)");
     const q = D(input.qty);
     if (q.lte(0)) throw new OrderControlError("Количество должно быть больше нуля");
     // выравнивание к ledger — без движения остатка
@@ -376,7 +379,7 @@ export async function resolveControlRemoval(input: {
   userId: string;
   taskId: string;
   checkLineId: string;
-  groupCode: string;
+  ean: string;
   qty: number;
   disposition: "RETURN" | "DISCREPANCY";
   comment?: string | null;
@@ -388,30 +391,39 @@ export async function resolveControlRemoval(input: {
     if (cl.resolutionStatus === "RESOLVED") return { alreadyResolved: true, moved: false, warehouseId: order.warehouseId };
     if ((cl.discrepancyType === "DAMAGED" || cl.discrepancyType === "OTHER") && input.disposition !== "DISCREPANCY")
       throw new OrderControlError("Повреждённый/прочий товар можно только изолировать в зону DISCREPANCY");
-    const scanned = await resolveScannedGroup(tx, input.companyId, input.groupCode);
-    if (scanned.warehouseId !== order.warehouseId) throw new OrderControlError("Группа не на складе этого заказа");
-    if (scanned.itemId !== cl.itemId) throw new OrderControlError("Отсканирован не тот товар этого расхождения");
+    const itemId = await eanItemIdInTx(tx, input.companyId, input.ean);
+    if (!itemId) throw new OrderControlError("Неизвестный, неактивный или чужой EAN — исправление отклонено");
+    if (itemId !== cl.itemId) throw new OrderControlError("Отсканирован не тот товар этого расхождения");
     const q = D(input.qty);
     if (q.lte(0)) throw new OrderControlError("Количество должно быть больше нуля");
-    // источник перемещения: строка заказа → зона CONTROL (товар заказа там после сборки);
-    // неожиданный товар (lineId=null) → текущее место остатка отсканированной группы.
+    // источник и партия: строка заказа → зона CONTROL, партия из резерва строки; неожиданный товар
+    // (lineId=null) → место и партия единственного остатка этого товара (при неоднозначности — fail-closed).
     let from: Loc;
+    let lotId: string;
     if (cl.lineId) {
       const controlZone = await tx.warehouseZone.findFirst({ where: { companyId: input.companyId, warehouseId: order.warehouseId, kind: "CONTROL" }, select: { id: true } });
       if (!controlZone) throw new OrderControlError("На складе нет зоны CONTROL");
       from = { kind: "zone", warehouseId: order.warehouseId, zoneId: controlZone.id };
+      const resv = await tx.stockReservation.findFirst({ where: { orderId: order.id, lineId: cl.lineId, lotId: { not: null } }, select: { lotId: true } });
+      if (!resv?.lotId) throw new OrderControlError("Не найдена партия строки заказа");
+      lotId = resv.lotId;
     } else {
-      const bal = await tx.stockBalance.findFirst({ where: { companyId: input.companyId, lotId: scanned.lotId, qty: { gt: 0 } }, select: { cellId: true, zoneId: true } });
-      if (!bal) throw new OrderControlError("Нет остатка группы для перемещения");
+      const itemLots = await tx.lot.findMany({ where: { companyId: input.companyId, itemId }, select: { id: true } });
+      const bals = await tx.stockBalance.findMany({ where: { companyId: input.companyId, lotId: { in: itemLots.map((l) => l.id) }, qty: { gt: 0 } }, select: { lotId: true, cellId: true, zoneId: true } });
+      const lots = new Set(bals.map((b) => b.lotId));
+      if (lots.size === 0) throw new OrderControlError("Нет остатка этого товара для перемещения");
+      if (lots.size > 1) throw new OrderControlError("Несколько партий этого товара с остатком — исправление неоднозначно");
+      const bal = bals[0];
+      lotId = bal.lotId;
       if (bal.cellId) { await lockCell(tx, input.companyId, bal.cellId); from = { kind: "cell", warehouseId: order.warehouseId, cellId: bal.cellId }; }
       else if (bal.zoneId) from = { kind: "zone", warehouseId: order.warehouseId, zoneId: bal.zoneId };
-      else throw new OrderControlError("Не определить место остатка группы");
+      else throw new OrderControlError("Не определить место остатка товара");
     }
     if (input.disposition === "DISCREPANCY") {
       const discZone = await tx.warehouseZone.findFirst({ where: { companyId: input.companyId, warehouseId: order.warehouseId, kind: "DISCREPANCY" }, select: { id: true } });
       if (!discZone) throw new OrderControlError("На складе нет зоны DISCREPANCY — исправление невозможно, оставьте задачу незавершённой");
       await applyLotMovement(tx, {
-        companyId: input.companyId, docType: "INVENTORY", docId: order.id, itemId: scanned.itemId, lotId: scanned.lotId, qty: q,
+        companyId: input.companyId, docType: "INVENTORY", docId: order.id, itemId, lotId, qty: q,
         from, to: { kind: "zone", warehouseId: order.warehouseId, zoneId: discZone.id }, createdById: input.userId,
       });
       await markResolved(tx, cl.id, "ISOLATED_DISCREPANCY", input.userId, input.comment, `изолировано ${q.toString()} в DISCREPANCY`);
@@ -422,7 +434,7 @@ export async function resolveControlRemoval(input: {
       if (!src?.cellId) throw new OrderControlError("Не найдена ячейка возврата — используйте изоляцию в DISCREPANCY");
       await lockCell(tx, input.companyId, src.cellId);
       await applyLotMovement(tx, {
-        companyId: input.companyId, docType: "TRANSFER", docId: order.id, itemId: scanned.itemId, lotId: scanned.lotId, qty: q,
+        companyId: input.companyId, docType: "TRANSFER", docId: order.id, itemId, lotId, qty: q,
         from, to: { kind: "cell", warehouseId: order.warehouseId, cellId: src.cellId }, createdById: input.userId,
       });
       await markResolved(tx, cl.id, "RETURNED", input.userId, input.comment, `возвращено ${q.toString()} в хранение`);

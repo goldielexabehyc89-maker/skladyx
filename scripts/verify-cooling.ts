@@ -6,7 +6,7 @@
 import { PrismaClient, type Role } from "@prisma/client";
 import bcrypt from "bcryptjs";
 import { createHandlingGroup, completeGroupPlacement } from "@/lib/group-receiving";
-import { completeCoolingRetrieval, estimateReadyAt } from "@/lib/cooling";
+import { prepareCoolingRetrieval, placeCoolingRetrieval, estimateReadyAt } from "@/lib/cooling";
 import { ensureStandardZones, createCellsInZone, assertCellNotHeldByGroup } from "@/lib/cells";
 import { startWorkflowTask, rebalanceQueuedTasks, cancelWorkflowTask } from "@/lib/workflow-tasks";
 import { updateSettings } from "@/lib/settings";
@@ -45,25 +45,38 @@ const freeLoader = (u: string) => prisma.workflowTask.updateMany({ where: { assi
 const endShift = (u: string) => prisma.workShift.updateMany({ where: { userId: u, endedAt: null }, data: { endedAt: new Date() } });
 
 const mkGroup = (temp: number, qty = 4) => createHandlingGroup({ companyId, warehouseId: W, itemId: lotItem, qty, temperature: temp, acceptedById: RUSER, dedupeKey: dk() });
-// поставить группу в ячейку через реальный поток (PLACE_GROUP: назначить→начать→завершить)
+// Пакет 9B: EAN товара + QR ячейки
+const cellQr = async (cid: string) => (await prisma.qrCode.findFirstOrThrow({ where: { type: "CELL", refId: cid } })).code;
+let lotEan = "";
+// поставить группу в ячейку через реальный поток (PLACE_GROUP: назначить→начать→завершить + скан EAN)
 async function place(loader: string, groupId: string, cell: string): Promise<string> {
   const t = await placeTaskOf(groupId);
   if (!t) return "нет задачи размещения";
   await startWorkflowTask(loader, companyId, t.id);
-  return err(() => completeGroupPlacement({ companyId, userId: loader, taskId: t.id, cellId: cell }));
+  return err(() => completeGroupPlacement({ companyId, userId: loader, taskId: t.id, cellId: cell, ean: lotEan }));
 }
 // активировать наступившую отложенную задачу (тест: сдвигаем срок в прошлое) и назначить
 async function makeDue(taskId: string) {
   await prisma.workflowTask.update({ where: { id: taskId }, data: { availableAt: new Date(Date.now() - 60_000) } });
   await rebalanceQueuedTasks(companyId);
 }
-// выполнить срочный забор с фактической температурой
+// Пакет 9B двухфазный забор: Фаза 1 — скан исходной COOLING-ячейки + EAN + температура; если готово
+// (temp<=X) — Фаза 2: скан назначенной целевой ячейки → физическое размещение через ядро.
 async function retrieve(loader: string, sessionId: string, temp: number): Promise<string> {
   const t = await retrieveTaskOf(sessionId);
   if (!t) return "нет задачи забора";
   await makeDue(t.id);
   await startWorkflowTask(loader, companyId, t.id);
-  return err(() => completeCoolingRetrieval({ companyId, userId: loader, taskId: t.id, temperature: temp }));
+  const session = await prisma.coolingSession.findFirstOrThrow({ where: { id: sessionId } });
+  const fromCode = await cellQr(session.coolingCellId);
+  return err(async () => {
+    const r = await prepareCoolingRetrieval({ companyId, userId: loader, taskId: t.id, fromCellCode: fromCode, ean: lotEan, temperature: temp });
+    if (r.ready) {
+      const cr = await prisma.cellReservation.findFirstOrThrow({ where: { sessionId, status: "ACTIVE" } });
+      const targetQr = await cellQr(cr.cellId);
+      await placeCoolingRetrieval({ companyId, userId: loader, taskId: t.id, fromCellCode: fromCode, ean: lotEan, targetCellCode: targetQr });
+    }
+  });
 }
 
 async function provision() {
@@ -82,6 +95,7 @@ async function provision() {
   C1 = await cellId("P5-C1"); C2 = await cellId("P5-C2");
   const uom = await prisma.uom.create({ data: { companyId, name: "шт P5" } });
   lotItem = (await prisma.item.create({ data: { companyId, name: "P5 товар", sku: "P5-LOT", uomId: uom.id, tracking: "LOT", isActive: true } })).id;
+  { function ec(b:string){let s=0;for(let i=b.length-1,k=0;i>=0;i--,k++)s+=Number(b[i])*(k%2===0?3:1);return b+String((10-(s%10))%10);} lotEan = ec("460775000001"); await prisma.itemBarcode.create({ data: { companyId, itemId: lotItem, code: lotEan, symbology: "EAN13", source: "MANUAL" } }); }
   const demo = await prisma.company.upsert({ where: { slug: "p5-demo" }, update: {}, create: { name: "P5 Demo", slug: "p5-demo", settings: {} } });
   demoId = demo.id;
   DW = (await prisma.warehouse.create({ data: { companyId: demoId, name: "P5 DW", isActive: true, coolingRate: 2 } })).id;
@@ -118,6 +132,7 @@ async function cleanup() {
   await prisma.cell.deleteMany({ where: { warehouseId: { in: whs } } });
   await prisma.warehouseZone.deleteMany({ where: { warehouseId: { in: whs } } });
   await prisma.user.deleteMany({ where: { id: { in: UIDS } } });
+  await prisma.itemBarcode.deleteMany({ where: { itemId: lotItem } });
   await prisma.item.deleteMany({ where: { id: lotItem } });
   await prisma.warehouse.deleteMany({ where: { id: W } });
   if (demoId) {
@@ -220,8 +235,8 @@ async function main() {
   await startWorkflowTask(L1, companyId, pt1!.id);
   await startWorkflowTask(L2, companyId, pt2!.id);
   const [rc1, rc2] = await Promise.all([
-    err(() => completeGroupPlacement({ companyId, userId: L1, taskId: pt1!.id, cellId: C1 })),
-    err(() => completeGroupPlacement({ companyId, userId: L2, taskId: pt2!.id, cellId: C2 })),
+    err(() => completeGroupPlacement({ companyId, userId: L1, taskId: pt1!.id, cellId: C1, ean: lotEan })),
+    err(() => completeGroupPlacement({ companyId, userId: L2, taskId: pt2!.id, cellId: C2, ean: lotEan })),
   ]);
   ok("успешна ровно одна сессия охлаждения (вторая — нет свободного резерва)", (rc1 === "") !== (rc2 === ""), `rc1="${rc1}" rc2="${rc2}"`);
   ok("на единственной свободной ячейке ур.3 — ровно одна активная бронь", (await prisma.cellReservation.count({ where: { cellId: S3b, status: "ACTIVE" } })) === 1);
@@ -230,7 +245,7 @@ async function main() {
   console.log("12) tenant-изоляция");
   const foreign = await err(() => createHandlingGroup({ companyId, warehouseId: DW, itemId: lotItem, qty: 4, temperature: 9, acceptedById: RUSER, dedupeKey: dk() }));
   ok("приёмка на чужой склад → отказ", !!foreign);
-  const foreignRetr = await err(() => completeCoolingRetrieval({ companyId: demoId, userId: L1, taskId: rt2!.id, temperature: 4 }));
+  const foreignRetr = await err(() => prepareCoolingRetrieval({ companyId: demoId, userId: L1, taskId: rt2!.id, fromCellCode: "XXXXXXXXXX", ean: lotEan, temperature: 4 }));
   ok("забор чужой сессии (другой companyId) → отказ", !!foreignRetr);
 
   console.log("13) push не создаётся");

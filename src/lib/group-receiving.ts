@@ -3,11 +3,11 @@ import { Prisma, type HandlingGroupStatus } from "@prisma/client";
 import { prisma } from "@/lib/db";
 import { applyLotMovement } from "@/lib/stock";
 import { lockCell } from "@/lib/cells";
-import { createQrIn } from "@/lib/qr";
 import { nextNumber } from "@/lib/counters";
 import { getSettings } from "@/lib/settings";
 import { fmtDateTime } from "@/lib/format";
 import { coolingWorkflowEnabled } from "@/lib/roles";
+import { eanItemIdInTx } from "@/lib/barcodes";
 import { startCoolingInTx } from "@/lib/cooling";
 import {
   lockCompany,
@@ -153,7 +153,9 @@ export async function createHandlingGroup(input: {
         acceptedAt: now,
       },
     });
-    const qrCode = await createQrIn(tx, { companyId: input.companyId, type: "GROUP", refId: group.id });
+    // Пакет 9B: новые группы БЕЗ собственного GROUP QR и этикетки паллеты. Товар определяется EAN,
+    // конкретная группа — задачей/резервом. Старые GROUP QR не удаляем, но новые не создаём.
+    const qrCode: string | null = null;
 
     // задача погрузчику PLACE_GROUP (авто-назначение по загрузке смен)
     const route = status === "AWAITING_STORAGE" ? "хранение" : "охлаждение";
@@ -184,6 +186,7 @@ export async function completeGroupPlacement(input: {
   userId: string;
   taskId: string;
   cellId: string;
+  ean: string;
 }): Promise<{ warehouseId: string }> {
   const res = await prisma.$transaction(async (tx) => {
     await lockCompany(tx, input.companyId);
@@ -196,6 +199,11 @@ export async function completeGroupPlacement(input: {
 
     const group = await tx.handlingGroup.findFirst({ where: { id: task.subjectId ?? "", companyId: input.companyId } });
     if (!group) throw new GroupError("Группа не найдена");
+    // Пакет 9B: подтверждение EAN — задача однозначно определяет группу, отсканированный товар обязан
+    // совпасть с товаром группы. Неизвестный/неактивный/чужой EAN или не тот товар — отказ.
+    const scannedItemId = await eanItemIdInTx(tx, input.companyId, input.ean);
+    if (!scannedItemId) throw new GroupError("Неизвестный, неактивный или чужой EAN — размещение отклонено");
+    if (scannedItemId !== group.itemId) throw new GroupError("Отсканирован не тот товар (EAN не совпадает с группой)");
     if (group.status !== "AWAITING_STORAGE" && group.status !== "AWAITING_COOLING")
       throw new GroupError("Группа уже размещена");
     const targetKind = group.status === "AWAITING_STORAGE" ? "STORAGE" : "COOLING";

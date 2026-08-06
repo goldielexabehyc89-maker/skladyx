@@ -13,7 +13,9 @@ import {
   type ControlActionState,
 } from "@/app/actions/order-control";
 import { Button, Badge } from "@/components/ui";
-import { WorkflowSheet } from "@/components/workflow-sheet";
+import { WorkflowSheet, type ScanFormat } from "@/components/workflow-sheet";
+const PRODUCT: ScanFormat[] = ["ean_8", "ean_13"];
+const ORDERF: ScanFormat[] = ["qr_code"];
 
 // Этап 5/Пакет 7 (+коррекция): контролёр сканирует QR заказа, затем QR каждой группы/товара +
 // количество (неожиданный товар — отдельной строкой). Сборщик исправляет КАЖДОЕ расхождение
@@ -95,6 +97,7 @@ function ScanOrderCamera({ taskId }: { taskId: string }) {
       subtitle="Отсканируйте QR заказа"
       scanning={scanning}
       scanHint="Сканируйте QR заказа"
+      scanFormats={ORDERF}
       onScan={handleScan}
       scanPaused={busy}
       busy={busy}
@@ -134,25 +137,25 @@ function MarkGroupScanner({ taskId }: { taskId: string }) {
   const router = useRouter();
   const [open, setOpen] = useState(false);
   const [scanning, setScanning] = useState(false);
-  const [step, setStep] = useState<"group" | "qty">("group");
-  const [groupRaw, setGroupRaw] = useState("");
+  const [step, setStep] = useState<"product" | "qty">("product");
+  const [eanRaw, setEanRaw] = useState("");
   const [qty, setQty] = useState("");
   const [type, setType] = useState("");
   const [busy, startTransition] = useTransition();
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
-  function reset() { setStep("group"); setGroupRaw(""); setQty(""); setType(""); setNotice(null); }
+  function reset() { setStep("product"); setEanRaw(""); setQty(""); setType(""); setNotice(null); }
   function handleScan(raw: string) {
     if (busy) return;
-    setGroupRaw(raw); setScanning(false); setStep("qty"); setNotice("Группа отсканирована — введите количество");
+    setEanRaw(raw); setScanning(false); setStep("qty"); setNotice("Товар отсканирован — введите количество");
   }
   function submit() {
     const n = Number(qty.replace(",", "."));
     if (!Number.isFinite(n) || n < 0) { setError("Укажите количество"); return; }
     startTransition(async () => {
       const fd = new FormData();
-      fd.set("taskId", taskId); fd.set("groupCode", groupRaw); fd.set("countedQty", String(n)); fd.set("discrepancyType", type);
+      fd.set("taskId", taskId); fd.set("ean", eanRaw); fd.set("countedQty", String(n)); fd.set("discrepancyType", type);
       const res = await markControlScanAction({}, fd);
       if (res.error) { setError(res.error); return; }
       reset(); router.refresh();
@@ -160,16 +163,17 @@ function MarkGroupScanner({ taskId }: { taskId: string }) {
   }
   if (!open)
     return (
-      <Button type="button" variant="primary" onClick={() => { setOpen(true); setScanning(true); setStep("group"); }} className="w-full">
+      <Button type="button" variant="primary" onClick={() => { setOpen(true); setScanning(true); setStep("product"); }} className="w-full">
         <ScanLine size={18} /> Проверить группу (сканирование)
       </Button>
     );
   return (
     <WorkflowSheet
       title="Проверка группы"
-      subtitle="Сканируйте QR группы/партии, затем количество"
+      subtitle="Сканируйте EAN товара, затем количество"
       scanning={scanning}
-      scanHint="Сканируйте QR группы/партии"
+      scanHint="Сканируйте EAN товара"
+      scanFormats={PRODUCT}
       onScan={handleScan}
       scanPaused={busy}
       busy={busy}
@@ -193,14 +197,14 @@ function MarkGroupScanner({ taskId }: { taskId: string }) {
             <Button type="button" variant="ghost" onClick={reset} className="w-full">Заново сканировать</Button>
           </>
         ) : (
-          <Button type="button" variant="primary" onClick={() => { setScanning(true); setStep("group"); setNotice(null); }} className="w-full">
-            <ScanLine size={18} /> Сканировать группу
+          <Button type="button" variant="primary" onClick={() => { setScanning(true); setStep("product"); setNotice(null); }} className="w-full">
+            <ScanLine size={18} /> Сканировать товар (EAN)
           </Button>
         )
       }
     >
       {notice && <p className="pb-1 text-sm font-medium text-green-600">{notice}</p>}
-      <p className="text-sm text-neutral-500">Сканируйте каждую группу/партию заказа и вводите фактическое количество. Неожиданный товар отметьте как «излишек» или «не тот товар».</p>
+      <p className="text-sm text-neutral-500">Сканируйте каждый товар заказа и вводите фактическое количество. Неожиданный товар отметьте как «излишек» или «не тот товар».</p>
     </WorkflowSheet>
   );
 }
@@ -212,7 +216,7 @@ function MarkGroupManual({ taskId }: { taskId: string }) {
       <summary className="cursor-pointer">Ввести код группы вручную (без камеры)</summary>
       <form action={action} className="mt-2 flex flex-col gap-2">
         <input type="hidden" name="taskId" value={taskId} />
-        <input name="groupCode" required placeholder="Код QR группы/партии" className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm" />
+        <input name="ean" required placeholder="EAN товара (8/13 цифр)" className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm" />
         <input name="countedQty" required type="number" inputMode="decimal" step="1" placeholder="Фактическое количество" className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm" />
         <select name="discrepancyType" className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm">
           <option value="">авто (по количеству)</option>
@@ -258,7 +262,7 @@ export function ControlOrderPanel({ ctx }: { ctx: ControlOrderCtx }) {
         <>
           <ScanOrderCamera taskId={ctx.taskId} />
           <ScanOrderManual taskId={ctx.taskId} />
-          <p className="text-xs text-neutral-400">Отсканируйте QR заказа, затем проверьте каждую группу/товар по QR.</p>
+          <p className="text-xs text-neutral-400">Отсканируйте QR заказа, затем проверьте каждый товар по EAN.</p>
         </>
       ) : (
         <>
@@ -315,7 +319,7 @@ function ResolveDiscrepancy({ taskId, disc }: { taskId: string; disc: CorrectOrd
         <form action={formAction} className="mt-2 flex flex-col gap-2">
           <input type="hidden" name="taskId" value={taskId} />
           <input type="hidden" name="checkLineId" value={disc.checkLineId} />
-          <input name="groupCode" required defaultValue={disc.groupCode ?? ""} placeholder={isShortage ? "QR добавляемого товара/группы" : "QR удаляемого товара/группы"} className="rounded-lg border border-[#e4e4f0] px-2 py-1 text-sm" />
+          <input name="ean" required inputMode="numeric" placeholder={isShortage ? "EAN добавляемого товара" : "EAN удаляемого товара"} className="rounded-lg border border-[#e4e4f0] px-2 py-1 text-sm" />
           <input name="qty" required type="number" inputMode="decimal" step="1" placeholder="Количество" className="rounded-lg border border-[#e4e4f0] px-2 py-1 text-sm" />
           {!isShortage && (
             <select name="disposition" defaultValue={isDamaged ? "DISCREPANCY" : "RETURN"} className="rounded-lg border border-[#e4e4f0] px-2 py-1 text-sm">

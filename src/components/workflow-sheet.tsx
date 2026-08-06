@@ -1,7 +1,8 @@
 "use client";
 
 import { RefreshCw } from "lucide-react";
-import { QrScanner } from "@/components/qr-scanner";
+import { QrScanner, type ScanFormat } from "@/components/qr-scanner";
+export type { ScanFormat };
 import { Button } from "@/components/ui";
 
 // Единая скан-шторка складских процессов (приёмка, сборка, выдача, скан-подряд):
@@ -23,6 +24,7 @@ export function WorkflowSheet({
   scanning,
   scanHint,
   onScan,
+  scanFormats,
   scanPaused,
   onBackToList,
   onClose,
@@ -40,6 +42,7 @@ export function WorkflowSheet({
   scanning: boolean; // true — камера вместо списка
   scanHint?: React.ReactNode; // подсказка под камерой
   onScan: (raw: string) => void;
+  scanFormats?: ScanFormat[]; // Пакет 9B: форматы текущего шага (ячейка/товар/заказ)
   scanPaused?: boolean;
   onBackToList: () => void;
   onClose: () => void;
@@ -92,7 +95,7 @@ export function WorkflowSheet({
           >
             {scanning ? (
               <div className="flex flex-col gap-3">
-                <QrScanner onScan={onScan} paused={!!scanPaused || !!error || !!modal} />
+                <QrScanner onScan={onScan} formats={scanFormats} paused={!!scanPaused || !!error || !!modal} />
                 <div className="min-h-14 text-center">
                   {scanHint && <p className="text-sm font-medium text-[#667eea]">{scanHint}</p>}
                   {busy && <p className="mt-1 text-sm text-neutral-400">Обработка…</p>}

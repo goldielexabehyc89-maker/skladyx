@@ -11,7 +11,12 @@ import {
   type IssueActionState,
 } from "@/app/actions/order-issue";
 import { Button, Badge } from "@/components/ui";
-import { WorkflowSheet } from "@/components/workflow-sheet";
+import { WorkflowSheet, type ScanFormat } from "@/components/workflow-sheet";
+
+// Пакет 9B: форматы по шагу
+const CELL: ScanFormat[] = ["qr_code", "code_128"];
+const PRODUCT: ScanFormat[] = ["ean_8", "ean_13"];
+const ORDER: ScanFormat[] = ["qr_code"];
 
 // Этап 5/Пакет 8: панели погрузчика — размещение проверенного заказа в ячейки выдачи и выдача
 // водителю. Настоящее сканирование через WorkflowSheet/QrScanner + ручной ввод кодов как fallback.
@@ -44,7 +49,7 @@ function PlaceScanner({ taskId }: { taskId: string }) {
   const router = useRouter();
   const [open, setOpen] = useState(false);
   const [scanning, setScanning] = useState(false);
-  const [step, setStep] = useState<"order" | "cell" | "group">("order");
+  const [step, setStep] = useState<"order" | "cell" | "product">("order");
   const [orderRaw, setOrderRaw] = useState("");
   const [cellRaw, setCellRaw] = useState("");
   const [busy, startTransition] = useTransition();
@@ -54,15 +59,15 @@ function PlaceScanner({ taskId }: { taskId: string }) {
   function reset(keepOrder = false) { setStep(keepOrder ? "cell" : "order"); if (!keepOrder) setOrderRaw(""); setCellRaw(""); setNotice(null); }
   function handleScan(raw: string) {
     if (busy) return;
-    if (step === "order") { setOrderRaw(raw); setStep("cell"); setNotice("Заказ отсканирован — сканируйте QR ячейки выдачи"); return; }
-    if (step === "cell") { setCellRaw(raw); setStep("group"); setNotice("Ячейка отсканирована — сканируйте QR группы/партии"); return; }
+    if (step === "order") { setOrderRaw(raw); setStep("cell"); setNotice("Заказ отсканирован — сканируйте QR/Code 128 ячейки выдачи"); return; }
+    if (step === "cell") { setCellRaw(raw); setStep("product"); setNotice("Ячейка отсканирована — сканируйте EAN товара"); return; }
     // step === group → размещаем
     startTransition(async () => {
       const fd = new FormData();
-      fd.set("taskId", taskId); fd.set("orderCode", orderRaw); fd.set("cellCode", cellRaw); fd.set("groupCode", raw);
+      fd.set("taskId", taskId); fd.set("orderCode", orderRaw); fd.set("cellCode", cellRaw); fd.set("ean", raw);
       const res = await placeGroupAction({}, fd);
       if (res.error) { setError(res.error); return; }
-      reset(true); setNotice("✓ Размещено — сканируйте следующую группу/ячейку"); router.refresh();
+      reset(true); setNotice("✓ Размещено — сканируйте следующий товар/ячейку"); router.refresh();
     });
   }
   if (!open)
@@ -74,9 +79,10 @@ function PlaceScanner({ taskId }: { taskId: string }) {
   return (
     <WorkflowSheet
       title="Размещение в выдаче"
-      subtitle="QR заказа → ячейка → группа"
+      subtitle="QR заказа → ячейка → EAN товара"
       scanning={scanning}
-      scanHint={step === "order" ? "Сканируйте QR заказа" : step === "cell" ? "Сканируйте QR ячейки выдачи" : "Сканируйте QR группы/партии"}
+      scanHint={step === "order" ? "Сканируйте QR заказа" : step === "cell" ? "Сканируйте QR/Code 128 ячейки выдачи" : "Сканируйте EAN товара"}
+      scanFormats={step === "order" ? ORDER : step === "cell" ? CELL : PRODUCT}
       onScan={handleScan}
       scanPaused={busy}
       busy={busy}
@@ -145,8 +151,8 @@ export function IssueOrderPanel({ ctx }: { ctx: IssueOrderCtx }) {
         ))
       )}
       <PlaceScanner taskId={ctx.taskId} />
-      <ManualForm title="Разместить по кодам (без камеры)" submit="Разместить по кодам" action={placeGroupAction} taskId={ctx.taskId}
-        fields={[{ name: "orderCode", placeholder: "Код QR заказа" }, { name: "cellCode", placeholder: "Код QR ячейки выдачи" }, { name: "groupCode", placeholder: "Код QR группы/партии" }]} />
+      <ManualForm title="Разместить по кодам/EAN (без камеры)" submit="Разместить по кодам" action={placeGroupAction} taskId={ctx.taskId}
+        fields={[{ name: "orderCode", placeholder: "Код QR заказа" }, { name: "cellCode", placeholder: "Код QR ячейки выдачи" }, { name: "ean", placeholder: "EAN товара (8/13 цифр)" }]} />
       <ManualForm title="Добавить ячейку по коду" submit="Добавить ячейку" action={addCellAction} taskId={ctx.taskId}
         fields={[{ name: "cellCode", placeholder: "Код QR свободной ячейки выдачи" }]} />
       <FinishPlacementForm ctx={ctx} />

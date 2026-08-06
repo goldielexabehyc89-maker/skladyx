@@ -7,7 +7,7 @@ import { prisma } from "@/lib/db";
 import { groupReceivingEnabled } from "@/lib/roles";
 import { getActiveShift } from "@/lib/work-shift";
 import { createHandlingGroup, completeGroupPlacement, GroupError } from "@/lib/group-receiving";
-import { qrUrl } from "@/lib/qr";
+import { findItemByEan } from "@/lib/barcodes";
 
 // Этап 5/Пакет 4: групповая приёмка. Доступ — RECEIVER с активной сменой на его складе
 // (ADMIN — только при активной смене RECEIVER; чистый ADMIN/OBSERVER не проводят).
@@ -41,15 +41,13 @@ export async function createGroupReceivingAction(
   if (!shift || shift.role !== "RECEIVER")
     return { error: "Нужна активная смена приёмщика (RECEIVER). Начните смену на складе." };
 
-  // товар: по id из поиска либо по точному sku (скан)
-  let itemId = String(formData.get("itemId") ?? "").trim();
-  const sku = String(formData.get("sku") ?? "").trim();
-  if (!itemId && sku) {
-    const bySku = await prisma.item.findFirst({ where: { companyId: s.companyId, sku, isActive: true } });
-    if (!bySku) return { error: `Товар с артикулом «${sku}» не найден` };
-    itemId = bySku.id;
-  }
-  if (!itemId) return { error: "Выберите товар из номенклатуры или отсканируйте артикул" };
+  // Пакет 9B: товар определяется ТОЛЬКО заводским EAN (скан камерой или ручной ввод EAN как fallback).
+  // Ручной выбор товара/SKU убран. Неизвестный/неактивный/чужой EAN — отказ.
+  const ean = String(formData.get("ean") ?? "").trim();
+  if (!ean) return { error: "Отсканируйте заводской штрихкод товара (EAN)" };
+  const found = await findItemByEan(s.companyId, ean);
+  if (!found) return { error: "Неизвестный, неактивный или чужой EAN — товар не найден" };
+  const itemId = found.item.id;
 
   const qty = Number(String(formData.get("qty") ?? "").trim());
   if (!Number.isInteger(qty) || qty <= 0) return { error: "Количество — целое число больше нуля" };
@@ -78,7 +76,6 @@ export async function createGroupReceivingAction(
       qty,
       temperature,
       route: res.status === "AWAITING_COOLING" ? "COOLING" : "STORAGE",
-      qrUrl: res.qrCode ? qrUrl(res.qrCode) : undefined,
       taskCreated: !!res.taskId,
     };
   } catch (e) {
@@ -99,9 +96,11 @@ export async function completeGroupPlacementAction(
   const s = scoped(session);
   const taskId = String(formData.get("taskId") ?? "").trim();
   const cellId = String(formData.get("cellId") ?? "").trim();
+  const ean = String(formData.get("ean") ?? "").trim();
   if (!cellId) return { error: "Выберите целевую ячейку" };
+  if (!ean) return { error: "Отсканируйте заводской штрихкод товара (EAN)" };
   try {
-    await completeGroupPlacement({ companyId: s.companyId, userId: session.userId, taskId, cellId });
+    await completeGroupPlacement({ companyId: s.companyId, userId: session.userId, taskId, cellId, ean });
   } catch (e) {
     return { error: msg(e) };
   }

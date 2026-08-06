@@ -73,11 +73,12 @@ export async function completeMoveGroupAction(_prev: OrderActionState, formData:
   const session = await requireUser();
   const s = scoped(session);
   const taskId = String(formData.get("taskId") ?? "").trim();
-  const groupCode = String(formData.get("groupCode") ?? "").trim();
+  const fromCellCode = String(formData.get("fromCellCode") ?? "").trim();
+  const ean = String(formData.get("ean") ?? "").trim();
   const cellCode = String(formData.get("cellCode") ?? "").trim();
-  if (!groupCode || !cellCode) return { error: "Отсканируйте QR группы и целевой ячейки" };
+  if (!fromCellCode || !ean || !cellCode) return { error: "Отсканируйте исходную ячейку, EAN товара и целевую ячейку" };
   try {
-    await completeMoveGroup({ companyId: s.companyId, userId: session.userId, taskId, groupCode, cellCode });
+    await completeMoveGroup({ companyId: s.companyId, userId: session.userId, taskId, fromCellCode, ean, cellCode });
   } catch (e) {
     return { error: msg(e) };
   }
@@ -92,12 +93,12 @@ export async function pickScanAction(_prev: OrderActionState, formData: FormData
   const s = scoped(session);
   const taskId = String(formData.get("taskId") ?? "").trim();
   const cellCode = String(formData.get("cellCode") ?? "").trim();
-  const groupCode = String(formData.get("groupCode") ?? "").trim();
+  const ean = String(formData.get("ean") ?? "").trim();
   const qty = Number(String(formData.get("qty") ?? "").trim().replace(",", "."));
-  if (!cellCode || !groupCode) return { error: "Отсканируйте QR ячейки и группы" };
+  if (!cellCode || !ean) return { error: "Отсканируйте ячейку и EAN товара" };
   if (!Number.isFinite(qty)) return { error: "Укажите количество" };
   try {
-    const r = await pickOrderScan({ companyId: s.companyId, userId: session.userId, taskId, cellCode, groupCode, qty });
+    const r = await pickOrderScan({ companyId: s.companyId, userId: session.userId, taskId, cellCode, ean, qty });
     revalidatePath("/warehouse/tasks");
     return { ok: true, status: r.done ? "IN_CONTROL" : r.alreadyPicked ? "alreadyPicked" : "PICKING" };
   } catch (e) {
