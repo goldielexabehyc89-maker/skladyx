@@ -80,6 +80,38 @@ export function orderIssueEnabled(): boolean {
   return process.env.ORDER_ISSUE_ENABLED === "true";
 }
 
+// Этап 5/Пакет 9B: видимость СТАРОГО (legacy) интерфейса склада. В отличие от бизнес-флагов,
+// по умолчанию ВКЛЮЧЁН — скрываем только при явном `false` (prod-совместимость: отсутствие
+// переменной = старый UI пока доступен). false — legacy-пункты навигации скрыты, прямые
+// legacy-маршруты редиректятся в новый интерфейс. Код и данные старых страниц не трогаются.
+export function legacyWarehouseUiEnabled(): boolean {
+  return process.env.LEGACY_WAREHOUSE_UI_ENABLED !== "false";
+}
+
+// Сегменты СТАРОГО интерфейса склада — единый список для скрытия в навигации и редиректа прямых
+// маршрутов при LEGACY_WAREHOUSE_UI_ENABLED=false (включая вложенные). Код страниц не удаляется.
+export const LEGACY_WAREHOUSE_PATHS = [
+  "/warehouse/active",
+  "/warehouse/scan",
+  "/warehouse/receipts",
+  "/warehouse/staging",
+  "/warehouse/orders",
+  "/warehouse/picklists",
+  "/warehouse/transfers",
+  "/warehouse/issues",
+  "/warehouse/writeoffs",
+  "/warehouse/inventories",
+  "/warehouse/suppliers",
+  "/warehouse/my",
+  "/warehouse/docs",
+] as const;
+
+// true — путь принадлежит СТАРОМУ интерфейсу (точное совпадение сегмента или вложенный маршрут).
+// Аккуратная проверка границы сегмента, чтобы /warehouse/issues не задевал /warehouse/items и т.п.
+export function isLegacyWarehousePath(pathname: string): boolean {
+  return LEGACY_WAREHOUSE_PATHS.some((p) => pathname === p || pathname.startsWith(p + "/"));
+}
+
 // Эффективный набор ролей.
 // При TENANT_AUTH=true роли всегда берутся из session.roles (их наполняет свежая
 // проверка из БД в @/lib/tenant-auth) — независимо от ROLES_DUAL_READ.

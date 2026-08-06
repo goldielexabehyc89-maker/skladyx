@@ -84,12 +84,23 @@ export function scoped(session: SessionData) {
     },
 
     items(search?: string) {
+      const q = search?.trim();
       return prisma.item.findMany({
         where: {
           companyId,
-          ...(search ? { name: { contains: search, mode: "insensitive" as const } } : {}),
+          // Пакет 9B: поиск по названию, EAN (штрихкод), SKU и внешнему идентификатору.
+          ...(q
+            ? {
+                OR: [
+                  { name: { contains: q, mode: "insensitive" as const } },
+                  { sku: { contains: q, mode: "insensitive" as const } },
+                  { externalId: { contains: q, mode: "insensitive" as const } },
+                  { barcodes: { some: { code: { contains: q } } } },
+                ],
+              }
+            : {}),
         },
-        include: { uom: true },
+        include: { uom: true, barcodes: { orderBy: { createdAt: "asc" } } },
         orderBy: { name: "asc" },
       });
     },

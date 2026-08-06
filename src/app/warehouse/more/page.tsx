@@ -1,20 +1,30 @@
 import Link from "next/link";
 import { requireAdminPage } from "@/lib/auth";
+import { isLegacyWarehousePath, legacyWarehouseUiEnabled, workflowTasksEnabled } from "@/lib/roles";
 import { PageTitle } from "@/components/ui";
 import { PushSubscribeButton } from "@/components/push-subscribe-button";
 
 const LINKS: { href: string; title: string }[] = [
+  { href: "/warehouse/tasks", title: "Задачи" },
   { href: "/warehouse/items", title: "Номенклатура" },
   { href: "/warehouse/suppliers", title: "Поставщики" },
   { href: "/warehouse/warehouses", title: "Склады и ячейки" },
   { href: "/warehouse/employees", title: "Сотрудники и бейджи" },
   { href: "/warehouse/my", title: "Мои ТМЦ" },
+  { href: "/warehouse/history", title: "История" },
   { href: "/warehouse/feed", title: "Лента событий" },
   { href: "/warehouse/settings", title: "Настройки" },
 ];
 
 export default async function MorePage() {
   await requireAdminPage();
+
+  // Пакет 9B: при выключенном старом интерфейсе не показываем legacy-ссылки; «Задачи» — только при флаге очереди.
+  const legacyUi = legacyWarehouseUiEnabled();
+  const tasksOn = workflowTasksEnabled();
+  const links = LINKS.filter(
+    (l) => (l.href !== "/warehouse/tasks" || tasksOn) && (legacyUi || !isLegacyWarehousePath(l.href)),
+  );
 
   return (
     <div className="mx-auto flex w-full max-w-2xl flex-col gap-4">

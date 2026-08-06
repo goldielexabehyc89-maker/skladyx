@@ -72,27 +72,36 @@ const RECEIVING_GROUP: NavItem = { href: "/warehouse/receiving", label: "При�
 
 const WORK_ROLES = ["RECEIVER", "LOADER", "PICKER", "CONTROLLER"] as const;
 
+// Пакет 9B: пункты СТАРОГО интерфейса склада — скрываются при legacyUi=false (код страниц не удалён).
+const LEGACY_HREFS = new Set<string>([
+  ACTIVE.href, SCAN.href, RECEIPTS.href, STAGING.href, ORDERS.href, PICKLISTS.href,
+  TRANSFERS.href, ISSUES.href, WRITEOFFS.href, INVENTORIES.href, SUPPLIERS.href, MY.href,
+]);
+
 // role — переходная навигационная роль (профиль меню); canStartShift — есть ли у пользователя
 // рабочая роль (тогда даже у ADMIN показываем «Смену»); tasksEnabled — флаг очереди задач;
-// canReceive — есть роль RECEIVER; groupReceiving — флаг групповой приёмки (Пакет 4).
+// canReceive — есть роль RECEIVER; groupReceiving — флаг групповой приёмки (Пакет 4);
+// legacyUi — виден ли старый интерфейс (false → legacy-пункты убираются, пустые группы отбрасываются).
 function groupsFor(
   role: Role,
   canStartShift: boolean,
   tasksEnabled: boolean,
   canReceive: boolean,
   groupReceiving: boolean,
+  legacyUi: boolean,
 ): NavGroup[] {
   const receivingItem = groupReceiving && canReceive ? [RECEIVING_GROUP] : [];
+  let raw: NavGroup[];
   if (role === "ADMIN")
-    return [
+    raw = [
       { title: "Работа", items: [ACTIVE, SCAN, RECEIPTS, STAGING, ...receivingItem, ...(canStartShift ? [SHIFT] : [])] },
       { title: "Документы", items: [ORDERS, PICKLISTS, TRANSFERS, ISSUES, WRITEOFFS, INVENTORIES] },
       { title: "Справочники", items: [STOCK, ITEMS, WAREHOUSES, SUPPLIERS, EMPLOYEES] },
       { title: "Контроль", items: [...(tasksEnabled ? [TASKS] : []), HISTORY, FEED, SETTINGS] },
       { title: "Моё", items: [MY] },
     ];
-  if (role === "STOREKEEPER")
-    return [
+  else if (role === "STOREKEEPER")
+    raw = [
       { title: "Работа", items: [ACTIVE, SCAN, RECEIPTS, STAGING] },
       { title: "Документы", items: [TRANSFERS, ISSUES] },
       { title: "Справочники", items: [STOCK] },
@@ -100,15 +109,20 @@ function groupsFor(
       { title: "Моё", items: [MY] },
     ];
   // Новые рабочие роли (Этап 5): смена + задачи (за флагом) + приёмка группами (RECEIVER) + просмотр.
-  if ((WORK_ROLES as readonly string[]).includes(role))
-    return [
+  else if ((WORK_ROLES as readonly string[]).includes(role))
+    raw = [
       { title: "Работа", items: [...(tasksEnabled ? [TASKS] : []), ...receivingItem, SHIFT] },
       { title: "Просмотр", items: [STOCK, HISTORY] },
       { title: "Моё", items: [MY, FEED] },
     ];
   // Наблюдатель — только просмотр: остатки, история, лента.
-  if (role === "OBSERVER") return [{ title: "Просмотр", items: [STOCK, HISTORY, FEED] }];
-  return [{ title: "Моё", items: [MY, FEED] }];
+  else if (role === "OBSERVER") raw = [{ title: "Просмотр", items: [STOCK, HISTORY, FEED] }];
+  else raw = [{ title: "Моё", items: [MY, FEED] }];
+
+  if (legacyUi) return raw;
+  return raw
+    .map((g) => ({ ...g, items: g.items.filter((it) => !LEGACY_HREFS.has(it.href)) }))
+    .filter((g) => g.items.length > 0);
 }
 
 function NavContent({
@@ -117,6 +131,7 @@ function NavContent({
   tasksEnabled,
   canReceive,
   groupReceiving,
+  legacyUi,
   name,
   collapsed,
   onNavigate,
@@ -127,13 +142,14 @@ function NavContent({
   tasksEnabled: boolean;
   canReceive: boolean;
   groupReceiving: boolean;
+  legacyUi: boolean;
   name: string;
   collapsed: boolean;
   onNavigate?: () => void;
   onToggleCollapse?: () => void;
 }) {
   const pathname = usePathname();
-  const groups = groupsFor(role, canStartShift, tasksEnabled, canReceive, groupReceiving);
+  const groups = groupsFor(role, canStartShift, tasksEnabled, canReceive, groupReceiving, legacyUi);
 
   const itemClass = (active: boolean) =>
     clsx(
@@ -221,9 +237,9 @@ function NavContent({
 }
 
 // Нижний таб-бар (только мобильный): главные разделы + «Ещё» с полным меню.
-function MobileTabBar({ role, tasksEnabled, onMore }: { role: Role; tasksEnabled: boolean; onMore: () => void }) {
+function MobileTabBar({ role, tasksEnabled, legacyUi, onMore }: { role: Role; tasksEnabled: boolean; legacyUi: boolean; onMore: () => void }) {
   const pathname = usePathname();
-  const tabs: NavItem[] =
+  let tabs: NavItem[] =
     role === "EMPLOYEE"
       ? [MY, { ...SCAN, label: "Сканер" }, { ...FEED, label: "Лента" }]
       : role === "OBSERVER"
@@ -233,6 +249,18 @@ function MobileTabBar({ role, tasksEnabled, onMore }: { role: Role; tasksEnabled
             ? [TASKS, SHIFT, STOCK]
             : [SHIFT, STOCK, MY]
           : [ACTIVE, { ...SCAN, label: "Сканер" }, STOCK];
+
+  // Пакет 9B: старый интерфейс выключен → убираем legacy-вкладки и добираем безопасными разделами
+  // (для ADMIN — монитор задач/справочники/контроль), сохраняя 3 слота + «Ещё».
+  if (!legacyUi) {
+    const pool: NavItem[] = [...(tasksEnabled ? [TASKS] : []), STOCK, { ...HISTORY, label: "История" }, { ...FEED, label: "Лента" }];
+    tabs = tabs.filter((t) => !LEGACY_HREFS.has(t.href));
+    for (const p of pool) {
+      if (tabs.length >= 3) break;
+      if (!tabs.some((t) => t.href === p.href)) tabs.push(p);
+    }
+    tabs = tabs.slice(0, 3);
+  }
 
   return (
     <nav
@@ -276,12 +304,14 @@ export function AppNav({
   name,
   tasksEnabled,
   groupReceivingEnabled = false,
+  legacyUi = true,
 }: {
   role: Role;
   roles: Role[];
   name: string;
   tasksEnabled: boolean;
   groupReceivingEnabled?: boolean;
+  legacyUi?: boolean;
 }) {
   const [mobileOpen, setMobileOpen] = useState(false);
   const [collapsed, setCollapsed] = useState(false);
@@ -305,6 +335,7 @@ export function AppNav({
           tasksEnabled={tasksEnabled}
           canReceive={canReceive}
           groupReceiving={groupReceivingEnabled}
+          legacyUi={legacyUi}
           name={name}
           collapsed={collapsed}
           onToggleCollapse={() => setCollapsed((v) => !v)}
@@ -328,7 +359,7 @@ export function AppNav({
       </header>
 
       {/* Мобильный: нижний таб-бар */}
-      <MobileTabBar role={role} tasksEnabled={tasksEnabled} onMore={() => setMobileOpen(true)} />
+      <MobileTabBar role={role} tasksEnabled={tasksEnabled} legacyUi={legacyUi} onMore={() => setMobileOpen(true)} />
 
       {mobileOpen && (
         <div className="fixed inset-0 z-50 lg:hidden">
@@ -350,6 +381,7 @@ export function AppNav({
               tasksEnabled={tasksEnabled}
               canReceive={canReceive}
               groupReceiving={groupReceivingEnabled}
+              legacyUi={legacyUi}
               name={name}
               collapsed={false}
               onNavigate={() => setMobileOpen(false)}

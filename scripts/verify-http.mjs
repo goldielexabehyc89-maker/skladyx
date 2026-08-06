@@ -171,30 +171,51 @@ async function main() {
     ok("этикетки ячеек содержат 5 QR", (printHtml.match(/class="label-qr/g) ?? []).length === 5);
   }
 
-  console.log("5. Товары: партионный и поштучный");
+  console.log("5. Товары: создание по заводскому EAN (Пакет 9B — авто шт+LOT, без выбора UNIT/LOT)");
   {
+    // Контрольная цифра EAN-13 (12 цифр базы → +checksum).
+    const ean13 = (b) => {
+      let sum = 0;
+      for (let i = 0; i < 12; i++) sum += Number(b[i]) * (i % 2 === 0 ? 1 : 3);
+      return b + String((10 - (sum % 10)) % 10);
+    };
+    const cementEan = ean13("460775000001");
+    const boschEan = ean13("460775000002");
+
     let html = await (await get("/warehouse/items/new")).text();
     let forms = parseForms(html);
-    const itemForm = forms.find((f) => f.html.includes('name="tracking"'));
+    const itemForm = forms.find((f) => f.html.includes('name="ean"'));
     const res1 = await submitForm("/warehouse/items/new", itemForm, {
       name: "Цемент М500 50кг",
+      ean: cementEan,
       sku: "CEM500",
-      tracking: "LOT",
     });
-    ok("цемент создан", (await followRedirect(res1)) === "/warehouse/items");
+    ok("цемент создан по EAN", (await followRedirect(res1)) === "/warehouse/items");
 
     html = await (await get("/warehouse/items/new")).text();
     forms = parseForms(html);
-    const itemForm2 = forms.find((f) => f.html.includes('name="tracking"'));
+    const itemForm2 = forms.find((f) => f.html.includes('name="ean"'));
     const res2 = await submitForm("/warehouse/items/new", itemForm2, {
       name: "Перфоратор Bosch GBH 2-26",
+      ean: boschEan,
       sku: "BOSCH226",
-      tracking: "UNIT",
     });
-    ok("перфоратор создан", (await followRedirect(res2)) === "/warehouse/items");
+    ok("перфоратор создан по EAN", (await followRedirect(res2)) === "/warehouse/items");
+
+    // Неверная контрольная цифра — отказ, товар не создаётся.
+    html = await (await get("/warehouse/items/new")).text();
+    const badForm = parseForms(html).find((f) => f.html.includes('name="ean"'));
+    const resBad = await submitForm("/warehouse/items/new", badForm, {
+      name: "Бракованный EAN",
+      ean: "4607750000019", // неверная контрольная цифра
+    });
+    const badLoc = await followRedirect(resBad);
+    ok("EAN с неверной контрольной цифрой отклонён", badLoc !== "/warehouse/items");
 
     const listHtml = await (await get("/warehouse/items")).text();
     ok("оба товара в списке", listHtml.includes("Цемент М500") && listHtml.includes("Перфоратор"));
+    ok("EAN отображается в списке", listHtml.includes(cementEan) && listHtml.includes(boschEan));
+    ok("бракованный товар не создан", !listHtml.includes("Бракованный EAN"));
   }
 
   console.log("6. Заказ поставщику: таблица, id позиций, приём во вкладке «Приемки»");
@@ -278,14 +299,10 @@ async function main() {
     // печать этикеток ИЗ ЗАКАЗА — до приемки
     const orderLabels = await (await get(`/warehouse/print/labels?order=${orderId}`)).text();
     ok(
-      "этикеток заказа 12 (10 одинаковых у партии + 2 единицы)",
+      "этикеток заказа 12 (по количеству партий: 10 + 2)",
       (orderLabels.match(/class="label-qr/g) ?? []).length === 12,
     );
     ok("этикетка партии с id позиции", codes.length > 0 && orderLabels.includes(codes[0]));
-    ok(
-      "этикетки единиц с суффиксом -1",
-      orderLabels.includes(`${codes[1]}-1`) || orderLabels.includes(`${codes[0]}-1`),
-    );
 
     // приёмка — во вкладке «Приемки»: заказ показывается в списке ORDERED
     const recListHtml = await (await get("/warehouse/active")).text();

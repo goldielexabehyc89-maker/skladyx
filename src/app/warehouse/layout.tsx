@@ -1,5 +1,5 @@
 import { redirect } from "next/navigation";
-import { navRole, effectiveRoles, workflowTasksEnabled, groupReceivingEnabled } from "@/lib/roles";
+import { navRole, effectiveRoles, workflowTasksEnabled, groupReceivingEnabled, legacyWarehouseUiEnabled } from "@/lib/roles";
 import { currentSession } from "@/lib/tenant-auth";
 import { AppNav } from "@/components/app-nav";
 import { AppRealtimeProvider } from "@/components/app-realtime";
@@ -19,6 +19,7 @@ export default async function AppLayout({ children }: { children: React.ReactNod
         name={session.name}
         tasksEnabled={workflowTasksEnabled()}
         groupReceivingEnabled={groupReceivingEnabled()}
+        legacyUi={legacyWarehouseUiEnabled()}
       />
       <main className="min-w-0 flex-1 px-4 pb-32 pt-4 lg:overflow-y-auto lg:px-8 lg:py-6">
         <div className="mx-auto w-full max-w-6xl">{children}</div>

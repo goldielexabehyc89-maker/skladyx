@@ -7,39 +7,64 @@ import { z } from "zod";
 import { prisma } from "@/lib/db";
 import { requireAdmin } from "@/lib/auth";
 import { scoped } from "@/lib/tenant";
-import { addItemBarcode, setItemBarcodeActive, barcodeErrorMessage } from "@/lib/barcodes";
+import { addItemBarcode, setItemBarcodeActive, barcodeErrorMessage, BarcodeError } from "@/lib/barcodes";
+import { parseEan } from "@/lib/ean";
 import type { FormState } from "@/app/actions/warehouses";
 
-const itemSchema = z.object({
+// Пакет 9B: ручной товар для тестового наполнения — название + заводской EAN-8/13 (с контрольной
+// цифрой) + необязательный SKU/externalId. Единица «шт» и tracking LOT назначаются автоматически;
+// выбор UNIT/LOT и единицы измерения пользователю не показывается.
+const createItemSchema = z.object({
   name: z.string().trim().min(1, "Укажите наименование"),
-  uomId: z.string().min(1, "Выберите единицу измерения"),
-  tracking: z.enum(["LOT", "UNIT"]),
+  ean: z.string().trim().min(1, "Укажите заводской EAN (8 или 13 цифр)"),
+  sku: z.string().trim().optional(),
+});
+// Обновление ручного товара: правим только название и статус (единица/tracking скрыты и не меняются).
+const updateItemSchema = z.object({
+  name: z.string().trim().min(1, "Укажите наименование"),
 });
 
 export async function createItemAction(_prev: FormState, formData: FormData): Promise<FormState> {
   const session = await requireAdmin();
   const s = scoped(session);
 
-  const parsed = itemSchema.safeParse({
+  const parsed = createItemSchema.safeParse({
     name: formData.get("name"),
-    uomId: formData.get("uomId"),
-    tracking: formData.get("tracking"),
+    ean: formData.get("ean"),
+    sku: formData.get("sku"),
   });
   if (!parsed.success) return { error: parsed.error.errors[0].message };
 
-  const uom = await prisma.uom.findFirst({
-    where: { id: parsed.data.uomId, companyId: s.companyId },
-  });
-  if (!uom) return { error: "Единица измерения не найдена" };
+  const parsedEan = parseEan(parsed.data.ean);
+  if (!parsedEan) return { error: "Неверный EAN — нужно 8 или 13 цифр с верной контрольной цифрой" };
+  const sku = parsed.data.sku && parsed.data.sku.length > 0 ? parsed.data.sku : null;
 
-  await prisma.item.create({
-    data: {
-      companyId: s.companyId,
-      name: parsed.data.name,
-      uomId: parsed.data.uomId,
-      tracking: parsed.data.tracking,
-    },
-  });
+  try {
+    // Товар + EAN создаём атомарно: невалидный/чужой EAN не оставит товар-сироту.
+    await prisma.$transaction(async (tx) => {
+      const clash = await tx.itemBarcode.findFirst({ where: { companyId: s.companyId, code: parsedEan.code } });
+      if (clash) throw new BarcodeError("Этот EAN уже привязан к другому товару");
+      // Единица «шт» (get-or-create) — пользователю не показываем; tracking всегда LOT.
+      const uom = await tx.uom.upsert({
+        where: { companyId_name: { companyId: s.companyId, name: "шт" } },
+        update: {},
+        create: { companyId: s.companyId, name: "шт", allowFraction: false },
+      });
+      const item = await tx.item.create({
+        data: { companyId: s.companyId, name: parsed.data.name, sku, uomId: uom.id, tracking: "LOT", source: "MANUAL" },
+      });
+      await tx.itemBarcode.create({
+        data: { companyId: s.companyId, itemId: item.id, code: parsedEan.code, symbology: parsedEan.symbology, source: "MANUAL", isActive: true },
+      });
+    });
+  } catch (e) {
+    if (e instanceof BarcodeError) return { error: e.message };
+    if (e && typeof e === "object" && "code" in e && (e as { code?: string }).code === "P2002") {
+      const target = String((e as { meta?: { target?: unknown } }).meta?.target ?? "");
+      return { error: target.includes("sku") ? "Такой SKU уже есть" : "Этот EAN уже привязан к другому товару" };
+    }
+    throw e;
+  }
   broadcastRealtime({
     type: "document.created",
     entity: "item",
@@ -58,19 +83,13 @@ export async function updateItemAction(_prev: FormState, formData: FormData): Pr
   // Пакет 9A: товары из интеграции (source=API) — ключевые поля только для чтения.
   if (current.source === "API") return { error: "Товар из интеграции — ключевые поля только для чтения" };
 
-  const parsed = itemSchema.safeParse({
-    name: formData.get("name"),
-    uomId: formData.get("uomId"),
-    tracking: formData.get("tracking"),
-  });
+  const parsed = updateItemSchema.safeParse({ name: formData.get("name") });
   if (!parsed.success) return { error: parsed.error.errors[0].message };
 
   await prisma.item.update({
     where: { id },
     data: {
       name: parsed.data.name,
-      uomId: parsed.data.uomId,
-      tracking: parsed.data.tracking,
       isActive: formData.get("isActive") === "on",
     },
   });
