@@ -66,6 +66,11 @@ Staging-домен staging-<org>.skladyx.ru используется как те
 Проект перехода к логике РостАгро: docs/ROSTAGRO_WORKFLOW_AUDIT.md и docs/ROSTAGRO_MIGRATION_DESIGN.md (только проект, реализация — по этапам после отдельных решений).
 
 > Приёмка группами, охлаждение, сборка внешних заказов, контроль и выдача заказов (Пакеты 4–8) технически доставлены на prod, но не активированы: `GROUP_RECEIVING_ENABLED=false`, `COOLING_WORKFLOW_ENABLED=false`, `EXTERNAL_ORDER_PICKING_ENABLED=false`, `ORDER_CONTROL_ENABLED=false`, `ORDER_ISSUE_ENABLED=false`. Полноценные бизнес-сценарии проверены на staging. Не включать до создания реальных справочников РостАгро, утверждения настроек X и warehouse-scoped R (`Warehouse.coolingRate`) и подключения интеграционного адаптера импорта. Активация выполняется отдельной подтверждённой задачей без тестовых движений на prod.
+>
+> Пакет 9A доставлен на prod: commit `fbab411`, миграция
+> `20260806120000_settings_ean_zones_s5p9a`; `WAREHOUSE_ZONES_ENABLED=true`.
+> Бизнес-процессы Пакетов 4–8 по-прежнему не активированы. Следующий этап —
+> Пакет 9B: перевод складских операций на заводские EAN.
 
 ## Проверка каждого изменения
 
