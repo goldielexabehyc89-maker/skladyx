@@ -53,7 +53,7 @@ async function place(loader: string, groupId: string, cell: string): Promise<str
   const t = await placeTaskOf(groupId);
   if (!t) return "нет задачи размещения";
   await startWorkflowTask(loader, companyId, t.id);
-  return err(() => completeGroupPlacement({ companyId, userId: loader, taskId: t.id, cellId: cell, ean: lotEan }));
+  return err(async () => completeGroupPlacement({ companyId, userId: loader, taskId: t.id, cellCode: await cellQr(cell), ean: lotEan }));
 }
 // активировать наступившую отложенную задачу (тест: сдвигаем срок в прошлое) и назначить
 async function makeDue(taskId: string) {
@@ -234,9 +234,10 @@ async function main() {
   await prisma.workflowTask.update({ where: { id: pt2!.id }, data: { assignedUserId: L2, assignedShiftId: (await prisma.workShift.findFirstOrThrow({ where: { userId: L2, endedAt: null } })).id } });
   await startWorkflowTask(L1, companyId, pt1!.id);
   await startWorkflowTask(L2, companyId, pt2!.id);
+  const [qrC1, qrC2] = [await cellQr(C1), await cellQr(C2)];
   const [rc1, rc2] = await Promise.all([
-    err(() => completeGroupPlacement({ companyId, userId: L1, taskId: pt1!.id, cellId: C1, ean: lotEan })),
-    err(() => completeGroupPlacement({ companyId, userId: L2, taskId: pt2!.id, cellId: C2, ean: lotEan })),
+    err(() => completeGroupPlacement({ companyId, userId: L1, taskId: pt1!.id, cellCode: qrC1, ean: lotEan })),
+    err(() => completeGroupPlacement({ companyId, userId: L2, taskId: pt2!.id, cellCode: qrC2, ean: lotEan })),
   ]);
   ok("успешна ровно одна сессия охлаждения (вторая — нет свободного резерва)", (rc1 === "") !== (rc2 === ""), `rc1="${rc1}" rc2="${rc2}"`);
   ok("на единственной свободной ячейке ур.3 — ровно одна активная бронь", (await prisma.cellReservation.count({ where: { cellId: S3b, status: "ACTIVE" } })) === 1);
@@ -309,6 +310,56 @@ async function main() {
   const after2 = await prisma.workflowTask.findUniqueOrThrow({ where: { id: tD!.id } });
   ok("после активации задача назначена LOADER (ASSIGNED)", after1.status === "ASSIGNED" && after1.assignedUserId === L1);
   ok("повторная активация идемпотентна (тот же исполнитель и смена)", after2.status === "ASSIGNED" && after2.assignedUserId === after1.assignedUserId && after2.assignedShiftId === after1.assignedShiftId);
+
+  console.log("19) Пакет 9B-fix: точная идемпотентность фаз (сверка ячейки/EAN/цели ДО любого возврата)");
+  await retrieve(L1, sD!.id, 4); // завершаем забор gD из сц.17 → освобождаем L1
+  await freeLoader(L1);
+  await createCellsInZone({ companyId, warehouseId: W, zoneId: zStorage, codes: ["P5-RE"], level: 3 }); // гарантированно свободный резерв
+  await createCellsInZone({ companyId, warehouseId: W, zoneId: zCooling, codes: ["P5-CE"], level: null });
+  const cCE = await cellId("P5-CE");
+  const gE = await mkGroup(9);
+  const placeErrE = await place(L1, gE.groupId, cCE);
+  ok("gE размещена в охлаждение", placeErrE === "", placeErrE);
+  const lotE = (await grp(gE.groupId)).lotId;
+  const sE = await sessOf(gE.groupId);
+  const tE = await retrieveTaskOf(sE!.id);
+  await makeDue(tE!.id);
+  await startWorkflowTask(L1, companyId, tE!.id);
+  const fromE = await cellQr(sE!.coolingCellId);
+  const wrongCellQr = await cellQr(C2); // валидный CELL-QR, но не исходная и не целевая ячейка сессии
+  // Фаза 1: замер <=X → назначается целевая ячейка
+  const p1 = await prepareCoolingRetrieval({ companyId, userId: L1, taskId: tE!.id, fromCellCode: fromE, ean: lotEan, temperature: 4 });
+  ok("Фаза 1: готово, назначена целевая ячейка", p1.ready && !!p1.targetCellCode);
+  const targetE = await resCellOf(sE!.id);
+  const targetQrE = await cellQr(targetE);
+  const measBefore = await prisma.temperatureMeasurement.count({ where: { sessionId: sE!.id } });
+  // prepare: посторонняя исходная ячейка / неверный EAN отклоняются ДО идемпотентного возврата цели
+  const badFrom = await err(() => prepareCoolingRetrieval({ companyId, userId: L1, taskId: tE!.id, fromCellCode: wrongCellQr, ean: lotEan, temperature: 4 }));
+  ok("prepare: чужая исходная ячейка отклонена (цель не возвращается)", badFrom.includes("не та ячейка"));
+  const badEan = await err(() => prepareCoolingRetrieval({ companyId, userId: L1, taskId: tE!.id, fromCellCode: fromE, ean: wrongCellQr, temperature: 4 }));
+  ok("prepare: неверный EAN отклонён", /EAN|товар/.test(badEan));
+  ok("prepare: отклонения не создали лишних замеров", (await prisma.temperatureMeasurement.count({ where: { sessionId: sE!.id } })) === measBefore);
+  // prepare: корректный повтор → та же цель без нового замера
+  const p1again = await prepareCoolingRetrieval({ companyId, userId: L1, taskId: tE!.id, fromCellCode: fromE, ean: lotEan, temperature: 4 });
+  ok("prepare: точный повтор → та же цель, без нового замера", p1again.ready && p1again.targetCellCode === p1.targetCellCode && (await prisma.temperatureMeasurement.count({ where: { sessionId: sE!.id } })) === measBefore);
+  // place: посторонняя целевая ячейка отклонена (до размещения)
+  const badTarget = await err(() => placeCoolingRetrieval({ companyId, userId: L1, taskId: tE!.id, fromCellCode: fromE, ean: lotEan, targetCellCode: wrongCellQr }));
+  ok("place: чужая целевая ячейка отклонена", badTarget.includes("не та целевая"));
+  const gEbeforeMoves = await prisma.stockMovement.count({ where: { lotId: lotE } });
+  ok("place: отклонение не создало движения", gEbeforeMoves === (await prisma.stockMovement.count({ where: { lotId: lotE } })));
+  // place: корректное размещение
+  ok("place: корректное размещение успешно", (await err(() => placeCoolingRetrieval({ companyId, userId: L1, taskId: tE!.id, fromCellCode: fromE, ean: lotEan, targetCellCode: targetQrE }))) === "");
+  const gEr = await grp(gE.groupId);
+  ok("группа IN_STORAGE в целевой ячейке", gEr.status === "IN_STORAGE" && !!(await bal(gEr.lotId, `C:${targetE}`)));
+  const movesAfter = await prisma.stockMovement.count({ where: { lotId: gEr.lotId } });
+  // place: точный повтор ПОСЛЕ COMPLETED — успех без нового движения
+  const rep = await err(() => placeCoolingRetrieval({ companyId, userId: L1, taskId: tE!.id, fromCellCode: fromE, ean: lotEan, targetCellCode: targetQrE }));
+  ok("place: точный повтор после COMPLETED — успех без нового движения", rep === "" && (await prisma.stockMovement.count({ where: { lotId: gEr.lotId } })) === movesAfter);
+  // place: повтор с неверными кодами ПОСЛЕ COMPLETED — отклонён (не «успех по любому коду»)
+  const repBadFrom = await err(() => placeCoolingRetrieval({ companyId, userId: L1, taskId: tE!.id, fromCellCode: wrongCellQr, ean: lotEan, targetCellCode: targetQrE }));
+  ok("place: повтор после COMPLETED с чужой исходной ячейкой — отклонён", repBadFrom.includes("не та ячейка"));
+  const repBadTarget = await err(() => placeCoolingRetrieval({ companyId, userId: L1, taskId: tE!.id, fromCellCode: fromE, ean: lotEan, targetCellCode: wrongCellQr }));
+  ok("place: повтор после COMPLETED с чужой целевой ячейкой — отклонён", repBadTarget.includes("не та целевая"));
 }
 
 main()

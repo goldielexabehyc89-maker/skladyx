@@ -95,12 +95,12 @@ export async function completeGroupPlacementAction(
   const session = await requireUser();
   const s = scoped(session);
   const taskId = String(formData.get("taskId") ?? "").trim();
-  const cellId = String(formData.get("cellId") ?? "").trim();
+  const cellCode = String(formData.get("cellCode") ?? "").trim();
   const ean = String(formData.get("ean") ?? "").trim();
-  if (!cellId) return { error: "Выберите целевую ячейку" };
   if (!ean) return { error: "Отсканируйте заводской штрихкод товара (EAN)" };
+  if (!cellCode) return { error: "Отсканируйте QR/Code 128 целевой ячейки" };
   try {
-    await completeGroupPlacement({ companyId: s.companyId, userId: session.userId, taskId, cellId, ean });
+    await completeGroupPlacement({ companyId: s.companyId, userId: session.userId, taskId, cellCode, ean });
   } catch (e) {
     return { error: msg(e) };
   }

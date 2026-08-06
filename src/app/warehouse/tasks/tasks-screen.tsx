@@ -13,7 +13,7 @@ import {
 } from "@/app/actions/tasks";
 import { completeGroupPlacementAction, type PlacementState } from "@/app/actions/group-receiving";
 import { reportShortageAction, pickScanAction, completeMoveGroupAction, type OrderActionState } from "@/app/actions/external-orders";
-import { PickOrderScanner, MoveGroupScanner } from "./order-scanners";
+import { PickOrderScanner, MoveGroupScanner, PlaceGroupScanner, CoolingRetrievalScanner } from "./order-scanners";
 import { ControlOrderPanel, CorrectOrderPanel, type ControlOrderCtx, type CorrectOrderCtx } from "./control-panels";
 import { IssueOrderPanel, DeliverOrderPanel, type IssueOrderCtx, type DeliverOrderCtx } from "./issue-panels";
 import { Button, Card, CardTitle, Badge, EmptyState } from "@/components/ui";
@@ -163,10 +163,9 @@ function HandoffResponse({ handoffId }: { handoffId: string }) {
   );
 }
 
-// Пакет 4: завершение размещения группы (PLACE_GROUP) — выбор пустой целевой ячейки.
-function PlacementForm({ placement }: { placement: Placement }) {
-  const [state, action, pending] = useActionState<PlacementState, FormData>(completeGroupPlacementAction, {});
-  const [cellId, setCellId] = useState(placement.cells[0]?.id ?? "");
+// Пакет 9B: первичное размещение группы (PLACE_GROUP) — основной путь скан (EAN товара → QR/Code128
+// целевой ячейки, сервер сам проверяет код ячейки), ручной ввод кодов — fallback.
+function PlacementBlock({ placement }: { placement: Placement }) {
   if (placement.cells.length === 0)
     return (
       <p className="text-xs text-orange-600">
@@ -174,64 +173,75 @@ function PlacementForm({ placement }: { placement: Placement }) {
       </p>
     );
   return (
-    <form action={action} className="flex flex-col gap-2">
-      <input type="hidden" name="taskId" value={placement.taskId} />
-      <label className="text-xs font-medium text-neutral-500">Целевая ячейка ({placement.routeLabel})</label>
-      <select
-        name="cellId"
-        value={cellId}
-        onChange={(e) => setCellId(e.target.value)}
-        className="rounded-lg border border-[#e4e4f0] px-3 py-2 text-sm"
-      >
-        {placement.cells.map((c) => (
-          <option key={c.id} value={c.id}>
-            {c.code}
-            {c.level != null ? ` · ур.${c.level}` : ""}
-            {c.recommended ? " · рекомендуется" : ""}
-          </option>
-        ))}
-      </select>
-      <label className="text-xs font-medium text-neutral-500">EAN товара (подтверждение)</label>
-      <input name="ean" required inputMode="numeric" placeholder="EAN товара (8/13 цифр)" className="rounded-lg border border-[#e4e4f0] px-3 py-2 text-sm" />
-      {state.error && <p className="text-xs text-red-600">{state.error}</p>}
-      <Button type="submit" disabled={pending} className="w-full">
-        {pending ? "…" : "Разместить группу"}
-      </Button>
-    </form>
+    <div className="flex flex-col gap-2">
+      <PlaceGroupScanner placement={placement} />
+      <ManualPlaceForm placement={placement} />
+    </div>
   );
 }
 
-// Пакет 9B: двухфазный забор из охлаждения. Фаза 1 — скан ячейки охлаждения + EAN + температура;
-// если готово (≤ X) — Фаза 2: показать назначенную ячейку и подтвердить её сканом (движение через ядро).
-const coolInput = "rounded-lg border border-[#e4e4f0] px-3 py-2 text-sm";
-function CoolingRetrievalForm({ cooling }: { cooling: Cooling }) {
+function ManualPlaceForm({ placement }: { placement: Placement }) {
+  const [state, action, pending] = useActionState<PlacementState, FormData>(completeGroupPlacementAction, {});
+  return (
+    <details className="text-xs text-neutral-500">
+      <summary className="cursor-pointer">Ввести коды вручную (без камеры)</summary>
+      <form action={action} className="mt-2 flex flex-col gap-2">
+        <input type="hidden" name="taskId" value={placement.taskId} />
+        <input name="ean" required inputMode="numeric" placeholder="EAN товара (8/13 цифр)" className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm" />
+        <input name="cellCode" required placeholder="Код целевой ячейки (QR/Code 128)" className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm" />
+        {state.error && <p className="text-red-600">{state.error}</p>}
+        <Button type="submit" variant="ghost" disabled={pending}>{pending ? "…" : "Разместить по кодам"}</Button>
+      </form>
+      {placement.cells.length > 0 && (
+        <div className="mt-1 text-[11px] text-neutral-400">Рекомендуемые ячейки: {placement.cells.slice(0, 4).map((c) => c.code).join(", ")}</div>
+      )}
+    </details>
+  );
+}
+
+// Пакет 9B: двухфазный забор из охлаждения — основной путь скан (CoolingRetrievalScanner),
+// ручной ввод кодов — fallback. Фаза 1 — ячейка охлаждения + EAN + температура; если готово (≤ X) —
+// Фаза 2: показать назначенную ячейку и подтвердить её сканом (движение через ядро).
+const coolInput = "rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm";
+function CoolingBlock({ cooling }: { cooling: Cooling }) {
+  return (
+    <div className="flex flex-col gap-2">
+      <CoolingRetrievalScanner cooling={cooling} />
+      <ManualCoolingForm cooling={cooling} />
+    </div>
+  );
+}
+
+function ManualCoolingForm({ cooling }: { cooling: Cooling }) {
   const [prep, prepAction, prepPending] = useActionState<TaskActionState, FormData>(prepareCoolingRetrievalAction, {});
   const [plc, plcAction, plcPending] = useActionState<TaskActionState, FormData>(placeCoolingRetrievalAction, {});
   return (
-    <div className="flex flex-col gap-3">
-      <form action={prepAction} className="flex flex-col gap-2">
-        <input type="hidden" name="taskId" value={cooling.taskId} />
-        <label className="text-xs font-medium text-neutral-500">Фаза 1 · замер (порог X = {cooling.thresholdX})</label>
-        <input name="fromCellCode" required placeholder="Ячейка охлаждения (QR/Code 128)" className={coolInput} />
-        <input name="ean" required inputMode="numeric" placeholder="EAN товара (8/13 цифр)" className={coolInput} />
-        <input name="temperature" type="number" inputMode="decimal" step="0.1" required placeholder="Температура, °C" className={coolInput} />
-        {prep.error && <p className="text-xs text-red-600">{prep.error}</p>}
-        {prep.ready === false && <p className="text-xs text-neutral-500">Выше X — записан новый цикл охлаждения.</p>}
-        <Button type="submit" disabled={prepPending} className="w-full">{prepPending ? "…" : "Записать замер"}</Button>
-      </form>
-      {prep.ready && prep.targetCellCode && (
-        <form action={plcAction} className="flex flex-col gap-2 border-t border-[#eee] pt-2">
+    <details className="text-xs text-neutral-500">
+      <summary className="cursor-pointer">Ввести коды вручную (без камеры)</summary>
+      <div className="mt-2 flex flex-col gap-3">
+        <form action={prepAction} className="flex flex-col gap-2">
           <input type="hidden" name="taskId" value={cooling.taskId} />
-          <p className="text-xs font-medium text-green-700">Готово к вывозу → ячейка <b>{prep.targetCellCode}</b>. Отсканируйте ячейку охлаждения, EAN и целевую ячейку.</p>
+          <label className="text-xs font-medium text-neutral-500">Фаза 1 · замер (порог X = {cooling.thresholdX})</label>
           <input name="fromCellCode" required placeholder="Ячейка охлаждения (QR/Code 128)" className={coolInput} />
           <input name="ean" required inputMode="numeric" placeholder="EAN товара (8/13 цифр)" className={coolInput} />
-          <input name="targetCellCode" required placeholder="Целевая ячейка (QR/Code 128)" className={coolInput} />
-          {plc.error && <p className="text-xs text-red-600">{plc.error}</p>}
-          <Button type="submit" disabled={plcPending} className="w-full">{plcPending ? "…" : "Разместить в назначенную ячейку"}</Button>
+          <input name="temperature" type="number" inputMode="decimal" step="0.1" required placeholder="Температура, °C" className={coolInput} />
+          {prep.error && <p className="text-xs text-red-600">{prep.error}</p>}
+          {prep.ready === false && <p className="text-xs text-neutral-500">Выше X — записан новый цикл охлаждения.</p>}
+          <Button type="submit" variant="ghost" disabled={prepPending} className="w-full">{prepPending ? "…" : "Записать замер"}</Button>
         </form>
-      )}
-      <p className="text-xs text-neutral-400">≤ X — Фаза 2 (скан назначенной ячейки → размещение); выше X — новый цикл охлаждения.</p>
-    </div>
+        {prep.ready && prep.targetCellCode && (
+          <form action={plcAction} className="flex flex-col gap-2 border-t border-[#eee] pt-2">
+            <input type="hidden" name="taskId" value={cooling.taskId} />
+            <p className="text-xs font-medium text-green-700">Готово к вывозу → ячейка <b>{prep.targetCellCode}</b>. Введите коды ячейки охлаждения, EAN и целевой ячейки.</p>
+            <input name="fromCellCode" required placeholder="Ячейка охлаждения (QR/Code 128)" className={coolInput} />
+            <input name="ean" required inputMode="numeric" placeholder="EAN товара (8/13 цифр)" className={coolInput} />
+            <input name="targetCellCode" required placeholder="Целевая ячейка (QR/Code 128)" className={coolInput} />
+            {plc.error && <p className="text-xs text-red-600">{plc.error}</p>}
+            <Button type="submit" variant="ghost" disabled={plcPending} className="w-full">{plcPending ? "…" : "Разместить в назначенную ячейку"}</Button>
+          </form>
+        )}
+      </div>
+    </details>
   );
 }
 
@@ -347,8 +357,8 @@ export function WorkerTasks({
                   <Button className="w-full">Открыть</Button>
                 </Link>
               )}
-              {placement && current.status === "IN_PROGRESS" && <PlacementForm placement={placement} />}
-              {cooling && current.status === "IN_PROGRESS" && <CoolingRetrievalForm cooling={cooling} />}
+              {placement && current.status === "IN_PROGRESS" && <PlacementBlock placement={placement} />}
+              {cooling && current.status === "IN_PROGRESS" && <CoolingBlock cooling={cooling} />}
               {moveGroup && current.status === "IN_PROGRESS" && (
                 <>
                   <MoveGroupScanner ctx={moveGroup} />

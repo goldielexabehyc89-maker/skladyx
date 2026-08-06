@@ -13,6 +13,7 @@ import {
   type ControlActionState,
 } from "@/app/actions/order-control";
 import { Button, Badge } from "@/components/ui";
+import { QrScanner } from "@/components/qr-scanner";
 import { WorkflowSheet, type ScanFormat } from "@/components/workflow-sheet";
 const PRODUCT: ScanFormat[] = ["ean_8", "ean_13"];
 const ORDERF: ScanFormat[] = ["qr_code"];
@@ -305,6 +306,8 @@ function ResolveDiscrepancy({ taskId, disc }: { taskId: string; disc: CorrectOrd
   const isDamaged = disc.type === "DAMAGED" || disc.type === "OTHER";
   const action = isShortage ? resolveShortageAction : resolveRemovalAction;
   const [state, formAction, pending] = useActionState<ControlActionState, FormData>(action, {});
+  const [ean, setEan] = useState("");
+  const [scanning, setScanning] = useState(false);
   const resolved = disc.resolutionStatus === "RESOLVED";
   return (
     <div className="rounded-xl border border-[#eee] p-2.5">
@@ -315,11 +318,21 @@ function ResolveDiscrepancy({ taskId, disc }: { taskId: string; disc: CorrectOrd
         </Badge>
       </div>
       <div className="mt-0.5 text-xs text-neutral-600">нужно {disc.expected} · по факту {disc.counted}{disc.comment ? ` · ${disc.comment}` : ""}</div>
+      {!resolved && scanning && (
+        <div className="mt-2">
+          <QrScanner formats={PRODUCT} onScan={(raw) => { setEan(raw.trim()); setScanning(false); }} />
+          <Button type="button" variant="ghost" onClick={() => setScanning(false)} className="mt-1 w-full">Отмена</Button>
+        </div>
+      )}
       {!resolved && (
         <form action={formAction} className="mt-2 flex flex-col gap-2">
           <input type="hidden" name="taskId" value={taskId} />
           <input type="hidden" name="checkLineId" value={disc.checkLineId} />
-          <input name="ean" required inputMode="numeric" placeholder={isShortage ? "EAN добавляемого товара" : "EAN удаляемого товара"} className="rounded-lg border border-[#e4e4f0] px-2 py-1 text-sm" />
+          {/* Пакет 9B: EAN исправляемого товара — основной путь скан камерой, ручной ввод EAN — fallback */}
+          <div className="flex gap-2">
+            <input name="ean" value={ean} onChange={(e) => setEan(e.target.value)} required inputMode="numeric" placeholder={isShortage ? "EAN добавляемого товара" : "EAN удаляемого товара"} className="min-w-0 flex-1 rounded-lg border border-[#e4e4f0] px-2 py-1 text-sm" />
+            <Button type="button" variant="ghost" onClick={() => setScanning(true)}><ScanLine size={16} /> Скан</Button>
+          </div>
           <input name="qty" required type="number" inputMode="decimal" step="1" placeholder="Количество" className="rounded-lg border border-[#e4e4f0] px-2 py-1 text-sm" />
           {!isShortage && (
             <select name="disposition" defaultValue={isDamaged ? "DISCREPANCY" : "RETURN"} className="rounded-lg border border-[#e4e4f0] px-2 py-1 text-sm">

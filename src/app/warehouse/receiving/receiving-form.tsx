@@ -6,12 +6,9 @@ import { Button, Card, CardTitle, Field, Badge } from "@/components/ui";
 import { QrScanner } from "@/components/qr-scanner";
 import { createGroupReceivingAction, type ReceivingState } from "@/app/actions/group-receiving";
 
-interface ItemOpt { id: string; name: string; sku: string | null; uom: string }
-
 // Пакет 9B: приёмка по заводскому EAN. Товар определяется сервером через findItemByEan; ручной выбор
 // товара/SKU убран. Скан камерой (EAN-8/EAN-13) — основной путь, ручной ввод EAN — fallback.
-// `items` больше не используется (совместимость сигнатуры со страницей).
-export function ReceivingForm({ thresholdX }: { thresholdX: number; items?: ItemOpt[] }) {
+export function ReceivingForm({ thresholdX }: { thresholdX: number }) {
   const [state, action, pending] = useActionState<ReceivingState, FormData>(createGroupReceivingAction, {});
   const [ean, setEan] = useState("");
   const [temp, setTemp] = useState("");

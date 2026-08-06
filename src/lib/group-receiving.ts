@@ -7,6 +7,7 @@ import { nextNumber } from "@/lib/counters";
 import { getSettings } from "@/lib/settings";
 import { fmtDateTime } from "@/lib/format";
 import { coolingWorkflowEnabled } from "@/lib/roles";
+import { parseScannedCode } from "@/lib/qr";
 import { eanItemIdInTx } from "@/lib/barcodes";
 import { startCoolingInTx } from "@/lib/cooling";
 import {
@@ -185,7 +186,7 @@ export async function completeGroupPlacement(input: {
   companyId: string;
   userId: string;
   taskId: string;
-  cellId: string;
+  cellCode: string; // Пакет 9B: отсканированный QR/Code128 целевой ячейки — сервер сам резолвит и проверяет
   ean: string;
 }): Promise<{ warehouseId: string }> {
   const res = await prisma.$transaction(async (tx) => {
@@ -208,9 +209,16 @@ export async function completeGroupPlacement(input: {
       throw new GroupError("Группа уже размещена");
     const targetKind = group.status === "AWAITING_STORAGE" ? "STORAGE" : "COOLING";
 
+    // Пакет 9B: целевую ячейку определяем ТОЛЬКО по отсканированному коду (QR/Code128), а не по
+    // присланному id — сервер резолвит код в ячейку и проверяет её принадлежность складу/зоне.
+    const scannedCellCode = parseScannedCode(input.cellCode);
+    if (!scannedCellCode) throw new GroupError("Неверный код ячейки");
+    const cellQr = await tx.qrCode.findUnique({ where: { code: scannedCellCode } });
+    if (!cellQr || cellQr.companyId !== input.companyId || cellQr.type !== "CELL")
+      throw new GroupError("Это не код ячейки этой организации");
     // целевая ячейка: та же компания+склад, активная, физическая нужного kind
     const cell = await tx.cell.findFirst({
-      where: { id: input.cellId, companyId: input.companyId, warehouseId: group.warehouseId },
+      where: { id: cellQr.refId, companyId: input.companyId, warehouseId: group.warehouseId },
       include: { zone: true },
     });
     if (!cell) throw new GroupError("Ячейка не найдена на этом складе");

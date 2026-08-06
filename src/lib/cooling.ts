@@ -189,7 +189,15 @@ export async function prepareCoolingRetrieval(input: {
     const X = session.thresholdX.toNumber();
     const reservation = await tx.cellReservation.findFirst({ where: { sessionId: session.id, status: "ACTIVE" } });
 
-    // идемпотентность: если уже подготовлено к вывозу (последнее измерение <= X) — вернуть ту же цель
+    // Пакет 9B-fix: исходную COOLING-ячейку и EAN подтверждаем ВСЕГДА — до любого (в т.ч. идемпотентного) возврата,
+    // иначе посторонним кодом можно получить успешный ответ после подготовки.
+    const fromCellId = await resolveCoolingCell(tx, input.companyId, group.warehouseId, input.fromCellCode);
+    if (fromCellId !== session.coolingCellId) throw new CoolingError("Отсканирована не та ячейка охлаждения");
+    const scannedItemId = await eanItemIdInTx(tx, input.companyId, input.ean);
+    if (!scannedItemId) throw new CoolingError("Неизвестный, неактивный или чужой EAN — операция отклонена");
+    if (scannedItemId !== group.itemId) throw new CoolingError("Отсканирован не тот товар (EAN не совпадает с группой)");
+
+    // идемпотентность: уже подготовлено к вывозу (последнее измерение <= X) — вернуть ту же цель без нового замера
     const last = await lastMeasurement(tx, session.id);
     if (last && last.temperature.toNumber() <= X) {
       if (!reservation) throw new CoolingError("Резерв целевой ячейки не найден");
@@ -197,14 +205,9 @@ export async function prepareCoolingRetrieval(input: {
       return { warehouseId: group.warehouseId, ready: true, targetCellCode: cell?.code ?? null, nextTaskRes: null as TaskCreateResult | null };
     }
 
-    // новый замер — подтверждаем исходную COOLING-ячейку и EAN товара
+    // новый замер
     if (!Number.isFinite(input.temperature) || input.temperature < -100 || input.temperature > 100)
       throw new CoolingError("Некорректная температура");
-    const fromCellId = await resolveCoolingCell(tx, input.companyId, group.warehouseId, input.fromCellCode);
-    if (fromCellId !== session.coolingCellId) throw new CoolingError("Отсканирована не та ячейка охлаждения");
-    const scannedItemId = await eanItemIdInTx(tx, input.companyId, input.ean);
-    if (!scannedItemId) throw new CoolingError("Неизвестный, неактивный или чужой EAN — операция отклонена");
-    if (scannedItemId !== group.itemId) throw new CoolingError("Отсканирован не тот товар (EAN не совпадает с группой)");
     if (!reservation) throw new CoolingError("Активный резерв ячейки не найден");
 
     await tx.temperatureMeasurement.create({ data: { companyId: input.companyId, sessionId: session.id, temperature: input.temperature, byUserId: input.userId } });
@@ -266,21 +269,26 @@ export async function placeCoolingRetrieval(input: {
     if (!session) throw new CoolingError("Сессия охлаждения не найдена");
     const group = await tx.handlingGroup.findFirst({ where: { id: session.handlingGroupId, companyId: input.companyId } });
     if (!group) throw new CoolingError("Группа не найдена");
-    // идемпотентность: уже размещено
-    if (session.status === "COMPLETED" || group.status === "IN_STORAGE")
-      return { companyId: input.companyId, warehouseId: group.warehouseId, title: task.title, taskId: task.id, unblocked: [] as { id: string; title: string; warehouseId: string }[], alreadyPlaced: true };
-    if (task.status !== "IN_PROGRESS") throw new CoolingError("Задача не в работе");
-    const last = await lastMeasurement(tx, session.id);
-    if (!last || last.temperature.toNumber() > session.thresholdX.toNumber())
-      throw new CoolingError("Сначала выполните замер (Фаза 1): группа ещё не готова к вывозу");
+
+    // Пакет 9B-fix: исходную ячейку, EAN и назначенную целевую ячейку сверяем ВСЕГДА — включая повтор после
+    // COMPLETED (тогда бронь уже RELEASED, но cellId цели сохранён), иначе посторонним кодом можно получить успех.
     const fromCellId = await resolveCoolingCell(tx, input.companyId, group.warehouseId, input.fromCellCode);
     if (fromCellId !== session.coolingCellId) throw new CoolingError("Отсканирована не та ячейка охлаждения");
     const scannedItemId = await eanItemIdInTx(tx, input.companyId, input.ean);
     if (!scannedItemId || scannedItemId !== group.itemId) throw new CoolingError("Отсканирован не тот товар (EAN не совпадает с группой)");
-    const reservation = await tx.cellReservation.findFirst({ where: { sessionId: session.id, status: "ACTIVE" } });
-    if (!reservation) throw new CoolingError("Активный резерв целевой ячейки не найден");
+    const reservation = await tx.cellReservation.findFirst({ where: { sessionId: session.id } });
+    if (!reservation) throw new CoolingError("Резерв целевой ячейки не найден");
     const destCellId = await resolveCoolingCell(tx, input.companyId, group.warehouseId, input.targetCellCode);
     if (destCellId !== reservation.cellId) throw new CoolingError("Отсканирована не та целевая ячейка (не совпадает с назначенной)");
+
+    // идемпотентность: уже размещено (после полной сверки кодов) — точный повтор успешен без нового движения
+    if (session.status === "COMPLETED" || group.status === "IN_STORAGE")
+      return { companyId: input.companyId, warehouseId: group.warehouseId, title: task.title, taskId: task.id, unblocked: [] as { id: string; title: string; warehouseId: string }[], alreadyPlaced: true };
+    if (task.status !== "IN_PROGRESS") throw new CoolingError("Задача не в работе");
+    if (reservation.status !== "ACTIVE") throw new CoolingError("Активный резерв целевой ячейки не найден");
+    const last = await lastMeasurement(tx, session.id);
+    if (!last || last.temperature.toNumber() > session.thresholdX.toNumber())
+      throw new CoolingError("Сначала выполните замер (Фаза 1): группа ещё не готова к вывозу");
 
     await lockCell(tx, input.companyId, session.coolingCellId);
     await lockCell(tx, input.companyId, destCellId);

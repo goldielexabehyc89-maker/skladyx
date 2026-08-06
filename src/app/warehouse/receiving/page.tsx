@@ -1,11 +1,10 @@
 import { redirect } from "next/navigation";
 import { requireUser } from "@/lib/auth";
 import { scoped } from "@/lib/tenant";
-import { prisma } from "@/lib/db";
 import { groupReceivingEnabled, hasRole } from "@/lib/roles";
 import { getActiveShift } from "@/lib/work-shift";
 import { getSettings } from "@/lib/settings";
-import { PageTitle, Card, Badge, EmptyState, LinkButton } from "@/components/ui";
+import { PageTitle, Card, Badge, LinkButton } from "@/components/ui";
 import { ReceivingForm } from "./receiving-form";
 
 // Экран групповой приёмки: только RECEIVER с активной сменой (ADMIN — при активной смене RECEIVER).
@@ -58,25 +57,14 @@ export default async function ReceivingPage() {
     );
   }
 
-  const items = await prisma.item.findMany({
-    where: { companyId: s.companyId, isActive: true, tracking: "LOT" },
-    select: { id: true, name: true, sku: true, uom: { select: { name: true } } },
-    orderBy: { name: "asc" },
-  });
-
+  // Пакет 9B: товар определяется сканом заводского EAN (findItemByEan на сервере). Полный список
+  // номенклатуры форме больше не нужен — не загружаем его (при большом API-каталоге это лишняя нагрузка).
   return (
     <div className="mx-auto flex w-full max-w-lg flex-col gap-4">
       <PageTitle action={<Badge tone="green">Приёмщик · {receiverShift.warehouseName}</Badge>}>
         Приёмка группами
       </PageTitle>
-      {items.length === 0 ? (
-        <EmptyState>Нет активной партионной номенклатуры для приёмки.</EmptyState>
-      ) : (
-        <ReceivingForm
-          thresholdX={settings.tempThresholdX}
-          items={items.map((i) => ({ id: i.id, name: i.name, sku: i.sku, uom: i.uom.name }))}
-        />
-      )}
+      <ReceivingForm thresholdX={settings.tempThresholdX} />
     </div>
   );
 }
