@@ -62,13 +62,22 @@ const EAN_C = ean13("460000100003");
 const EAN_UNKNOWN = ean13("460000100099");
 const EAN_BAD = "4600001000015"; // неверная контрольная цифра
 
+// SAFE-режим (staging): НЕ трогаем существующие склады (в т.ч. «Тестовый») — используем единственный
+// активный как есть, не создаём/не выключаем его, пропускаем деструктивную под-проверку «0 складов».
+const SAFE = process.env.INTEGRATION_E2E_SAFE === "1";
 let companyId = "";
-let WT = ""; // тестовый склад
-let deactivated: string[] = []; // склады, которые мы временно выключили
+let WT = ""; // рабочий склад теста
+let deactivated: string[] = []; // склады, которые мы временно выключили (только не-SAFE)
 
 async function setup() {
   companyId = (await prisma.company.findFirstOrThrow({ where: { slug: SLUG } })).id;
-  // Точный контроль числа активных складов: выключаем существующие, создаём ровно один тестовый.
+  if (SAFE) {
+    const active = await prisma.warehouse.findMany({ where: { companyId, isActive: true }, select: { id: true } });
+    if (active.length !== 1) throw new Error(`SAFE-режим требует ровно один активный склад, найдено ${active.length}`);
+    WT = active[0].id; // используем существующий (напр. «Тестовый») без изменений
+    return;
+  }
+  // Обычный режим (эфемерная CI-БД): выключаем существующие, создаём ровно один тестовый.
   const active = await prisma.warehouse.findMany({ where: { companyId, isActive: true }, select: { id: true } });
   deactivated = active.map((w) => w.id);
   if (deactivated.length) await prisma.warehouse.updateMany({ where: { id: { in: deactivated } }, data: { isActive: false } });
@@ -185,17 +194,20 @@ async function main() {
     ok("заказ не создан", (await prisma.externalOrder.count({ where: { companyId, externalId: `${P}ORD2` } })) === 0);
   }
 
-  console.log("12) 0 или >1 активных складов → отказ конфигурации");
+  console.log("12) >1 активных складов → отказ конфигурации" + (SAFE ? " (SAFE: под-проверку «0 складов» пропускаем — не трогаем единственный склад)" : ""));
   {
     const WT2 = (await prisma.warehouse.create({ data: { companyId, name: `${P}WH2`, isActive: true } })).id;
     const r2 = await post("/api/integration/v1/orders", { externalId: `${P}ORD3`, lines: [{ externalLineId: "L1", ean: EAN_A, quantity: 1 }] });
     ok("два активных склада → 409", r2.status === 409, JSON.stringify(r2.json));
     await prisma.warehouse.update({ where: { id: WT2 }, data: { isActive: false } });
-    await prisma.warehouse.update({ where: { id: WT }, data: { isActive: false } });
-    const r0 = await post("/api/integration/v1/orders", { externalId: `${P}ORD3`, lines: [{ externalLineId: "L1", ean: EAN_A, quantity: 1 }] });
-    ok("ноль активных складов → 409", r0.status === 409, JSON.stringify(r0.json));
+    if (!SAFE) {
+      // деактивируем единственный оставшийся склад — только в эфемерной CI-БД
+      await prisma.warehouse.update({ where: { id: WT }, data: { isActive: false } });
+      const r0 = await post("/api/integration/v1/orders", { externalId: `${P}ORD3`, lines: [{ externalLineId: "L1", ean: EAN_A, quantity: 1 }] });
+      ok("ноль активных складов → 409", r0.status === 409, JSON.stringify(r0.json));
+      await prisma.warehouse.update({ where: { id: WT }, data: { isActive: true } });
+    }
     ok("заказ ORD3 не создан", (await prisma.externalOrder.count({ where: { companyId, externalId: `${P}ORD3` } })) === 0);
-    await prisma.warehouse.update({ where: { id: WT }, data: { isActive: true } }); // вернуть один активный
     await prisma.warehouse.deleteMany({ where: { id: WT2 } });
   }
 
