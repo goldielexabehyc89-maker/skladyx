@@ -132,6 +132,7 @@ function NavContent({
   canReceive,
   groupReceiving,
   legacyUi,
+  homeHref,
   name,
   collapsed,
   onNavigate,
@@ -143,6 +144,7 @@ function NavContent({
   canReceive: boolean;
   groupReceiving: boolean;
   legacyUi: boolean;
+  homeHref: string;
   name: string;
   collapsed: boolean;
   onNavigate?: () => void;
@@ -169,7 +171,7 @@ function NavContent({
         )}
       >
         {!collapsed && (
-          <Link href="/warehouse" className="text-[15px] font-bold tracking-wide text-[#3d3460]">
+          <Link href={homeHref} className="text-[15px] font-bold tracking-wide text-[#3d3460]">
             SkladyX
           </Link>
         )}
@@ -305,6 +307,7 @@ export function AppNav({
   tasksEnabled,
   groupReceivingEnabled = false,
   legacyUi = true,
+  homeHref = "/warehouse",
 }: {
   role: Role;
   roles: Role[];
@@ -312,6 +315,7 @@ export function AppNav({
   tasksEnabled: boolean;
   groupReceivingEnabled?: boolean;
   legacyUi?: boolean;
+  homeHref?: string;
 }) {
   const [mobileOpen, setMobileOpen] = useState(false);
   const [collapsed, setCollapsed] = useState(false);
@@ -336,6 +340,7 @@ export function AppNav({
           canReceive={canReceive}
           groupReceiving={groupReceivingEnabled}
           legacyUi={legacyUi}
+          homeHref={homeHref}
           name={name}
           collapsed={collapsed}
           onToggleCollapse={() => setCollapsed((v) => !v)}
@@ -382,6 +387,7 @@ export function AppNav({
               canReceive={canReceive}
               groupReceiving={groupReceivingEnabled}
               legacyUi={legacyUi}
+              homeHref={homeHref}
               name={name}
               collapsed={false}
               onNavigate={() => setMobileOpen(false)}

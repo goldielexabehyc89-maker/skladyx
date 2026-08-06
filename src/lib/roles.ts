@@ -166,3 +166,17 @@ export function navRole(session: SessionData): Role {
   const eff = effectiveRoles(session);
   return ROLE_PRIORITY.find((r) => eff.includes(r)) ?? session.role;
 }
+
+// Пакет 10 (коррекция навигации): единый резолвер домашнего экрана роли. Используется и лендингом
+// `/warehouse` (redirect), и логотипом навигации — чтобы nav ссылался ПРЯМО на реальную страницу, а не
+// на редирект-маршрут `/warehouse` (иначе его prefetch кэширует редирект и перехватывает навигацию по
+// `/warehouse/*`). Логика зеркалит src/app/warehouse/page.tsx.
+export function warehouseHomePath(session: SessionData): string {
+  const role = navRole(session);
+  const legacyUi = legacyWarehouseUiEnabled();
+  const newHome = workflowTasksEnabled() ? "/warehouse/tasks" : "/warehouse/stock";
+  if (role === "ADMIN" || role === "STOREKEEPER") return legacyUi ? "/warehouse/active" : newHome;
+  if (role === "OBSERVER") return "/warehouse/stock";
+  if (role === "EMPLOYEE") return legacyUi ? "/warehouse/my" : newHome;
+  return "/warehouse/shift"; // RECEIVER/LOADER/PICKER/CONTROLLER
+}
