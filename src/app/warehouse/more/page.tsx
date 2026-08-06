@@ -30,7 +30,7 @@ export default async function MorePage() {
     <div className="mx-auto flex w-full max-w-2xl flex-col gap-4">
       <PageTitle>Ещё</PageTitle>
       <div className="flex flex-col gap-2">
-        {LINKS.map((l) => (
+        {links.map((l) => (
           <Link
             key={l.href}
             href={l.href}
