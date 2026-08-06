@@ -9,10 +9,11 @@ import { applyLotMovement } from "@/lib/stock";
 import { ensureStandardZones, createCellsBatch, renameCell, deleteCell, setCellActive } from "@/lib/cells";
 import { addItemBarcode, setItemBarcodeActive, findItemByEan } from "@/lib/barcodes";
 import { parseEan, eanChecksumValid, classifyScan, parseInternalCode } from "@/lib/ean";
-import { code128Modules, code128TotalModules } from "@/lib/code128";
+import { code128Png } from "@/lib/code128";
 import { updateSettings, getSettings } from "@/lib/settings";
 import { buildLabels } from "@/app/warehouse/print/labels/build-labels";
 import { ZONE_KINDS } from "@/lib/zones";
+import { readBarcodesFromImageFile } from "zxing-wasm/reader";
 
 const prisma = new PrismaClient();
 let failures = 0;
@@ -82,7 +83,7 @@ async function cleanup() {
   await prisma.warehouseZone.deleteMany({ where: { warehouseId: { in: [W, DW] } } });
   await prisma.userRole.deleteMany({ where: { userId: "p9a_adm" } });
   await prisma.user.deleteMany({ where: { id: "p9a_adm" } });
-  await prisma.item.deleteMany({ where: { id: { in: [itemA, itemB] } } });
+  await prisma.item.deleteMany({ where: { companyId, name: { startsWith: "P9A " } } });
   await prisma.warehouse.deleteMany({ where: { id: { in: [W, DW] } } });
   if (demoId) await prisma.company.deleteMany({ where: { id: demoId, slug: "p9a-demo" } });
   await prisma.uom.deleteMany({ where: { id: uomId } });
@@ -187,8 +188,10 @@ async function main() {
   const { labels } = await buildLabels(companyId, { cell: c3.id });
   const cellQr = (await prisma.qrCode.findFirstOrThrow({ where: { type: "CELL", refId: c3.id } })).code;
   ok("этикетка ячейки содержит её внутренний код", labels.length === 1 && labels[0].code === cellQr);
-  const mods = code128Modules(cellQr);
-  ok("Code 128 кодирует ТОТ ЖЕ код (детерминированно, непусто)", mods.length > 0 && code128TotalModules(cellQr) > 0 && code128Modules(cellQr).length === mods.length);
+  // РЕАЛЬНАЯ считываемость: генерим Code 128 через bwip-js и декодируем ZXing (zxing-wasm) обратно
+  const png = await code128Png(cellQr, 3);
+  const decoded = await readBarcodesFromImageFile(new Blob([new Uint8Array(png)]), { formats: ["Code128"], tryHarder: true } as never);
+  ok("Code 128 декодируется ZXing обратно в ТОТ ЖЕ внутренний код", decoded[0]?.text === cellQr, JSON.stringify(decoded.map((d) => d.text)));
   ok("внутренний код парсится как internal, а не как EAN", classifyScan(cellQr).kind === "internal" && parseInternalCode(cellQr) === cellQr);
   ok("валидный EAN классифицируется как ean, не как internal", classifyScan(ean2).kind === "ean" && parseInternalCode(ean2) === null);
 
@@ -208,6 +211,18 @@ async function main() {
   await prisma.warehouse.update({ where: { id: W }, data: { coolingRate: 9.9 } });
   const coolAfter = await prisma.coolingSession.findFirstOrThrow({ where: { id: cool.id } });
   ok("снимок X/R активной сессии не переписан сменой настроек", Number(coolAfter.thresholdX) === 4 && Number(coolAfter.coolingRate) === 2.5);
+
+  console.log("18) API-товар: EAN read-only (добавление/деактивация запрещены), учёт остаётся");
+  const apiItem = await prisma.item.create({ data: { companyId, name: "P9A API товар", sku: "P9A-API", uomId, tracking: "LOT", isActive: true, source: "API", externalId: "ext-1" } });
+  const apiEan = mkEan13("461000000000");
+  await prisma.itemBarcode.create({ data: { companyId, itemId: apiItem.id, code: apiEan, symbology: "EAN13", source: "API", externalId: "ext-bc-1" } });
+  const eApiAdd = await err(() => addItemBarcode({ companyId, itemId: apiItem.id, code: mkEan13("461000000001") }));
+  ok("[18] добавление EAN API-товару отклонено", /интеграции/.test(eApiAdd), eApiAdd);
+  const apiBc = await prisma.itemBarcode.findFirstOrThrow({ where: { companyId, code: apiEan } });
+  const eApiDeact = await err(() => setItemBarcodeActive(companyId, apiBc.id, false));
+  ok("[18] деактивация API-EAN отклонена", /интеграции/.test(eApiDeact), eApiDeact);
+  ok("[18] активный API-EAN находит активный API-товар (учёт работает)", (await findItemByEan(companyId, apiEan))?.item.id === apiItem.id);
+  // cleanup API-item создаётся здесь; общий cleanup удалит по companyId
 
   console.log(failures === 0 ? "\nВСЕ ПРОВЕРКИ P9A ПРОЙДЕНЫ ✓" : `\nПРОВАЛ: ${failures} проверок`);
 }

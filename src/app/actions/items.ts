@@ -123,6 +123,8 @@ export async function deleteItemAction(_prev: FormState, formData: FormData): Pr
   const id = String(formData.get("id") ?? "");
   const item = await prisma.item.findFirst({ where: { id, companyId: s.companyId } });
   if (!item) return { error: "Товар не найден" };
+  // Пакет 9A: товар из интеграции нельзя удалять (отсутствие в API-sync ≠ удаление/деактивация).
+  if (item.source === "API") return { error: "Товар из интеграции — удаление недоступно" };
 
   const orderLine = await prisma.supplierOrderLine.findFirst({
     where: { companyId: s.companyId, itemId: item.id },

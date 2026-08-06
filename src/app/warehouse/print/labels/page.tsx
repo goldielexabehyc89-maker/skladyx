@@ -50,7 +50,7 @@ export default async function PrintLabelsPage({
         ),
       )
     : labels.map(() => "");
-  const bcSvgs = showBc ? labels.map((l) => code128Svg(l.code, { moduleW: 1, height: 30 })) : labels.map(() => "");
+  const bcSvgs = showBc ? labels.map((l) => code128Svg(l.code)) : labels.map(() => "");
 
   const qrSide = Math.min(H - 6, W * 0.45);
   const pageCss =
