@@ -10,20 +10,20 @@ import { warehouseAccess, isWhAllowed } from "@/lib/warehouse-access";
 import { logEvent } from "@/lib/events";
 import { broadcastRealtime } from "@/lib/realtime";
 import { createQrIn } from "@/lib/qr";
-import { warehouseZonesEnabled, coolingWorkflowEnabled } from "@/lib/roles";
+import { warehouseZonesEnabled } from "@/lib/roles";
 import {
   createStandardZonesInTx,
-  createCellsInZone,
+  createCellsBatch,
   changeCellZone,
-  renameZone,
-  addPhysicalZone,
+  renameCell,
+  deleteCell,
+  setCellActive,
   cellErrorMessage,
 } from "@/lib/cells";
-import { isPhysicalZoneKind } from "@/lib/zones";
-import type { ZoneKind } from "@prisma/client";
 
 export interface FormState {
   error?: string;
+  ok?: string;
 }
 
 const warehouseSchema = z.object({
@@ -84,9 +84,10 @@ export async function updateWarehouseAction(
   });
   if (!parsed.success) return { error: parsed.error.errors[0].message };
 
-  // Пакет 5: скорость охлаждения R (°C/час) — только при включённом флаге (иначе поле не трогаем).
+  // Пакет 9A: скорость охлаждения R (°C/час) настраивается ВСЕГДА (даже при выключенных бизнес-флагах);
+  // nullable, при заполнении строго > 0. Поле отправляется формой только когда присутствует в разметке.
   let coolingRate: number | null | undefined;
-  if (coolingWorkflowEnabled()) {
+  if (formData.has("coolingRate")) {
     const rRaw = String(formData.get("coolingRate") ?? "").trim().replace(",", ".");
     if (rRaw === "") coolingRate = null;
     else {
@@ -118,13 +119,51 @@ export async function updateWarehouseAction(
   return {};
 }
 
-const bulkCellsSchema = z.object({
-  prefix: z.string().trim().min(1, "Укажите префикс, например «А-»"),
-  from: z.coerce.number().int().min(0),
-  to: z.coerce.number().int().min(0),
-});
+// Пакет 9A: построить набор кодов ячеек. mode=manual → один код; mode=bulk → префикс + диапазон мест
+// (+ для STORAGE диапазон уровней, код вида «PREFIX-МЕСТО-УРN»). Возвращает {code, level}[] (≤500) или ошибку.
+function buildCellItems(fd: FormData, isStorage: boolean): { items?: { code: string; level: number | null }[]; error?: string } {
+  const mode = String(fd.get("mode") ?? "bulk");
+  if (mode === "manual") {
+    const code = String(fd.get("code") ?? "").trim();
+    if (!code) return { error: "Укажите код ячейки" };
+    let level: number | null = null;
+    if (isStorage) {
+      const lv = Number(String(fd.get("level") ?? "").trim());
+      if (!Number.isInteger(lv) || lv < 1) return { error: "Для зоны хранения укажите уровень (целое ≥ 1)" };
+      level = lv;
+    } else if (String(fd.get("level") ?? "").trim() !== "") {
+      return { error: "Уровень задаётся только для зоны хранения" };
+    }
+    return { items: [{ code, level }] };
+  }
+  const prefix = String(fd.get("prefix") ?? "").trim();
+  if (!prefix) return { error: "Укажите префикс, например «А-»" };
+  const from = Number(fd.get("from")), to = Number(fd.get("to"));
+  if (!Number.isInteger(from) || !Number.isInteger(to) || from < 0 || to < 0) return { error: "Диапазон мест — целые числа ≥ 0" };
+  if (to < from) return { error: "Конец диапазона меньше начала" };
+  const pad = String(to).length > 2 ? String(to).length : 2;
+  let levels: (number | null)[] = [null];
+  if (isStorage) {
+    const lFrom = Number(fd.get("levelFrom")), lTo = Number(fd.get("levelTo"));
+    if (!Number.isInteger(lFrom) || !Number.isInteger(lTo) || lFrom < 1 || lTo < lFrom)
+      return { error: "Для зоны хранения укажите диапазон уровней (целые ≥ 1)" };
+    levels = [];
+    for (let l = lFrom; l <= lTo; l++) levels.push(l);
+  } else if (String(fd.get("levelFrom") ?? "").trim() !== "" || String(fd.get("levelTo") ?? "").trim() !== "") {
+    return { error: "Уровень задаётся только для зоны хранения" };
+  }
+  const items: { code: string; level: number | null }[] = [];
+  for (const level of levels)
+    for (let i = from; i <= to; i++) {
+      const place = `${prefix}${String(i).padStart(pad, "0")}`;
+      items.push({ code: level == null ? place : `${place}-У${level}`, level });
+    }
+  if (items.length === 0) return { error: "Пустой набор ячеек" };
+  if (items.length > 500) return { error: "Не больше 500 ячеек за раз" };
+  return { items };
+}
 
-// Массовое создание ячеек: префикс + диапазон номеров («А-» 1..20 → А-01…А-20).
+// Создание ячеек: ручное (один код) или массовое (диапазон + уровни для STORAGE). Одна транзакция.
 export async function createCellsAction(_prev: FormState, formData: FormData): Promise<FormState> {
   const session = await requireAdmin();
   const s = scoped(session);
@@ -132,60 +171,85 @@ export async function createCellsAction(_prev: FormState, formData: FormData): P
   await s.warehouse(warehouseId);
   if (!isWhAllowed(await warehouseAccess(session), warehouseId))
     return { error: "Нет доступа к этому складу" };
+  const zoneId = String(formData.get("zoneId") ?? "");
 
-  const parsed = bulkCellsSchema.safeParse({
-    prefix: formData.get("prefix"),
-    from: formData.get("from"),
-    to: formData.get("to"),
-  });
-  if (!parsed.success) return { error: parsed.error.errors[0].message };
-  const { prefix, from, to } = parsed.data;
-  if (to < from) return { error: "Конец диапазона меньше начала" };
-  if (to - from + 1 > 500) return { error: "Не больше 500 ячеек за раз" };
-
-  const pad = String(to).length > 2 ? String(to).length : 2;
-  const codes: string[] = [];
-  for (let i = from; i <= to; i++) codes.push(`${prefix}${String(i).padStart(pad, "0")}`);
-
-  let created = 0;
-  if (warehouseZonesEnabled()) {
-    // Пакет 3: ячейки создаются в выбранной физической зоне; для STORAGE обязателен уровень.
-    const zoneId = String(formData.get("zoneId") ?? "");
-    if (!zoneId) return { error: "Выберите зону для ячеек" };
-    const levelRaw = String(formData.get("level") ?? "").trim();
-    const level = levelRaw ? Number(levelRaw) : null;
-    if (levelRaw && (!Number.isInteger(level) || (level as number) < 1))
-      return { error: "Уровень должен быть целым числом ≥ 1" };
-    try {
-      created = await createCellsInZone({ companyId: s.companyId, warehouseId, zoneId, codes, level });
-    } catch (e) {
-      return { error: cellErrorMessage(e) };
-    }
-  } else {
+  // Legacy-режим (флаг зон выключен, ячейки без зоны): плоское создание по префиксу/диапазону.
+  if (!zoneId) {
+    if (warehouseZonesEnabled()) return { error: "Выберите зону для ячеек" };
+    const prefix = String(formData.get("prefix") ?? "").trim();
+    if (!prefix) return { error: "Укажите префикс, например «А-»" };
+    const from = Number(formData.get("from")), to = Number(formData.get("to"));
+    if (!Number.isInteger(from) || !Number.isInteger(to) || from < 0 || to < from) return { error: "Проверьте диапазон номеров" };
+    if (to - from + 1 > 500) return { error: "Не больше 500 ячеек за раз" };
+    const pad = String(to).length > 2 ? String(to).length : 2;
     const isStaging = formData.get("isStaging") === "on";
-    created = await prisma.$transaction(async (tx) => {
+    const created = await prisma.$transaction(async (tx) => {
       let count = 0;
-      for (const code of codes) {
-        const exists = await tx.cell.findUnique({ where: { warehouseId_code: { warehouseId, code } } });
-        if (exists) continue;
+      for (let i = from; i <= to; i++) {
+        const code = `${prefix}${String(i).padStart(pad, "0")}`;
+        if (await tx.cell.findUnique({ where: { warehouseId_code: { warehouseId, code } } })) continue;
         const cell = await tx.cell.create({ data: { companyId: s.companyId, warehouseId, code, isStaging } });
         await createQrIn(tx, { companyId: s.companyId, type: "CELL", refId: cell.id });
         count++;
       }
       return count;
     });
+    if (created === 0) return { error: "Все ячейки диапазона уже существуют" };
+    broadcastRealtime({ type: "cell.updated", entity: "cell", companyId: s.companyId, warehouseIds: [warehouseId], actorUserId: session.userId });
+    revalidatePath(`/warehouse/warehouses/${warehouseId}`);
+    return { ok: `Создано ячеек: ${created}.` };
   }
 
-  if (created === 0) return { error: "Все ячейки диапазона уже существуют" };
-  broadcastRealtime({
-    type: "cell.updated",
-    entity: "cell",
-    companyId: s.companyId,
-    warehouseIds: [warehouseId],
-    actorUserId: session.userId,
-  });
+  const zone = await prisma.warehouseZone.findFirst({ where: { id: zoneId, companyId: s.companyId, warehouseId } });
+  if (!zone) return { error: "Зона не найдена" };
+
+  const built = buildCellItems(formData, zone.kind === "STORAGE");
+  if (built.error || !built.items) return { error: built.error ?? "Нет ячеек" };
+
+  let result: { created: number; skipped: string[] };
+  try {
+    result = await createCellsBatch({ companyId: s.companyId, warehouseId, zoneId, items: built.items });
+  } catch (e) {
+    return { error: cellErrorMessage(e) };
+  }
+  if (result.created === 0)
+    return { error: `Новых ячеек нет (все ${result.skipped.length} кода уже существуют)` };
+  broadcastRealtime({ type: "cell.updated", entity: "cell", companyId: s.companyId, warehouseIds: [warehouseId], actorUserId: session.userId });
   revalidatePath(`/warehouse/warehouses/${warehouseId}`);
-  return {};
+  const skipMsg = result.skipped.length ? ` Пропущено (уже есть): ${result.skipped.length}.` : "";
+  return { ok: `Создано ячеек: ${result.created}.${skipMsg}` };
+}
+
+// Переименовать неиспользованную ячейку (после первого движения/резерва/задачи — отказ).
+export async function renameCellAction(_prev: FormState, formData: FormData): Promise<FormState> {
+  const session = await requireAdmin();
+  const s = scoped(session);
+  const cellId = String(formData.get("cellId") ?? "");
+  const cell = await s.cell(cellId);
+  if (!isWhAllowed(await warehouseAccess(session), cell.warehouseId)) return { error: "Нет доступа к складу" };
+  try {
+    await renameCell(s.companyId, cellId, String(formData.get("code") ?? ""));
+  } catch (e) {
+    return { error: cellErrorMessage(e) };
+  }
+  revalidatePath(`/warehouse/warehouses/${cell.warehouseId}`);
+  return { ok: "Код ячейки изменён" };
+}
+
+// Удалить неиспользованную ячейку (атомарно с QR).
+export async function deleteCellAction(_prev: FormState, formData: FormData): Promise<FormState> {
+  const session = await requireAdmin();
+  const s = scoped(session);
+  const cellId = String(formData.get("cellId") ?? "");
+  const cell = await s.cell(cellId);
+  if (!isWhAllowed(await warehouseAccess(session), cell.warehouseId)) return { error: "Нет доступа к складу" };
+  try {
+    await deleteCell(s.companyId, cellId);
+  } catch (e) {
+    return { error: cellErrorMessage(e) };
+  }
+  revalidatePath(`/warehouse/warehouses/${cell.warehouseId}`);
+  return { ok: "Ячейка удалена" };
 }
 
 export async function toggleCellStagingAction(formData: FormData): Promise<void> {
@@ -209,13 +273,19 @@ export async function toggleCellStagingAction(formData: FormData): Promise<void>
   revalidatePath(`/warehouse/warehouses/${cell.warehouseId}`);
 }
 
-export async function toggleCellActiveAction(formData: FormData): Promise<void> {
+// Пакет 9A: деактивация/активация ячейки с серверным guard'ом (нельзя деактивировать занятую).
+export async function setCellActiveAction(_prev: FormState, formData: FormData): Promise<FormState> {
   const session = await requireAdmin();
   const s = scoped(session);
   const cellId = String(formData.get("cellId") ?? "");
   const cell = await s.cell(cellId);
-  if (!isWhAllowed(await warehouseAccess(session), cell.warehouseId)) return;
-  await prisma.cell.update({ where: { id: cellId }, data: { isActive: !cell.isActive } });
+  if (!isWhAllowed(await warehouseAccess(session), cell.warehouseId)) return { error: "Нет доступа к складу" };
+  const active = String(formData.get("active") ?? "") === "true";
+  try {
+    await setCellActive(s.companyId, cellId, active);
+  } catch (e) {
+    return { error: cellErrorMessage(e) };
+  }
   broadcastRealtime({
     type: "cell.updated",
     entity: "cell",
@@ -225,6 +295,7 @@ export async function toggleCellActiveAction(formData: FormData): Promise<void> 
     actorUserId: session.userId,
   });
   revalidatePath(`/warehouse/warehouses/${cell.warehouseId}`);
+  return { ok: active ? "Ячейка активирована" : "Ячейка деактивирована" };
 }
 
 // ── Пакет 3: зоны ──
@@ -259,34 +330,5 @@ export async function changeCellZoneAction(_prev: FormState, formData: FormData)
   return {};
 }
 
-// Переименовать зону (названия зон настраиваются организацией). Плоское form-действие.
-export async function renameZoneAction(formData: FormData): Promise<void> {
-  const session = await requireAdmin();
-  const s = scoped(session);
-  const zoneId = String(formData.get("zoneId") ?? "");
-  const name = String(formData.get("name") ?? "").trim();
-  if (!name) return;
-  const zone = await prisma.warehouseZone.findFirst({ where: { id: zoneId, companyId: s.companyId } });
-  if (!zone) return;
-  if (!isWhAllowed(await warehouseAccess(session), zone.warehouseId)) return;
-  await renameZone(s.companyId, zoneId, name);
-  revalidatePath(`/warehouse/warehouses/${zone.warehouseId}`);
-}
-
-// Добавить дополнительную физическую зону (допускается несколько зон одного kind).
-export async function addZoneAction(_prev: FormState, formData: FormData): Promise<FormState> {
-  const session = await requireAdmin();
-  const s = scoped(session);
-  const warehouseId = String(formData.get("warehouseId") ?? "");
-  await s.warehouse(warehouseId);
-  if (!isWhAllowed(await warehouseAccess(session), warehouseId)) return { error: "Нет доступа к складу" };
-  const kind = String(formData.get("kind") ?? "") as ZoneKind;
-  if (!isPhysicalZoneKind(kind)) return { error: "Добавлять можно только физические зоны" };
-  try {
-    await addPhysicalZone({ companyId: s.companyId, warehouseId, kind, name: String(formData.get("name") ?? "") });
-  } catch (e) {
-    return { error: cellErrorMessage(e) };
-  }
-  revalidatePath(`/warehouse/warehouses/${warehouseId}`);
-  return {};
-}
+// Пакет 9A: системные зоны фиксированы (7 на склад). Добавление/переименование/удаление/деактивация
+// зон закрыто на сервере — соответствующих actions больше нет (renameZoneAction/addZoneAction удалены).

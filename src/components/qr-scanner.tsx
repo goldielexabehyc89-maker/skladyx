@@ -3,20 +3,29 @@
 import { useEffect, useRef, useState } from "react";
 import { BarcodeDetector } from "barcode-detector/ponyfill";
 
-// Камера + распознавание QR. Ponyfill стандартного BarcodeDetector (zxing-wasm):
-// работает и на iOS Safari, и на Android Chrome. Требует HTTPS (secure context).
+// Камера + распознавание кодов. Ponyfill стандартного BarcodeDetector (zxing-wasm): работает и на
+// iOS Safari, и на Android Chrome. Требует HTTPS (secure context). Компонент технически способен
+// распознавать qr_code / code_128 / ean_8 / ean_13; конкретный набор задаётся пропом `formats`.
+// По умолчанию — только QR (существующие потоки Пакетов 4–8 сканируют QR групп/заказов и не должны
+// внезапно ловить EAN и мисроутить его). EAN-контексты (номенклатура) подключают форматы явно.
+
+// Пакет 9A: форматы, которые сканер умеет распознавать.
+export type ScanFormat = "qr_code" | "code_128" | "ean_8" | "ean_13";
 
 export function QrScanner({
   onScan,
   paused = false,
+  formats = ["qr_code"],
 }: {
   onScan: (rawValue: string) => void;
   paused?: boolean;
+  formats?: ScanFormat[];
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [error, setError] = useState<string | null>(null);
   const pausedRef = useRef(paused);
   const onScanRef = useRef(onScan);
+  const formatsRef = useRef(formats);
   pausedRef.current = paused;
   onScanRef.current = onScan;
 
@@ -27,7 +36,7 @@ export function QrScanner({
     let stopped = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
     const lastSeen = { value: "", at: 0 };
-    const detector = new BarcodeDetector({ formats: ["qr_code"] });
+    const detector = new BarcodeDetector({ formats: formatsRef.current });
 
     async function tick() {
       if (stopped) return;

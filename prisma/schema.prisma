@@ -467,6 +467,8 @@ model WarehouseZone {
   cells     Cell[]
 
   @@unique([warehouseId, code])
+  // Пакет 9A: ровно одна системная зона каждого kind на складе (7 фиксированных зон).
+  @@unique([warehouseId, kind])
   @@index([companyId])
   @@index([warehouseId])
   @@index([kind])
@@ -624,6 +626,18 @@ model Uom {
   @@unique([companyId, name])
 }
 
+// Этап 5/Пакет 9A: заводской штрихкод номенклатуры (EAN-8/EAN-13). Один скан = одна штука.
+// Источник MANUAL (создан в UI) или API (будущая интеграция, поля read-only). Аддитивно к QR.
+enum BarcodeSymbology {
+  EAN8
+  EAN13
+}
+
+enum BarcodeSource {
+  MANUAL
+  API
+}
+
 model Item {
   id        String       @id @default(cuid())
   companyId String
@@ -632,13 +646,41 @@ model Item {
   uomId     String
   tracking  TrackingType
   isActive  Boolean      @default(true)
+  // Пакет 9A: источник номенклатуры (MANUAL — заведено в UI; API — из будущей интеграции, ключевые
+  // поля read-only) и внешний идентификатор источника. Формат конкретной 1С НЕ зашивается.
+  source     BarcodeSource @default(MANUAL)
+  externalId String?
   createdAt DateTime     @default(now())
 
-  company Company @relation(fields: [companyId], references: [id])
-  uom     Uom     @relation(fields: [uomId], references: [id])
+  company  Company       @relation(fields: [companyId], references: [id])
+  uom      Uom           @relation(fields: [uomId], references: [id])
+  barcodes ItemBarcode[]
 
   @@unique([companyId, sku])
   @@index([companyId, name])
+}
+
+// Пакет 9A: EAN номенклатуры. У Item может быть несколько EAN; один EAN в пределах компании
+// относится только к одному Item (@@unique([companyId, code])). Проверка длины/контрольной цифры —
+// в actions. isActive=false запрещает новые приёмки, но не ломает остатки/историю. Физическое
+// удаление кода будущей интеграцией запрещено (только isActive).
+model ItemBarcode {
+  id         String           @id @default(cuid())
+  companyId  String
+  itemId     String
+  code       String
+  symbology  BarcodeSymbology
+  source     BarcodeSource    @default(MANUAL)
+  externalId String?
+  isActive   Boolean          @default(true)
+  createdAt  DateTime         @default(now())
+  updatedAt  DateTime         @updatedAt
+
+  item Item @relation(fields: [itemId], references: [id])
+
+  @@unique([companyId, code])
+  @@index([companyId])
+  @@index([itemId])
 }
 
 // Сквозные номера документов в рамках компании.

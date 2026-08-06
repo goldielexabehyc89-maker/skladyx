@@ -7,6 +7,7 @@ import { z } from "zod";
 import { prisma } from "@/lib/db";
 import { requireAdmin } from "@/lib/auth";
 import { scoped } from "@/lib/tenant";
+import { addItemBarcode, setItemBarcodeActive, barcodeErrorMessage } from "@/lib/barcodes";
 import type { FormState } from "@/app/actions/warehouses";
 
 const itemSchema = z.object({
@@ -53,7 +54,9 @@ export async function updateItemAction(_prev: FormState, formData: FormData): Pr
   const session = await requireAdmin();
   const s = scoped(session);
   const id = String(formData.get("id") ?? "");
-  await s.item(id);
+  const current = await s.item(id);
+  // Пакет 9A: товары из интеграции (source=API) — ключевые поля только для чтения.
+  if (current.source === "API") return { error: "Товар из интеграции — ключевые поля только для чтения" };
 
   const parsed = itemSchema.safeParse({
     name: formData.get("name"),
@@ -129,12 +132,14 @@ export async function deleteItemAction(_prev: FormState, formData: FormData): Pr
     return {
       error: `Товар в заказе поставщику №${orderLine.order.number} — сначала удалите заказ`,
     };
-  const [lot, unit, movement] = await Promise.all([
+  const [lot, unit, movement, barcode] = await Promise.all([
     prisma.lot.findFirst({ where: { companyId: s.companyId, itemId: item.id } }),
     prisma.itemUnit.findFirst({ where: { companyId: s.companyId, itemId: item.id } }),
     prisma.stockMovement.findFirst({ where: { companyId: s.companyId, itemId: item.id } }),
+    prisma.itemBarcode.findFirst({ where: { companyId: s.companyId, itemId: item.id } }),
   ]);
   if (lot || unit || movement) return { error: "По товару есть складские данные — удалить нельзя" };
+  if (barcode) return { error: "У товара есть штрихкоды (EAN) — удаление недоступно" };
 
   await prisma.item.delete({ where: { id: item.id } });
   broadcastRealtime({
@@ -146,4 +151,36 @@ export async function deleteItemAction(_prev: FormState, formData: FormData): Pr
   });
   revalidatePath("/warehouse/items");
   redirect("/warehouse/items");
+}
+
+// Пакет 9A: добавить EAN товару (проверка длины/контрольной цифры; коллизия — отказ без перепривязки).
+export async function addBarcodeAction(_prev: FormState, formData: FormData): Promise<FormState> {
+  const session = await requireAdmin();
+  const s = scoped(session);
+  const itemId = String(formData.get("itemId") ?? "");
+  await s.item(itemId);
+  try {
+    await addItemBarcode({ companyId: s.companyId, itemId, code: String(formData.get("code") ?? "") });
+  } catch (e) {
+    return { error: barcodeErrorMessage(e) };
+  }
+  revalidatePath(`/warehouse/items/${itemId}`);
+  return { ok: "EAN добавлен" };
+}
+
+// Деактивировать/активировать EAN (физического удаления нет — история сохраняется).
+export async function setBarcodeActiveAction(_prev: FormState, formData: FormData): Promise<FormState> {
+  const session = await requireAdmin();
+  const s = scoped(session);
+  const barcodeId = String(formData.get("barcodeId") ?? "");
+  const itemId = String(formData.get("itemId") ?? "");
+  await s.item(itemId);
+  const active = String(formData.get("active") ?? "") === "true";
+  try {
+    await setItemBarcodeActive(s.companyId, barcodeId, active);
+  } catch (e) {
+    return { error: barcodeErrorMessage(e) };
+  }
+  revalidatePath(`/warehouse/items/${itemId}`);
+  return { ok: active ? "EAN активирован" : "EAN деактивирован" };
 }

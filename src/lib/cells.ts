@@ -75,8 +75,8 @@ export async function ensureStandardZones(companyId: string, warehouseId: string
   await prisma.$transaction((tx) => createStandardZonesInTx(tx, companyId, warehouseId));
 }
 
-// Массовое создание ячеек в физической зоне. Виртуальная зона запрещена; для STORAGE уровень >= 1.
-// isStaging синхронизируется с зоной ISSUE. Возвращает число созданных ячеек.
+// Обратная совместимость: массив кодов + один уровень → число созданных (используется старыми
+// верификаторами и changeCellZone). Новый путь (ручное/массовое с уровнями) — createCellsBatch.
 export async function createCellsInZone(input: {
   companyId: string;
   warehouseId: string;
@@ -84,6 +84,27 @@ export async function createCellsInZone(input: {
   codes: string[];
   level: number | null;
 }): Promise<number> {
+  const res = await createCellsBatch({
+    companyId: input.companyId,
+    warehouseId: input.warehouseId,
+    zoneId: input.zoneId,
+    items: input.codes.map((code) => ({ code, level: input.level })),
+  });
+  return res.created;
+}
+
+// Создание ячеек в физической зоне (ручное = один элемент, массовое = много), одной транзакцией:
+// при любой ошибке набор не создаётся частично. Виртуальная зона запрещена; для STORAGE уровень >= 1,
+// для остальных физических — уровень должен быть null. isStaging синхронизируется с зоной ISSUE.
+// Существующие коды пропускаются и возвращаются в skipped (отчёт created/skipped).
+export async function createCellsBatch(input: {
+  companyId: string;
+  warehouseId: string;
+  zoneId: string;
+  items: { code: string; level: number | null }[];
+}): Promise<{ created: number; skipped: string[] }> {
+  if (input.items.length === 0) throw new CellError("Нет ячеек для создания");
+  if (input.items.length > 500) throw new CellError("Не больше 500 ячеек за раз");
   return prisma.$transaction(async (tx) => {
     const zone = await tx.warehouseZone.findFirst({
       where: { id: input.zoneId, companyId: input.companyId, warehouseId: input.warehouseId },
@@ -91,20 +112,97 @@ export async function createCellsInZone(input: {
     if (!zone) throw new CellError("Зона не найдена");
     if (!isPhysicalZoneKind(zone.kind))
       throw new CellError("Нельзя создавать ячейки в виртуальной зоне");
-    const level = normalizeLevel(zone.kind, input.level);
     const isStaging = zoneKindIsStaging(zone.kind);
 
-    let count = 0;
-    for (const code of input.codes) {
+    let created = 0;
+    const skipped: string[] = [];
+    const seen = new Set<string>();
+    for (const it of input.items) {
+      const code = it.code.trim();
+      if (!code) throw new CellError("Пустой код ячейки");
+      if (seen.has(code)) continue; // дубли в самом наборе
+      seen.add(code);
+      const level = normalizeLevel(zone.kind, it.level);
       const exists = await tx.cell.findUnique({ where: { warehouseId_code: { warehouseId: input.warehouseId, code } } });
-      if (exists) continue;
+      if (exists) { skipped.push(code); continue; }
       const cell = await tx.cell.create({
         data: { companyId: input.companyId, warehouseId: input.warehouseId, code, zoneId: zone.id, level, isStaging },
       });
       await createQrIn(tx, { companyId: input.companyId, type: "CELL", refId: cell.id });
-      count++;
+      created++;
     }
-    return count;
+    return { created, skipped };
+  });
+}
+
+// Ячейка «использована» — по ней когда-либо было движение/остаток/резерв/единица. Код такой ячейки
+// менять и физически удалять нельзя (только деактивировать). Максимально широкий набор ссылок на cellId.
+export async function cellUsed(tx: Prisma.TransactionClient, cellId: string): Promise<boolean> {
+  const [bal, mv, sr, cr, oic, unit] = await Promise.all([
+    tx.stockBalance.findFirst({ where: { cellId }, select: { id: true } }),
+    tx.stockMovement.findFirst({ where: { OR: [{ fromCellId: cellId }, { toCellId: cellId }] }, select: { id: true } }),
+    tx.stockReservation.findFirst({ where: { cellId }, select: { id: true } }),
+    tx.cellReservation.findFirst({ where: { cellId }, select: { id: true } }),
+    tx.orderIssueCell.findFirst({ where: { cellId }, select: { id: true } }),
+    tx.itemUnit.findFirst({ where: { cellId }, select: { id: true } }),
+  ]);
+  return !!(bal || mv || sr || cr || oic || unit);
+}
+
+// Ячейка «занята сейчас» — есть текущий остаток/единица/активный резерв (деактивировать нельзя).
+export async function cellOccupied(tx: Prisma.TransactionClient, cellId: string): Promise<boolean> {
+  const [bal, unit, cr, oic, sr] = await Promise.all([
+    tx.stockBalance.findFirst({ where: { cellId, qty: { gt: 0 } }, select: { id: true } }),
+    tx.itemUnit.findFirst({ where: { cellId }, select: { id: true } }),
+    tx.cellReservation.findFirst({ where: { cellId, status: "ACTIVE" }, select: { id: true } }),
+    tx.orderIssueCell.findFirst({ where: { cellId, status: { not: "RELEASED" } }, select: { id: true } }),
+    tx.stockReservation.findFirst({ where: { cellId, status: "ACTIVE" }, select: { id: true } }),
+  ]);
+  return !!(bal || unit || cr || oic || sr);
+}
+
+// Переименовать неиспользованную ячейку (после первого движения/резерва/задачи код менять нельзя).
+// QR не трогаем — он указывает на cellId, а не на код.
+export async function renameCell(companyId: string, cellId: string, newCode: string): Promise<{ warehouseId: string }> {
+  const code = newCode.trim();
+  if (!code) throw new CellError("Укажите код ячейки");
+  return prisma.$transaction(async (tx) => {
+    const cell = await tx.cell.findFirst({ where: { id: cellId, companyId } });
+    if (!cell) throw new CellError("Ячейка не найдена");
+    await lockCell(tx, companyId, cellId);
+    if (await cellUsed(tx, cellId)) throw new CellError("Ячейка уже использовалась — код менять нельзя, только деактивировать");
+    if (code !== cell.code) {
+      const dup = await tx.cell.findUnique({ where: { warehouseId_code: { warehouseId: cell.warehouseId, code } } });
+      if (dup) throw new CellError("Ячейка с таким кодом уже существует");
+      await tx.cell.update({ where: { id: cellId }, data: { code } });
+    }
+    return { warehouseId: cell.warehouseId };
+  });
+}
+
+// Удалить неиспользованную ячейку — атомарно с её внутренним кодом/QR.
+export async function deleteCell(companyId: string, cellId: string): Promise<{ warehouseId: string }> {
+  return prisma.$transaction(async (tx) => {
+    const cell = await tx.cell.findFirst({ where: { id: cellId, companyId } });
+    if (!cell) throw new CellError("Ячейка не найдена");
+    await lockCell(tx, companyId, cellId);
+    if (await cellUsed(tx, cellId)) throw new CellError("Ячейка уже использовалась — удалять нельзя, только деактивировать");
+    await tx.qrCode.deleteMany({ where: { type: "CELL", refId: cellId } });
+    await tx.cell.delete({ where: { id: cellId } });
+    return { warehouseId: cell.warehouseId };
+  });
+}
+
+// Деактивировать/активировать ячейку. Деактивация запрещена при остатке/единице/активном резерве.
+export async function setCellActive(companyId: string, cellId: string, active: boolean): Promise<{ warehouseId: string }> {
+  return prisma.$transaction(async (tx) => {
+    const cell = await tx.cell.findFirst({ where: { id: cellId, companyId } });
+    if (!cell) throw new CellError("Ячейка не найдена");
+    await lockCell(tx, companyId, cellId);
+    if (!active && (await cellOccupied(tx, cellId)))
+      throw new CellError("Нельзя деактивировать ячейку с остатком, единицей или активным резервом");
+    await tx.cell.update({ where: { id: cellId }, data: { isActive: active } });
+    return { warehouseId: cell.warehouseId };
   });
 }
 
@@ -142,60 +240,19 @@ export async function changeCellZone(input: {
   });
 }
 
-// Переименовать зону (названия зон настраиваются организацией; kind неизменен).
-export async function renameZone(companyId: string, zoneId: string, name: string): Promise<{ warehouseId: string }> {
-  const zone = await prisma.warehouseZone.findFirst({ where: { id: zoneId, companyId } });
-  if (!zone) throw new CellError("Зона не найдена");
-  const trimmed = name.trim();
-  if (!trimmed) throw new CellError("Укажите название зоны");
-  await prisma.warehouseZone.update({ where: { id: zone.id }, data: { name: trimmed } });
-  return { warehouseId: zone.warehouseId };
-}
+// Пакет 9A: системные зоны фиксированы (ровно 7 на склад, один kind каждого вида). Переименование и
+// добавление зон закрыто — функции renameZone/addPhysicalZone удалены. Зоны создаёт только
+// createStandardZonesInTx при создании склада; изменить/добавить/удалить/деактивировать нельзя.
 
-// Добавить дополнительную ФИЗИЧЕСКУЮ зону нужного kind (допускается несколько зон одного kind).
-// Код генерируется уникальным в пределах склада: KIND-2, KIND-3, …
-export async function addPhysicalZone(input: {
-  companyId: string;
-  warehouseId: string;
-  kind: ZoneKind;
-  name: string;
-}): Promise<void> {
-  if (!isPhysicalZoneKind(input.kind)) throw new CellError("Добавлять можно только физические зоны");
-  const name = input.name.trim();
-  if (!name) throw new CellError("Укажите название зоны");
-  await prisma.$transaction(async (tx) => {
-    const existing = await tx.warehouseZone.findMany({
-      where: { warehouseId: input.warehouseId, code: { startsWith: input.kind } },
-      select: { code: true },
-    });
-    const taken = new Set(existing.map((z) => z.code));
-    let n = 2;
-    let code = `${input.kind}-${n}`;
-    while (taken.has(code)) code = `${input.kind}-${++n}`;
-    const base = STANDARD_ZONES.find((z) => z.kind === input.kind);
-    await tx.warehouseZone.create({
-      data: {
-        companyId: input.companyId,
-        warehouseId: input.warehouseId,
-        code,
-        name,
-        kind: input.kind,
-        sortOrder: (base?.sortOrder ?? 20) + n,
-      },
-    });
-  });
-}
-
-// Уровень: для STORAGE обязателен и >= 1; для прочих физических зон — необязателен (если задан, >= 1).
+// Уровень: для STORAGE обязателен и >= 1; для остальных физических зон — всегда null (задавать запрещено).
 function normalizeLevel(kind: ZoneKind, level: number | null): number | null {
   if (zoneKindRequiresLevel(kind)) {
     if (level == null || !Number.isInteger(level) || level < 1)
       throw new CellError("Для зоны хранения укажите уровень (целое ≥ 1)");
     return level;
   }
-  if (level == null) return null;
-  if (!Number.isInteger(level) || level < 1) throw new CellError("Уровень должен быть целым ≥ 1");
-  return level;
+  if (level != null) throw new CellError("Уровень задаётся только для зоны хранения");
+  return null;
 }
 
 // Тип ошибки для actions: польз. сообщение из CellError, иначе — общий текст.

@@ -15,6 +15,9 @@ export const companySettingsSchema = z.object({
   // Этап 5/Пакет 4: общий порог допустимой температуры X, °C (nullable, без prod-default).
   // Пока null — групповая приёмка заблокирована. temperature <= X → STORAGE, иначе COOLING.
   tempThresholdX: z.number().min(-100).max(100).nullable().default(null),
+  // Пакет 9A: формат этикетки ячейки. Не влияет на базу/логику — только на печать. Один и тот же
+  // внутренний 10-символьный код кодируется как QR и/или Code 128.
+  cellLabelFormat: z.enum(["QR", "CODE128", "BOTH"]).default("QR"),
 });
 
 export type CompanySettings = z.infer<typeof companySettingsSchema>;

@@ -3,7 +3,7 @@
 import { useState } from "react";
 import { clsx } from "clsx";
 import { Badge, Button } from "@/components/ui";
-import { toggleCellStagingAction, toggleCellActiveAction } from "@/app/actions/warehouses";
+import { toggleCellStagingAction, setCellActiveAction } from "@/app/actions/warehouses";
 
 // Плитка ячейки: крупная тап-цель; действия («зона выдачи», «отключить») —
 // в маленьком листе по тапу вместо микро-ссылок.
@@ -58,8 +58,9 @@ export function CellTile({
                   {cell.isStaging ? "Сделать ячейкой хранения" : "Сделать ячейкой зоны выдачи"}
                 </Button>
               </form>
-              <form action={toggleCellActiveAction}>
+              <form action={async (fd) => { await setCellActiveAction({}, fd); }}>
                 <input type="hidden" name="cellId" value={cell.id} />
+                <input type="hidden" name="active" value={cell.isActive ? "false" : "true"} />
                 <Button type="submit" variant="ghost" className="w-full">
                   {cell.isActive ? "Отключить ячейку" : "Включить ячейку"}
                 </Button>

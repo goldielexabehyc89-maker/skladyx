@@ -2,15 +2,11 @@ import { Printer } from "lucide-react";
 import { requireAdminPage } from "@/lib/auth";
 import { scoped } from "@/lib/tenant";
 import { getAllowedWarehouse } from "@/lib/warehouse-access";
-import { warehouseZonesEnabled, coolingWorkflowEnabled } from "@/lib/roles";
-import {
-  updateWarehouseAction,
-  createCellsAction,
-  renameZoneAction,
-  addZoneAction,
-} from "@/app/actions/warehouses";
+import Link from "next/link";
+import { warehouseZonesEnabled } from "@/lib/roles";
+import { updateWarehouseAction, createCellsAction } from "@/app/actions/warehouses";
 import { ActionForm } from "@/components/action-form";
-import { Card, CardTitle, Field, Badge, EmptyState, DownloadButton, SelectField } from "@/components/ui";
+import { Card, CardTitle, Field, Badge, EmptyState, DownloadButton } from "@/components/ui";
 import { PageShell } from "@/components/page-shell";
 import { CellTile } from "../cell-tile";
 import { ZoneCellTile } from "../zone-cell-tile";
@@ -18,7 +14,6 @@ import { CreateCellsForm } from "../create-cells-form";
 import {
   ZONE_KIND_LABEL,
   ZONE_KIND_TONE,
-  PHYSICAL_ZONE_KINDS,
   isPhysicalZoneKind,
   isVirtualZoneKind,
 } from "@/lib/zones";
@@ -148,41 +143,52 @@ export default async function WarehousePage({ params }: { params: Promise<{ id: 
             <CreateCellsForm warehouseId={warehouse.id} zones={physOpts} />
           </Card>
 
-          {/* Управление зонами: переименование + добавление физической зоны */}
+          {/* Системные зоны фиксированы (ровно 7). Изменение/добавление/удаление недоступно. */}
           <Card className="lg:max-w-2xl">
-            <CardTitle>Зоны склада</CardTitle>
+            <CardTitle>Зоны склада (системные, фиксированные)</CardTitle>
             <div className="flex flex-col gap-2">
               {zones.map((z) => (
-                <form key={z.id} action={renameZoneAction} className="flex items-center gap-2">
-                  <input type="hidden" name="zoneId" value={z.id} />
+                <div key={z.id} className="flex items-center justify-between gap-3 rounded-xl border border-[#eee] px-3 py-2">
+                  <span className="text-sm font-medium">{z.name}</span>
                   <Badge tone={ZONE_KIND_TONE[z.kind]}>{ZONE_KIND_LABEL[z.kind]}</Badge>
-                  <input
-                    name="name"
-                    defaultValue={z.name}
-                    className="min-w-0 flex-1 rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm"
-                  />
-                  <button type="submit" className="shrink-0 rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm active:bg-neutral-50">
-                    Сохранить
-                  </button>
-                </form>
+                </div>
               ))}
             </div>
-            <div className="mt-4 border-t border-[#eee] pt-3">
-              <ActionForm action={addZoneAction} submitLabel="Добавить зону" variant="ghost">
-                <input type="hidden" name="warehouseId" value={warehouse.id} />
-                <div className="grid grid-cols-2 gap-3">
-                  <SelectField name="kind" defaultValue="STORAGE" className="text-sm">
-                    {PHYSICAL_ZONE_KINDS.map((k) => (
-                      <option key={k} value={k}>
-                        {ZONE_KIND_LABEL[k]}
-                      </option>
-                    ))}
-                  </SelectField>
-                  <Field label="" name="name" required placeholder="Название зоны" />
-                </div>
-              </ActionForm>
-            </div>
+            <p className="mt-2 text-xs text-neutral-400">
+              Семь системных зон фиксированы: их нельзя добавлять, удалять, переименовывать, менять тип или деактивировать.
+            </p>
           </Card>
+
+          {/* Печать этикеток ячеек: формат берётся из настроек, здесь можно выбрать QR/Code 128/оба */}
+          {cells.length > 0 && (
+            <Card className="lg:max-w-2xl">
+              <CardTitle>Печать этикеток ячеек</CardTitle>
+              <p className="mb-2 text-xs text-neutral-500">Все активные ячейки склада ({cells.filter((c) => c.isActive).length}). Формат:</p>
+              <div className="flex flex-wrap gap-2">
+                {(["BOTH", "QR", "CODE128"] as const).map((bc) => (
+                  <Link
+                    key={bc}
+                    href={`/warehouse/print/labels?cells=${warehouse.id}&bc=${bc}`}
+                    className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm text-brand active:bg-neutral-50"
+                  >
+                    {bc === "BOTH" ? "QR + Code 128" : bc === "QR" ? "Только QR" : "Только Code 128"}
+                  </Link>
+                ))}
+              </div>
+              <p className="mt-3 mb-1 text-xs text-neutral-500">По зоне:</p>
+              <div className="flex flex-wrap gap-2">
+                {physical.map((z) => (
+                  <Link
+                    key={z.id}
+                    href={`/warehouse/print/labels?zone=${z.id}`}
+                    className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm active:bg-neutral-50"
+                  >
+                    {z.name}
+                  </Link>
+                ))}
+              </div>
+            </Card>
+          )}
 
           {/* Настройки склада */}
           <Card className="lg:max-w-2xl">
@@ -195,7 +201,7 @@ export default async function WarehousePage({ params }: { params: Promise<{ id: 
                 <input type="checkbox" name="isActive" defaultChecked={warehouse.isActive} className="h-5 w-5" />
                 Склад активен
               </label>
-              {coolingWorkflowEnabled() && (
+              {(
                 <Field
                   label="Скорость охлаждения R, °C/час"
                   name="coolingRate"
@@ -258,7 +264,7 @@ export default async function WarehousePage({ params }: { params: Promise<{ id: 
               <input type="checkbox" name="isActive" defaultChecked={warehouse.isActive} className="h-5 w-5" />
               Склад активен
             </label>
-            {coolingWorkflowEnabled() && (
+            {(
               <Field
                 label="Скорость охлаждения R, °C/час"
                 name="coolingRate"

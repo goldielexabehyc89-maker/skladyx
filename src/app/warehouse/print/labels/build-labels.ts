@@ -17,6 +17,7 @@ export async function buildLabels(
   params: {
     cells?: string;
     cell?: string;
+    zone?: string;
     receipt?: string;
     order?: string;
     employee?: string;
@@ -66,13 +67,14 @@ export async function buildLabels(
     return { title: `Заказ поставщику №${order.number}`, labels };
   }
 
-  if (params.cells || params.cell) {
-    const cells = params.cell
-      ? await prisma.cell.findMany({ where: { id: params.cell, companyId } })
-      : await prisma.cell.findMany({
-          where: { warehouseId: params.cells, companyId, isActive: true },
-          orderBy: { code: "asc" },
-        });
+  if (params.cells || params.cell || params.zone) {
+    // одна ячейка · все активные ячейки зоны · все активные ячейки склада
+    const where = params.cell
+      ? { id: params.cell, companyId }
+      : params.zone
+        ? { zoneId: params.zone, companyId, isActive: true }
+        : { warehouseId: params.cells, companyId, isActive: true };
+    const cells = await prisma.cell.findMany({ where, orderBy: { code: "asc" } });
     if (cells.length === 0) return { title: "Ячейки", labels: [] };
     const warehouse = await prisma.warehouse.findFirst({
       where: { id: cells[0].warehouseId, companyId },

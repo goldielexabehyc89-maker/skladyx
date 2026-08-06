@@ -1,10 +1,12 @@
 import { requireAdminPage } from "@/lib/auth";
 import { scoped } from "@/lib/tenant";
+import { prisma } from "@/lib/db";
 import { updateItemAction, deleteItemAction } from "@/app/actions/items";
 import { DeleteDocButton } from "@/components/delete-doc-button";
 import { ActionForm } from "@/components/action-form";
 import { Card, CardTitle, ChipSelect, Field, Badge, SelectField } from "@/components/ui";
 import { PageShell } from "@/components/page-shell";
+import { ItemBarcodes } from "../item-barcodes";
 
 export default async function ItemPage({ params }: { params: Promise<{ id: string }> }) {
   const session = await requireAdminPage();
@@ -12,6 +14,11 @@ export default async function ItemPage({ params }: { params: Promise<{ id: strin
   const { id } = await params;
   const item = await s.item(id);
   const uoms = await s.uoms();
+  const barcodes = await prisma.itemBarcode.findMany({
+    where: { itemId: item.id, companyId: s.companyId },
+    orderBy: { createdAt: "asc" },
+  });
+  const apiItem = item.source === "API";
 
   return (
     <div className="mx-auto w-full max-w-2xl">
@@ -54,6 +61,16 @@ export default async function ItemPage({ params }: { params: Promise<{ id: strin
             Товар активен
           </label>
         </ActionForm>
+        {apiItem && <p className="mt-2 text-xs text-neutral-400">Товар из интеграции — ключевые поля только для чтения (сервер отклонит изменения).</p>}
+      </Card>
+
+      <Card className="lg:max-w-2xl">
+        <CardTitle>Штрихкоды EAN</CardTitle>
+        <ItemBarcodes
+          itemId={item.id}
+          readOnly={apiItem}
+          barcodes={barcodes.map((b) => ({ id: b.id, code: b.code, symbology: b.symbology, isActive: b.isActive, source: b.source }))}
+        />
       </Card>
 
       <DeleteDocButton

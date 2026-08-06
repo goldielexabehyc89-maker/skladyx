@@ -4,7 +4,6 @@ import { revalidatePath } from "next/cache";
 import { requireAdmin } from "@/lib/auth";
 import { scoped } from "@/lib/tenant";
 import { updateSettings, type CompanySettings } from "@/lib/settings";
-import { groupReceivingEnabled } from "@/lib/roles";
 import type { FormState } from "@/app/actions/warehouses";
 
 export async function updateCompanySettingsAction(
@@ -26,8 +25,9 @@ export async function updateCompanySettingsAction(
     labelHeightMm,
   };
 
-  // Этап 5/Пакет 4: порог температуры X (только когда поле отрисовано — иначе X не трогаем).
-  if (groupReceivingEnabled()) {
+  // Пакет 9A: порог температуры X настраивается ВСЕГДА (даже при выключенных бизнес-флагах).
+  // Отправляется формой только когда поле присутствует в разметке (patch не трогает X иначе).
+  if (formData.has("tempThresholdX")) {
     const xRaw = String(formData.get("tempThresholdX") ?? "").trim().replace(",", ".");
     if (xRaw === "") {
       patch.tempThresholdX = null;
@@ -38,6 +38,10 @@ export async function updateCompanySettingsAction(
       patch.tempThresholdX = x;
     }
   }
+
+  // Пакет 9A: формат этикетки ячейки (QR/CODE128/BOTH).
+  const fmt = String(formData.get("cellLabelFormat") ?? "");
+  if (fmt === "QR" || fmt === "CODE128" || fmt === "BOTH") patch.cellLabelFormat = fmt;
 
   try {
     await updateSettings(s.companyId, patch);
