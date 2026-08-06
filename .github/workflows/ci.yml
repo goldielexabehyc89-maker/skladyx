@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: skladyx_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/skladyx_ci?schema=public"
+      AUTH_SECRET: "ci-verify-secret-0123456789abcdef0123456789abcdef"
+      APP_URL: "http://localhost:3000"
+      TENANT_BASE_DOMAIN: "skladyx.ru"
+      SEED_COMPANY_SLUG: "rostagro"
+      SEED_ADMIN_EMAIL: "ci@skladyx.ru"
+      SEED_ADMIN_PASSWORD: "ci-admin-pass-01"
+      INTEGRATION_API_TOKEN: "ci-integration-token-2f9c1a7b5e"
+      VERIFY_HOST: "rostagro.skladyx.ru"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: npm ci
+        run: npm ci
+
+      - name: Prisma validate / migrate / generate
+        run: |
+          npx prisma validate
+          npx prisma migrate deploy
+          npx prisma generate
+
+      - name: Seed
+        run: npx tsx prisma/seed.ts
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Engine verify (без сервера)
+        run: |
+          V="npx tsx --tsconfig scripts/tsconfig.verify.json"
+          $V scripts/verify-p9a.ts
+          $V scripts/verify-zones.ts
+          WORKFLOW_TASKS_ENABLED=true GROUP_RECEIVING_ENABLED=true $V scripts/verify-group-receiving.ts
+          WORKFLOW_TASKS_ENABLED=true GROUP_RECEIVING_ENABLED=true COOLING_WORKFLOW_ENABLED=true $V scripts/verify-cooling.ts
+          WORKFLOW_TASKS_ENABLED=true EXTERNAL_ORDER_PICKING_ENABLED=true $V scripts/verify-external-orders.ts
+          WORKFLOW_TASKS_ENABLED=true EXTERNAL_ORDER_PICKING_ENABLED=true $V scripts/verify-order-control.ts
+          WORKFLOW_TASKS_ENABLED=true EXTERNAL_ORDER_PICKING_ENABLED=true $V scripts/verify-order-issue.ts
+
+      - name: Build
+        run: npm run build
+
+      # ── Фаза A: сервер (TENANT_AUTH=false, задачи вкл., интеграция ВКЛ.) ──
+      - name: Phase A — http/stock/workflow-tasks + integration API
+        run: |
+          TENANT_AUTH=false WAREHOUSE_ZONES_ENABLED=false WORKFLOW_TASKS_ENABLED=true \
+            INTEGRATION_API_ENABLED=true INTEGRATION_API_TOKEN="$INTEGRATION_API_TOKEN" \
+            node_modules/.bin/next start -p 3000 >/tmp/srvA.log 2>&1 &
+          SRV=$!
+          for i in $(seq 1 40); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/login || echo 000)
+            [ "$code" = "200" ] && break; sleep 2
+          done
+          set -e
+          V="npx tsx --tsconfig scripts/tsconfig.verify.json"
+          VERIFY_BASE=http://localhost:3000 VERIFY_EMAIL=ci@skladyx.ru VERIFY_PASSWORD=ci-admin-pass-01 node scripts/verify-http.mjs
+          $V scripts/verify-stock.ts
+          VERIFY_BASE=http://localhost:3000 $V scripts/verify-workflow-tasks.ts
+          VERIFY_BASE=http://localhost:3000 $V scripts/verify-integration-api.ts
+          kill $SRV 2>/dev/null || true
+
+      # ── Фаза B: сервер (TENANT_AUTH=true, интеграция ВЫКЛ.) → tenant-s3 + проверка «API выключен» ──
+      - name: Phase B — tenant-s3 + integration disabled
+        run: |
+          TENANT_AUTH=true WAREHOUSE_ZONES_ENABLED=false WORKFLOW_TASKS_ENABLED=true \
+            node_modules/.bin/next start -p 3000 >/tmp/srvB.log 2>&1 &
+          SRV=$!
+          for i in $(seq 1 40); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: rostagro.skladyx.ru' http://localhost:3000/login || echo 000)
+            [ "$code" = "200" ] && break; sleep 2
+          done
+          set -e
+          VERIFY_BASE=http://localhost:3000 npx tsx --tsconfig scripts/tsconfig.verify.json scripts/verify-tenant-s3.ts
+          # Интеграционный API выключен (переменная не задана) → 404
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Host: rostagro.skladyx.ru' \
+            -H 'content-type: application/json' -d '{"items":[]}' http://localhost:3000/api/integration/v1/items || echo 000)
+          echo "disabled integration items → $code"
+          test "$code" = "404"
+          kill $SRV 2>/dev/null || true

@@ -88,6 +88,13 @@ export function legacyWarehouseUiEnabled(): boolean {
   return process.env.LEGACY_WAREHOUSE_UI_ENABLED !== "false";
 }
 
+// Этап 5/Пакет 10: нейтральный REST-API интеграции (POST /api/integration/v1/{items,orders}).
+// По умолчанию ВЫКЛЮЧЕН. Токен читается напрямую в роуте и сравнивается безопасно (timingSafeEqual);
+// сюда НЕ выносим — чтобы не светить секрет в общих геттерах и логах.
+export function integrationApiEnabled(): boolean {
+  return process.env.INTEGRATION_API_ENABLED === "true";
+}
+
 // Сегменты СТАРОГО интерфейса склада — единый список для скрытия в навигации и редиректа прямых
 // маршрутов при LEGACY_WAREHOUSE_UI_ENABLED=false (включая вложенные). Код страниц не удаляется.
 export const LEGACY_WAREHOUSE_PATHS = [

@@ -657,6 +657,10 @@ model Item {
   barcodes ItemBarcode[]
 
   @@unique([companyId, sku])
+  // Пакет 10: идемпотентность интеграционного upsert по внешнему идентификатору (tenant-scoped).
+  // externalId nullable → ручные товары (NULL) в Postgres считаются различными; уникальность
+  // действует только для непустых externalId (товары из API).
+  @@unique([companyId, externalId])
   @@index([companyId, name])
 }
 
@@ -1159,7 +1163,9 @@ model ExternalOrder {
   status      ExternalOrderStatus @default(IMPORTED)
   arrivalAt   DateTime? // срок/ожидаемое время — ключ сортировки очереди (dueAt задачи)
   payloadHash String // снимок нормализованного payload; изменённый payload → контролируемая ошибка
-  createdById String
+  // Пакет 10: nullable — интеграционный импорт (через API-токен, без сессии) не приписывается
+  // реальному пользователю: передаётся null. Ручной импорт из UI по-прежнему пишет userId.
+  createdById String?
   createdAt   DateTime            @default(now())
   updatedAt   DateTime            @updatedAt
 

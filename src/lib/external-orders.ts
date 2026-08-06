@@ -76,7 +76,7 @@ export interface ImportPayload {
   companyId: string;
   warehouseId: string;
   externalId: string;
-  createdById: string;
+  createdById: string | null; // Пакет 10: интеграционный импорт передаёт null (без сессии)
   arrivalAt?: Date | string | null;
   lines: ImportLine[];
 }
