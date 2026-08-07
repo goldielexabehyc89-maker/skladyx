@@ -2,7 +2,7 @@
 
 import { revalidatePath } from "next/cache";
 import { prisma } from "@/lib/db";
-import { requireAdmin } from "@/lib/auth";
+import { requireAdmin, assertLegacyUiEnabled } from "@/lib/auth";
 import { scoped } from "@/lib/tenant";
 import { logEvent } from "@/lib/events";
 import { createQrIn } from "@/lib/qr";
@@ -214,8 +214,10 @@ export async function issuePasswordLinkAction(userId: string): Promise<UserFormS
   return { link: await passwordLink(token) };
 }
 
-// Перевыпуск QR-бейджа (старый код перестаёт действовать).
+// Перевыпуск QR-бейджа сотрудника (legacy EMPLOYEE QR). Пакет 11: fail-closed при выключенном
+// старом интерфейсе — из активной карточки сотрудника действие убрано.
 export async function regenerateBadgeAction(formData: FormData): Promise<void> {
+  assertLegacyUiEnabled();
   const session = await requireAdmin();
   const s = scoped(session);
   const userId = String(formData.get("userId") ?? "");

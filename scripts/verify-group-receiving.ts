@@ -102,8 +102,12 @@ async function provision() {
 
 async function cleanup() {
   const whs = [W, DW].filter(Boolean);
-  const groups = await prisma.handlingGroup.findMany({ where: { warehouseId: { in: whs } }, select: { lotId: true } });
+  const groups = await prisma.handlingGroup.findMany({ where: { warehouseId: { in: whs } }, select: { id: true, lotId: true } });
   const lotIds = groups.map((g) => g.lotId);
+  // Пакет 11: события Ленты, порождённые тест-группами (стабильные ключи) — чистим по ключу
+  await prisma.event.deleteMany({
+    where: { key: { in: groups.flatMap((g) => [`group_received:${g.id}`, `group_placed:${g.id}`, `group_cooling:${g.id}`]) } },
+  });
   await prisma.workflowTask.deleteMany({ where: { warehouseId: { in: whs }, type: "PLACE_GROUP" } });
   await prisma.handlingGroup.deleteMany({ where: { warehouseId: { in: whs } } });
   await prisma.stockMovement.deleteMany({ where: { OR: [{ fromZoneId: { in: [zRecv, zStorage, zCooling] } }, { toZoneId: { in: [zRecv, zStorage, zCooling] } }, { lotId: { in: lotIds } }] } });
@@ -175,6 +179,15 @@ async function main() {
   const grp8 = await prisma.handlingGroup.findUniqueOrThrow({ where: { id: g8a.groupId } });
   ok("одна группа с этим dedupeKey", (await prisma.handlingGroup.count({ where: { companyId, dedupeKey: grp8.dedupeKey } })) === 1);
   ok("один Lot / один остаток / одна задача", (await prisma.stockBalance.count({ where: { lotId: grp8.lotId } })) === 1 && (await prisma.workflowTask.count({ where: { subjectId: g8a.groupId } })) === 1);
+  // Пакет 11: событие «Приёмка группы» идемпотентно — стабильный ключ, повтор не пишет второе Event и не меняет время
+  const rcvKey = `group_received:${g8a.groupId}`;
+  const rEv1 = await prisma.event.findMany({ where: { companyId, type: "group_received", key: rcvKey } });
+  ok("group_received: ровно одно событие (стабильный ключ)", rEv1.length === 1);
+  const rT1 = rEv1[0]?.createdAt.getTime();
+  await createHandlingGroup({ companyId, warehouseId: W, itemId: lotItem, qty: 4, temperature: 3, acceptedById: RUSER, dedupeKey: idk }); // точный повтор
+  const rEv2 = await prisma.event.findMany({ where: { companyId, type: "group_received", key: rcvKey } });
+  ok("group_received: повтор не создаёт второе событие", rEv2.length === 1);
+  ok("group_received: время первого события не изменилось", rEv2[0]?.createdAt.getTime() === rT1);
 
   console.log("9–10) остаток в Z:<receiving> и приход null→RECEIVING в ledger");
   const b9 = await bal(grp8.lotId, `Z:${zRecv}`);
@@ -199,6 +212,19 @@ async function main() {
   ok("размещение в S2 при свободной S1 → отказ", (await place(L1, gS.groupId, S2)).includes("свободная ячейка ниже"));
   ok("размещение в S1 (нижний уровень) → успех", (await place(L1, gS.groupId, S1)) === "");
   ok("после размещения: группа IN_STORAGE", (await prisma.handlingGroup.findUniqueOrThrow({ where: { id: gS.groupId } })).status === "IN_STORAGE");
+  // Пакет 11: событие «Размещение» идемпотентно — стабильный ключ; повторное размещение той же
+  // группы отклоняется движком, второе Event не пишется, время первого не меняется.
+  const plKey = `group_placed:${gS.groupId}`;
+  const pEv1 = await prisma.event.findMany({ where: { companyId, type: "group_placed", key: plKey } });
+  ok("group_placed: ровно одно событие (стабильный ключ)", pEv1.length === 1);
+  const pT1 = pEv1[0]?.createdAt.getTime();
+  // точный повтор напрямую в движок (без startWorkflowTask, чтобы не трогать авто-назначение
+  // грузчика для последующих тестов): задача уже COMPLETED → completeGroupPlacement отклоняет
+  const gsTask = await taskOf(gS.groupId);
+  await err(async () => completeGroupPlacement({ companyId, userId: L1, taskId: gsTask!.id, cellCode: await cellQr(S1), ean: eanOf(lotItem) }));
+  const pEv2 = await prisma.event.findMany({ where: { companyId, type: "group_placed", key: plKey } });
+  ok("group_placed: повтор не создаёт второе событие", pEv2.length === 1);
+  ok("group_placed: время первого события не изменилось", pEv2[0]?.createdAt.getTime() === pT1);
 
   console.log("14) занятая/чужая/неверная зона → отказ");
   const gS14 = await G(3);

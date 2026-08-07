@@ -47,7 +47,11 @@ export type EventType =
   | "order_correction_required"
   // Этап 5/Пакет 8: выдача заказа
   | "order_ready_for_driver"
-  | "order_issued";
+  | "order_issued"
+  // Этап 5/Пакет 11: бизнес-события складских процессов (приёмка/размещение/охлаждение)
+  | "group_received"
+  | "group_placed"
+  | "group_cooling";
 
 // Карта «событие журнала → realtime-сущность и действие» для онлайн-обновлений.
 // stock: true — изменение затрагивает остатки, клиентам дополнительно уходит stock.updated.
@@ -89,6 +93,9 @@ const REALTIME_MAP: Record<EventType, { entity: RealtimeEntity; action: string; 
   order_correction_required: { entity: "order", action: "updated" },
   order_ready_for_driver: { entity: "order", action: "updated" },
   order_issued: { entity: "order", action: "updated", stock: true },
+  group_received: { entity: "task", action: "created", stock: true },
+  group_placed: { entity: "task", action: "updated", stock: true },
+  group_cooling: { entity: "task", action: "updated", stock: true },
 };
 
 export async function logEvent(args: {

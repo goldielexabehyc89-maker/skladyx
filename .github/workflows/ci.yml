@@ -8,10 +8,14 @@ on:
   workflow_dispatch: {}
 
 jobs:
-  verify:
+  # ── ОБЯЗАТЕЛЬНЫЙ (blocking) job: релизный профиль РостАгро на свежей БД ──
+  # LEGACY off, ZONES on, бизнес-флаги Пакетов 4–8 on, TENANT_AUTH true. Движки + browser-e2e
+  # на реально созданном (через движки) состоянии. Старые (legacy) HTTP-тесты сюда НЕ входят —
+  # они в отдельном non-blocking job со своей БД и не загрязняют эту.
+  release:
+    name: Release profile (blocking)
     runs-on: ubuntu-latest
     timeout-minutes: 30
-
     services:
       postgres:
         image: postgres:16
@@ -26,7 +30,6 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
-
     env:
       DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/skladyx_ci?schema=public"
       AUTH_SECRET: "ci-verify-secret-0123456789abcdef0123456789abcdef"
@@ -35,38 +38,42 @@ jobs:
       SEED_COMPANY_SLUG: "rostagro"
       SEED_ADMIN_EMAIL: "ci@skladyx.ru"
       SEED_ADMIN_PASSWORD: "ci-admin-pass-01"
-      INTEGRATION_API_TOKEN: "ci-integration-token-2f9c1a7b5e"
-      INTEGRATION_API_ORG_SLUG: "rostagro"
       VERIFY_HOST: "rostagro.skladyx.ru"
-
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
-
       - name: npm ci
         run: npm ci
-
       - name: Prisma validate / migrate / generate
         run: |
           npx prisma validate
           npx prisma migrate deploy
           npx prisma generate
-
       - name: Seed
         run: npx tsx prisma/seed.ts
-
       - name: Typecheck
         run: npm run typecheck
 
-      - name: Engine verify (без сервера)
+      # Запрещённые пользовательские термины/названия флагов в UI (не в комментариях)
+      - name: Forbidden legacy terms in UI
         run: |
+          set -e
+          PAT='Пакет [0-9]|GROUP_RECEIVING|COOLING_WORKFLOW|EXTERNAL_ORDER_PICKING|ORDER_CONTROL_ENABLED|ORDER_ISSUE_ENABLED|LEGACY_WAREHOUSE_UI|WAREHOUSE_ZONES_ENABLED|флаги окружения'
+          HITS=$(grep -rnE "$PAT" src/app src/components --include='*.tsx' | grep -vE '(^[^:]+:[0-9]+:[[:space:]]*(//|\*|/\*)|//|/\*|\*/)' || true)
+          if [ -n "$HITS" ]; then echo "Найдены запрещённые термины в UI:"; echo "$HITS"; exit 1; fi
+          echo "Запрещённые термины не найдены ✓"
+
+      # Движки нового профиля + идемпотентность событий + контракт legacy-guard (fail-closed)
+      - name: Engine verify (release profile)
+        run: |
+          set -e
           V="npx tsx --tsconfig scripts/tsconfig.verify.json"
           $V scripts/verify-p9a.ts
           $V scripts/verify-zones.ts
+          $V scripts/verify-legacy-guard.ts
           WORKFLOW_TASKS_ENABLED=true GROUP_RECEIVING_ENABLED=true $V scripts/verify-group-receiving.ts
           WORKFLOW_TASKS_ENABLED=true GROUP_RECEIVING_ENABLED=true COOLING_WORKFLOW_ENABLED=true $V scripts/verify-cooling.ts
           WORKFLOW_TASKS_ENABLED=true EXTERNAL_ORDER_PICKING_ENABLED=true $V scripts/verify-external-orders.ts
@@ -77,8 +84,83 @@ jobs:
       - name: Build
         run: npm run build
 
-      # ── Фаза A: сервер (TENANT_AUTH=false, задачи вкл., интеграция ВКЛ.) ──
-      - name: Phase A — http/stock/workflow-tasks + integration API
+      - name: Ensure Chrome for e2e
+        run: |
+          if command -v google-chrome >/dev/null 2>&1; then google-chrome --version; \
+          elif command -v google-chrome-stable >/dev/null 2>&1; then google-chrome-stable --version; \
+          elif command -v chromium-browser >/dev/null 2>&1; then chromium-browser --version; \
+          else sudo apt-get update && sudo apt-get install -y chromium-browser; fi
+
+      # Релизный профиль: реальное состояние через движки → браузерный e2e новых экранов + доступ.
+      - name: Release profile browser-e2e
+        run: |
+          set -e
+          OUT=$(npx tsx --tsconfig scripts/tsconfig.verify.json scripts/ci-seed-e2e.ts)
+          echo "$OUT" | grep -v '^E2E_IDS=' || true
+          export E2E_IDS=$(echo "$OUT" | grep '^E2E_IDS=' | sed 's/^E2E_IDS=//')
+          test -n "$E2E_IDS"
+          TENANT_AUTH=true LEGACY_WAREHOUSE_UI_ENABLED=false WAREHOUSE_ZONES_ENABLED=true \
+            WORKFLOW_TASKS_ENABLED=true GROUP_RECEIVING_ENABLED=true COOLING_WORKFLOW_ENABLED=true \
+            EXTERNAL_ORDER_PICKING_ENABLED=true ORDER_CONTROL_ENABLED=true ORDER_ISSUE_ENABLED=true \
+            node_modules/.bin/next start -p 3000 >/tmp/srvRel.log 2>&1 &
+          SRV=$!
+          for i in $(seq 1 40); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: rostagro.skladyx.ru' http://localhost:3000/login || echo 000)
+            [ "$code" = "200" ] && break; sleep 2
+          done
+          VERIFY_HOST=rostagro.skladyx.ru APP_PORT=3000 node scripts/e2e-release.mjs \
+            || { echo '--- srvRel.log ---'; tail -80 /tmp/srvRel.log; false; }
+          kill $SRV 2>/dev/null || true
+
+  # ── NON-BLOCKING job: совместимость СТАРОГО интерфейса (legacy). Своя БД; не влияет на gate. ──
+  legacy-compat:
+    name: Legacy compatibility (non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: skladyx_legacy
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/skladyx_legacy?schema=public"
+      AUTH_SECRET: "ci-verify-secret-0123456789abcdef0123456789abcdef"
+      APP_URL: "http://localhost:3000"
+      TENANT_BASE_DOMAIN: "skladyx.ru"
+      SEED_COMPANY_SLUG: "rostagro"
+      SEED_ADMIN_EMAIL: "ci@skladyx.ru"
+      SEED_ADMIN_PASSWORD: "ci-admin-pass-01"
+      INTEGRATION_API_TOKEN: "ci-integration-token-2f9c1a7b5e"
+      INTEGRATION_API_ORG_SLUG: "rostagro"
+      VERIFY_HOST: "rostagro.skladyx.ru"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: npm ci
+        run: npm ci
+      - name: Prisma migrate / generate / seed
+        run: |
+          npx prisma migrate deploy
+          npx prisma generate
+          npx tsx prisma/seed.ts
+      - name: Build
+        run: npm run build
+
+      # Фаза A: сервер (TENANT_AUTH=false, СТАРЫЙ интерфейс ВКЛ. по умолчанию) — legacy verify-http и пр.
+      - name: Phase A — legacy http/stock/workflow-tasks + integration API
         run: |
           TENANT_AUTH=false WAREHOUSE_ZONES_ENABLED=false WORKFLOW_TASKS_ENABLED=true \
             INTEGRATION_API_ENABLED=true INTEGRATION_API_TOKEN="$INTEGRATION_API_TOKEN" INTEGRATION_API_ORG_SLUG=rostagro \
@@ -96,7 +178,7 @@ jobs:
           VERIFY_BASE=http://localhost:3000 $V scripts/verify-integration-api.ts
           kill $SRV 2>/dev/null || true
 
-      # ── Фаза B: сервер (TENANT_AUTH=true, интеграция ВЫКЛ.) → tenant-s3 + проверка «API выключен» ──
+      # Фаза B: сервер (TENANT_AUTH=true, интеграция ВЫКЛ.) → tenant-s3 + проверка «API выключен»
       - name: Phase B — tenant-s3 + integration disabled
         run: |
           TENANT_AUTH=true WAREHOUSE_ZONES_ENABLED=false WORKFLOW_TASKS_ENABLED=true \
@@ -108,7 +190,6 @@ jobs:
           done
           set -e
           VERIFY_BASE=http://localhost:3000 npx tsx --tsconfig scripts/tsconfig.verify.json scripts/verify-tenant-s3.ts
-          # Интеграционный API выключен (переменная не задана) → 404
           code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Host: rostagro.skladyx.ru' \
             -H 'content-type: application/json' -d '{"items":[]}' http://localhost:3000/api/integration/v1/items || echo 000)
           echo "disabled integration items → $code"

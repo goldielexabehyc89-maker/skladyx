@@ -101,6 +101,7 @@ export async function placeCoolingRetrievalAction(_prev: TaskActionState, formDa
     if (e instanceof CoolingError) return { error: e.message };
     throw e;
   }
+  // Событие «Охлаждение завершено» пишется в движке placeCoolingRetrieval (стабильный ключ, идемпотентно).
   revalidatePath("/warehouse/tasks");
   return {};
 }

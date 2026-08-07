@@ -38,7 +38,7 @@ export function ReceivingForm({ thresholdX }: { thresholdX: number }) {
               <Badge tone={state.route === "COOLING" ? "blue" : "green"}>{state.route === "COOLING" ? "охлаждение" : "хранение"}</Badge>
             </div>
             <div className="flex justify-between"><span className="text-neutral-500">Задача погрузчику</span><span className="font-semibold">{state.taskCreated ? "создана" : "—"}</span></div>
-            <p className="text-xs text-neutral-400">Пакет 9B: группа без собственного QR — товар определяется по EAN.</p>
+            <p className="text-xs text-neutral-400">Группа без отдельного QR — товар определяется по заводскому EAN.</p>
           </div>
         </Card>
       )}

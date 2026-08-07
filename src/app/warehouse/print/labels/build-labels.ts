@@ -1,6 +1,7 @@
 import "server-only";
 import { prisma } from "@/lib/db";
 import { fmtDate, fmtQty } from "@/lib/format";
+import { legacyWarehouseUiEnabled } from "@/lib/roles";
 
 // Сборка этикеток по параметрам (?cells | ?cell | ?receipt | ?order | ?employee |
 // ?picklist). Используется страницей печати и PDF-скачиванием.
@@ -24,9 +25,12 @@ export async function buildLabels(
     picklist?: string;
   },
 ): Promise<{ title: string; labels: Label[] }> {
+  // Пакет 11: печать этикеток заказов/приёмок/бейджей/заявок — только старый интерфейс (fail-closed).
+  // Печать этикеток ЯЧЕЕК (cells/cell/zone) остаётся доступной всегда.
+  const legacy = legacyWarehouseUiEnabled();
   // Этикетки из заказа поставщику — печатаются ДО приемки (id позиций уже присвоены),
   // клеятся на товар, затем приемка идёт сканированием.
-  if (params.order) {
+  if (params.order && legacy) {
     const order = await prisma.supplierOrder.findFirst({
       where: { id: params.order, companyId },
       include: { lines: { orderBy: { createdAt: "asc" } }, supplier: true },
@@ -96,7 +100,7 @@ export async function buildLabels(
     };
   }
 
-  if (params.receipt) {
+  if (params.receipt && legacy) {
     const receipt = await prisma.receipt.findFirst({
       where: { id: params.receipt, companyId },
       include: { lines: true },
@@ -156,7 +160,7 @@ export async function buildLabels(
     return { title: `Приемка №${receipt.number}`, labels };
   }
 
-  if (params.employee) {
+  if (params.employee && legacy) {
     const user = await prisma.user.findFirst({ where: { id: params.employee, companyId } });
     if (!user) return { title: "Бейдж", labels: [] };
     const qr = await prisma.qrCode.findUnique({
@@ -168,7 +172,7 @@ export async function buildLabels(
     };
   }
 
-  if (params.picklist) {
+  if (params.picklist && legacy) {
     const pl = await prisma.pickList.findFirst({ where: { id: params.picklist, companyId } });
     if (!pl) return { title: "Заявка", labels: [] };
     const employee = pl.targetEmployeeId

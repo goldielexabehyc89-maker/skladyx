@@ -4,7 +4,7 @@ import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/db";
-import { requireAdmin, requireStaff } from "@/lib/auth";
+import { requireAdmin, requireStaff , assertLegacyUiEnabled } from "@/lib/auth";
 import { scoped } from "@/lib/tenant";
 import { warehouseAccess, isWhAllowed } from "@/lib/warehouse-access";
 import { logEvent } from "@/lib/events";
@@ -32,6 +32,7 @@ export async function createPickListAction(
   formData: FormData,
 ): Promise<FormState> {
   const session = await requireAdmin();
+  assertLegacyUiEnabled();
   const s = scoped(session);
   const targetEmployeeId = String(formData.get("targetEmployeeId") ?? "");
   const warehouseId = String(formData.get("warehouseId") ?? "");
@@ -130,6 +131,7 @@ export async function createTransferPickAction(
   formData: FormData,
 ): Promise<FormState> {
   const session = await requireAdmin();
+  assertLegacyUiEnabled();
   const s = scoped(session);
   const warehouseId = String(formData.get("warehouseId") ?? "");
   const targetWarehouseId = String(formData.get("targetWarehouseId") ?? "");
@@ -181,6 +183,7 @@ export async function createTransferPickAction(
 // или единица ("U:unitId"). Выбирается из положительных остатков этого склада.
 export async function addPickLineAction(_prev: FormState, formData: FormData): Promise<FormState> {
   const session = await requireAdmin();
+  assertLegacyUiEnabled();
   const s = scoped(session);
   const pickListId = String(formData.get("pickListId") ?? "");
   const pickList = await s.pickList(pickListId);
@@ -287,6 +290,7 @@ export async function addPickLineAction(_prev: FormState, formData: FormData): P
 
 export async function removePickLineAction(formData: FormData): Promise<void> {
   const session = await requireAdmin();
+  assertLegacyUiEnabled();
   const s = scoped(session);
   const lineId = String(formData.get("lineId") ?? "");
   const line = await prisma.pickLine.findFirst({
@@ -310,6 +314,7 @@ export async function removePickLineAction(formData: FormData): Promise<void> {
 // в «Активных», им уходит пуш. Повторное сохранение — просто выход в журнал.
 export async function savePickListAction(formData: FormData): Promise<void> {
   const session = await requireAdmin();
+  assertLegacyUiEnabled();
   const s = scoped(session);
   const pickList = await s.pickList(String(formData.get("pickListId") ?? ""));
   if (pickList.status !== "NEW" || pickList.lines.length === 0)
@@ -343,6 +348,7 @@ export async function checkPickItemAction(
   raw: string,
 ): Promise<PickScanResult> {
   const session = await requireStaff();
+  assertLegacyUiEnabled();
   const s = scoped(session);
   const pickList = await s.pickList(pickListId);
   if (!isWhAllowed(await warehouseAccess(session), pickList.warehouseId))
@@ -470,6 +476,7 @@ export async function placePickToCellAction(
   raw: string,
 ): Promise<PickScanResult> {
   const session = await requireStaff();
+  assertLegacyUiEnabled();
   const s = scoped(session);
   const pickList = await s.pickList(pickListId);
   if (!isWhAllowed(await warehouseAccess(session), pickList.warehouseId))
@@ -603,6 +610,7 @@ export async function placePickToCellAction(
 
 export async function undoPickAction(formData: FormData): Promise<void> {
   const session = await requireStaff();
+  assertLegacyUiEnabled();
   const s = scoped(session);
   const fulfillmentId = String(formData.get("fulfillmentId") ?? "");
   const f = await prisma.pickFulfillment.findFirst({
@@ -678,6 +686,7 @@ export async function undoPickAction(formData: FormData): Promise<void> {
 
 export async function cancelPickListAction(formData: FormData): Promise<void> {
   const session = await requireAdmin();
+  assertLegacyUiEnabled();
   const s = scoped(session);
   const pickListId = String(formData.get("pickListId") ?? "");
   const pickList = await s.pickList(pickListId);
@@ -773,6 +782,7 @@ export async function resolveIssueScanAction(
   raw: string,
 ): Promise<{ ok?: string; error?: string; lineId?: string; unitRefId?: string }> {
   const session = await requireStaff();
+  assertLegacyUiEnabled();
   const s = scoped(session);
   const pickList = await s.pickList(pickListId);
   if (!isWhAllowed(await warehouseAccess(session), pickList.warehouseId))
@@ -806,6 +816,7 @@ export async function issuePickListByBadgeAction(
   badgeRaw: string,
 ): Promise<{ ok?: string; error?: string; employeeName?: string }> {
   const session = await requireStaff();
+  assertLegacyUiEnabled();
   const s = scoped(session);
   const pickList = await s.pickList(pickListId);
   if (!isWhAllowed(await warehouseAccess(session), pickList.warehouseId))
@@ -951,6 +962,7 @@ export async function dispatchTransferByScanAction(
   pickListId: string,
 ): Promise<{ ok?: string; error?: string; destName?: string }> {
   const session = await requireStaff();
+  assertLegacyUiEnabled();
   const s = scoped(session);
   const pickList = await s.pickList(pickListId);
   if (!isWhAllowed(await warehouseAccess(session), pickList.warehouseId))
@@ -1031,6 +1043,7 @@ export async function deletePickListAction(
   formData: FormData,
 ): Promise<FormState> {
   const session = await requireAdmin();
+  assertLegacyUiEnabled();
   const s = scoped(session);
   const pickList = await s.pickList(String(formData.get("pickListId") ?? ""));
   const issue = await prisma.issue.findFirst({

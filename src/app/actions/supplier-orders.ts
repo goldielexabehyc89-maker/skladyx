@@ -5,7 +5,7 @@ import { redirect } from "next/navigation";
 import { z } from "zod";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/db";
-import { requireAdmin, requireStaff } from "@/lib/auth";
+import { requireAdmin, requireStaff , assertLegacyUiEnabled } from "@/lib/auth";
 import { scoped, CompanyForbiddenError } from "@/lib/tenant";
 import { warehouseAccess, isWhAllowed } from "@/lib/warehouse-access";
 import { logEvent } from "@/lib/events";
@@ -54,6 +54,7 @@ export async function createSupplierOrderAction(
   formData: FormData,
 ): Promise<FormState> {
   const session = await requireAdmin();
+  assertLegacyUiEnabled();
   const s = scoped(session);
 
   const supplierId = String(formData.get("supplierId") ?? "");
@@ -97,6 +98,7 @@ const lineSchema = z.object({
 
 export async function addOrderLineAction(_prev: FormState, formData: FormData): Promise<FormState> {
   const session = await requireAdmin();
+  assertLegacyUiEnabled();
   const s = scoped(session);
 
   const priceRaw = decimalInput(formData.get("price"));
@@ -146,6 +148,7 @@ export async function updateOrderLineAction(
   formData: FormData,
 ): Promise<FormState> {
   const session = await requireAdmin();
+  assertLegacyUiEnabled();
   const s = scoped(session);
   const lineId = String(formData.get("lineId") ?? "");
   const line = await prisma.supplierOrderLine.findFirst({
@@ -188,6 +191,7 @@ export async function updateOrderLineAction(
 
 export async function removeOrderLineAction(formData: FormData): Promise<void> {
   const session = await requireAdmin();
+  assertLegacyUiEnabled();
   const s = scoped(session);
   const lineId = String(formData.get("lineId") ?? "");
   const line = await prisma.supplierOrderLine.findFirst({
@@ -213,6 +217,7 @@ export async function saveSupplierOrderAction(
   formData: FormData,
 ): Promise<FormState> {
   const session = await requireAdmin();
+  assertLegacyUiEnabled();
   const s = scoped(session);
   const orderId = String(formData.get("orderId") ?? "");
   const order = await getOrder(s.companyId, orderId);
@@ -258,6 +263,7 @@ export async function saveSupplierOrderAction(
 
 export async function cancelSupplierOrderAction(formData: FormData): Promise<void> {
   const session = await requireAdmin();
+  assertLegacyUiEnabled();
   const s = scoped(session);
   const orderId = String(formData.get("orderId") ?? "");
   const order = await getOrder(s.companyId, orderId);
@@ -311,6 +317,7 @@ export async function checkOrderReceiveScanAction(
   raw: string,
 ): Promise<ReceiveCheck> {
   const session = await requireStaff();
+  assertLegacyUiEnabled();
   const s = scoped(session);
   const order = await getOrder(s.companyId, orderId);
   if (order.status !== "ORDERED") return { error: "Заказ не в статусе «заказан»" };
@@ -360,6 +367,7 @@ export async function receiveOrderScanAction(
   cellRaw: string,
 ): Promise<ReceiveResult> {
   const session = await requireStaff();
+  assertLegacyUiEnabled();
   const s = scoped(session);
   const order = await getOrder(s.companyId, orderId);
   if (order.status !== "ORDERED") return { error: "Заказ не в статусе «заказан»" };
@@ -573,6 +581,7 @@ export async function deleteSupplierOrderAction(
   formData: FormData,
 ): Promise<FormState> {
   const session = await requireAdmin();
+  assertLegacyUiEnabled();
   const s = scoped(session);
   const order = await getOrder(s.companyId, String(formData.get("orderId") ?? ""));
   if (order.receiptId) {
@@ -605,6 +614,7 @@ export async function deleteReceiptAction(
   formData: FormData,
 ): Promise<FormState> {
   const session = await requireAdmin();
+  assertLegacyUiEnabled();
   const s = scoped(session);
   const order = await getOrder(s.companyId, String(formData.get("orderId") ?? ""));
   if (!order.receiptId) return { error: "У заказа нет приёмки" };

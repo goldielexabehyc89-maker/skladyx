@@ -4,7 +4,7 @@ import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/db";
-import { requireAdmin } from "@/lib/auth";
+import { requireAdmin , assertLegacyUiEnabled } from "@/lib/auth";
 import { scoped } from "@/lib/tenant";
 import { warehouseAccess, isWhAllowed } from "@/lib/warehouse-access";
 import { logEvent } from "@/lib/events";
@@ -22,6 +22,7 @@ export async function createWriteOffAction(
   formData: FormData,
 ): Promise<FormState> {
   const session = await requireAdmin();
+  assertLegacyUiEnabled();
   const s = scoped(session);
   const scope = String(formData.get("scope") ?? "");
   const reason = String(formData.get("reason") ?? "").trim();
@@ -63,6 +64,7 @@ export async function addWriteOffLineByScanAction(
   raw: string,
 ): Promise<ScanResult> {
   const session = await requireAdmin();
+  assertLegacyUiEnabled();
   const s = scoped(session);
   const writeOff = await s.writeOff(writeOffId);
   if (writeOff.status !== "DRAFT") return { error: "Списание уже проведено" };
@@ -132,6 +134,7 @@ export async function setWriteOffLineQtyAction(
   formData: FormData,
 ): Promise<FormState> {
   const session = await requireAdmin();
+  assertLegacyUiEnabled();
   const s = scoped(session);
   const lineId = String(formData.get("lineId") ?? "");
   const qty = Number(String(formData.get("qty") ?? "").trim().replace(",", "."));
@@ -152,6 +155,7 @@ export async function setWriteOffLineQtyAction(
 
 export async function removeWriteOffLineAction(formData: FormData): Promise<void> {
   const session = await requireAdmin();
+  assertLegacyUiEnabled();
   const s = scoped(session);
   const lineId = String(formData.get("lineId") ?? "");
   const line = await prisma.writeOffLine.findFirst({
@@ -165,6 +169,7 @@ export async function removeWriteOffLineAction(formData: FormData): Promise<void
 
 export async function postWriteOffAction(_prev: FormState, formData: FormData): Promise<FormState> {
   const session = await requireAdmin();
+  assertLegacyUiEnabled();
   const s = scoped(session);
   const writeOffId = String(formData.get("writeOffId") ?? "");
   const writeOff = await s.writeOff(writeOffId);
@@ -261,6 +266,7 @@ export async function deleteWriteOffAction(
   formData: FormData,
 ): Promise<FormState> {
   const session = await requireAdmin();
+  assertLegacyUiEnabled();
   const s = scoped(session);
   const writeOff = await prisma.writeOff.findFirst({
     where: { id: String(formData.get("writeOffId") ?? ""), companyId: s.companyId },

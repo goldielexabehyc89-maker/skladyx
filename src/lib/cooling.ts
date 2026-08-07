@@ -17,6 +17,7 @@ import {
   rebalanceQueuedTasks,
   type TaskCreateResult,
 } from "@/lib/workflow-tasks";
+import { logEvent } from "@/lib/events";
 
 // Этап 5/Пакет 5: охлаждение и срочный забор. Все движения остатка — через src/lib/stock.ts.
 // Резерв ячейки (CellReservation) остаток НЕ двигает. Снимки X/R хранятся в CoolingSession.
@@ -283,7 +284,7 @@ export async function placeCoolingRetrieval(input: {
 
     // идемпотентность: уже размещено (после полной сверки кодов) — точный повтор успешен без нового движения
     if (session.status === "COMPLETED" || group.status === "IN_STORAGE")
-      return { companyId: input.companyId, warehouseId: group.warehouseId, title: task.title, taskId: task.id, unblocked: [] as { id: string; title: string; warehouseId: string }[], alreadyPlaced: true };
+      return { companyId: input.companyId, warehouseId: group.warehouseId, title: task.title, taskId: task.id, unblocked: [] as { id: string; title: string; warehouseId: string }[], alreadyPlaced: true, groupId: group.id, cellCode: "" };
     if (task.status !== "IN_PROGRESS") throw new CoolingError("Задача не в работе");
     if (reservation.status !== "ACTIVE") throw new CoolingError("Активный резерв целевой ячейки не найден");
     const last = await lastMeasurement(tx, session.id);
@@ -309,11 +310,24 @@ export async function placeCoolingRetrieval(input: {
     await tx.handlingGroup.update({ where: { id: group.id }, data: { status: "IN_STORAGE" } });
     await tx.coolingSession.update({ where: { id: session.id }, data: { status: "COMPLETED" } });
     await tx.cellReservation.update({ where: { id: reservation.id }, data: { status: "RELEASED", releasedAt: new Date() } });
+    const destCell = await tx.cell.findFirst({ where: { id: destCellId }, select: { code: true } });
     const unblocked = await completeWorkflowTaskInTransaction(tx, task.id);
-    return { companyId: input.companyId, warehouseId: group.warehouseId, title: task.title, taskId: task.id, unblocked, alreadyPlaced: false };
+    return { companyId: input.companyId, warehouseId: group.warehouseId, title: task.title, taskId: task.id, unblocked, alreadyPlaced: false, groupId: group.id, cellCode: destCell?.code ?? "" };
   });
+  // Идемпотентно: точный повтор (alreadyPlaced=true) не пишет второй Event; стабильный ключ
+  // group_cooling:<groupId> гарантирует единственность записи в Ленте.
   if (!res.alreadyPlaced) {
     await emitTaskCompleted({ companyId: res.companyId, warehouseId: res.warehouseId, title: res.title, taskId: res.taskId, unblocked: res.unblocked });
+    await logEvent({
+      companyId: res.companyId,
+      type: "group_cooling",
+      key: `group_cooling:${res.groupId}`,
+      title: "Охлаждение завершено",
+      body: `Группа снята с охлаждения и размещена в ячейку ${res.cellCode}`,
+      url: "/warehouse/tasks",
+      warehouseIds: [res.warehouseId],
+      actorId: input.userId,
+    });
     await rebalanceQueuedTasks(res.companyId, { warehouseId: res.warehouseId });
   }
   return { warehouseId: res.warehouseId, placed: true, alreadyPlaced: res.alreadyPlaced };

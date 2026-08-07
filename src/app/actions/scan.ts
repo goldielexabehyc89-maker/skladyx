@@ -1,7 +1,7 @@
 "use server";
 
 import { prisma } from "@/lib/db";
-import { requireUser, requireAdmin } from "@/lib/auth";
+import { requireUser, requireAdmin , assertLegacyUiEnabled } from "@/lib/auth";
 import { hasRole } from "@/lib/roles";
 import { scoped } from "@/lib/tenant";
 import { warehouseAccess, isWhAllowed } from "@/lib/warehouse-access";
@@ -58,6 +58,7 @@ async function locName(
 // Универсальный резолвер скана: краткая сводка по сущности.
 export async function resolveScanAction(raw: string): Promise<ScanInfo> {
   const session = await requireUser();
+  assertLegacyUiEnabled();
   const s = scoped(session);
   const code = parseScannedCode(raw);
   if (!code) return { error: "Это не QR-код системы" };
@@ -240,6 +241,7 @@ export async function assignCellAction(
   cellRaw: string,
 ): Promise<{ ok?: string; error?: string }> {
   const session = await requireAdmin();
+  assertLegacyUiEnabled();
   const s = scoped(session);
 
   const itemCode = parseScannedCode(itemRaw);

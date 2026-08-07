@@ -68,6 +68,7 @@ export async function createGroupReceivingAction(
       dedupeKey: `grcv:${s.companyId}:${dedupeKey}`,
     });
     const item = await prisma.item.findFirst({ where: { id: itemId, companyId: s.companyId }, select: { name: true } });
+    // Событие «Приёмка группы» пишется в движке createHandlingGroup (идемпотентно по created).
     revalidatePath("/warehouse/tasks");
     revalidatePath("/warehouse/receiving");
     return {
@@ -104,6 +105,7 @@ export async function completeGroupPlacementAction(
   } catch (e) {
     return { error: msg(e) };
   }
+  // Событие «Размещение» пишется в движке completeGroupPlacement (стабильный ключ, единично).
   revalidatePath("/warehouse/tasks");
   return {};
 }

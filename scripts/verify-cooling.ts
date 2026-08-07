@@ -113,8 +113,12 @@ async function cleanup() {
   const sessions = await prisma.coolingSession.findMany({ where: { warehouseId: { in: whs } }, select: { id: true } });
   await prisma.temperatureMeasurement.deleteMany({ where: { sessionId: { in: sessions.map((s) => s.id) } } });
   await prisma.coolingSession.deleteMany({ where: { warehouseId: { in: whs } } });
-  const groups = await prisma.handlingGroup.findMany({ where: { warehouseId: { in: whs } }, select: { lotId: true } });
+  const groups = await prisma.handlingGroup.findMany({ where: { warehouseId: { in: whs } }, select: { id: true, lotId: true } });
   const lotIds = groups.map((g) => g.lotId);
+  // Пакет 11: события Ленты тест-групп (стабильные ключи) — чистим по ключу
+  await prisma.event.deleteMany({
+    where: { key: { in: groups.flatMap((g) => [`group_received:${g.id}`, `group_placed:${g.id}`, `group_cooling:${g.id}`]) } },
+  });
   await prisma.workflowTask.deleteMany({ where: { warehouseId: { in: whs } } });
   await prisma.handlingGroup.deleteMany({ where: { warehouseId: { in: whs } } });
   await prisma.stockMovement.deleteMany({ where: { lotId: { in: lotIds } } });
@@ -205,6 +209,17 @@ async function main() {
   ok("группа IN_STORAGE", g9.status === "IN_STORAGE");
   ok("вся группа в зарезервированной ячейке, COOLING-ячейка пуста", !!(await bal(g9.lotId, `C:${reservedCellId}`)) && !(await bal(g9.lotId, `C:${C1}`)));
   ok("сессия COMPLETED, резерв RELEASED, задача COMPLETED", (await prisma.coolingSession.findUniqueOrThrow({ where: { id: session!.id } })).status === "COMPLETED" && (await prisma.cellReservation.count({ where: { sessionId: session!.id, status: "ACTIVE" } })) === 0 && (await prisma.workflowTask.findUniqueOrThrow({ where: { id: rt2!.id } })).status === "COMPLETED");
+  // Пакет 11: событие «Охлаждение завершено» идемпотентно — стабильный ключ; точный повтор
+  // возвращает alreadyPlaced=true, второе Event не пишется, время первого не меняется.
+  const coolKey = `group_cooling:${gHot.groupId}`;
+  const cEv1 = await prisma.event.findMany({ where: { companyId, type: "group_cooling", key: coolKey } });
+  ok("group_cooling: ровно одно событие (стабильный ключ)", cEv1.length === 1);
+  const cT1 = cEv1[0]?.createdAt.getTime();
+  const repCool = await placeCoolingRetrieval({ companyId, userId: L1, taskId: rt2!.id, fromCellCode: await cellQr(session!.coolingCellId), ean: lotEan, targetCellCode: await cellQr(reservedCellId) });
+  ok("group_cooling: точный повтор → alreadyPlaced=true", repCool.alreadyPlaced === true);
+  const cEv2 = await prisma.event.findMany({ where: { companyId, type: "group_cooling", key: coolKey } });
+  ok("group_cooling: повтор не создаёт второе событие", cEv2.length === 1);
+  ok("group_cooling: время первого события не изменилось", cEv2[0]?.createdAt.getTime() === cT1);
 
   console.log("4) запрет охлаждения без R");
   await prisma.warehouse.update({ where: { id: W }, data: { coolingRate: null } });

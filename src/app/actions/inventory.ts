@@ -4,7 +4,7 @@ import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/db";
-import { requireAdmin } from "@/lib/auth";
+import { requireAdmin , assertLegacyUiEnabled } from "@/lib/auth";
 import { scoped } from "@/lib/tenant";
 import { warehouseAccess, isWhAllowed } from "@/lib/warehouse-access";
 import { logEvent } from "@/lib/events";
@@ -24,6 +24,7 @@ export async function startInventoryAction(
   formData: FormData,
 ): Promise<FormState> {
   const session = await requireAdmin();
+  assertLegacyUiEnabled();
   const s = scoped(session);
   const warehouseId = String(formData.get("warehouseId") ?? "");
   const warehouse = await s.warehouse(warehouseId);
@@ -116,6 +117,7 @@ async function snapshotLocation(
 // Скан в инвентаризации: ячейка → снимок ожидаемого; единица → отмечена найденной.
 export async function scanInventoryAction(inventoryId: string, raw: string): Promise<ScanResult> {
   const session = await requireAdmin();
+  assertLegacyUiEnabled();
   const s = scoped(session);
   const inv = await s.inventory(inventoryId);
   if (inv.status !== "IN_PROGRESS") return { error: "Подсчёт уже завершён" };
@@ -195,6 +197,7 @@ export async function scanInventoryAction(inventoryId: string, raw: string): Pro
 
 export async function setCountedQtyAction(_prev: FormState, formData: FormData): Promise<FormState> {
   const session = await requireAdmin();
+  assertLegacyUiEnabled();
   const s = scoped(session);
   const lineId = String(formData.get("lineId") ?? "");
   const counted = Number(formData.get("counted"));
@@ -219,6 +222,7 @@ export async function setCountedQtyAction(_prev: FormState, formData: FormData):
 // формируем акт (непосчитанное = 0).
 export async function submitReviewAction(_prev: FormState, formData: FormData): Promise<FormState> {
   const session = await requireAdmin();
+  assertLegacyUiEnabled();
   const s = scoped(session);
   const inventoryId = String(formData.get("inventoryId") ?? "");
   const inv = await s.inventory(inventoryId);
@@ -238,6 +242,7 @@ export async function submitReviewAction(_prev: FormState, formData: FormData): 
 
 export async function backToCountingAction(formData: FormData): Promise<void> {
   const session = await requireAdmin();
+  assertLegacyUiEnabled();
   const s = scoped(session);
   const inv = await s.inventory(String(formData.get("inventoryId") ?? ""));
   if (inv.status !== "REVIEW") return;
@@ -247,6 +252,7 @@ export async function backToCountingAction(formData: FormData): Promise<void> {
 
 export async function cancelInventoryAction(formData: FormData): Promise<void> {
   const session = await requireAdmin();
+  assertLegacyUiEnabled();
   const s = scoped(session);
   const inv = await s.inventory(String(formData.get("inventoryId") ?? ""));
   if (inv.status !== "IN_PROGRESS" && inv.status !== "REVIEW") return;
@@ -258,6 +264,7 @@ export async function cancelInventoryAction(formData: FormData): Promise<void> {
 // Проведение корректировок: излишек — приход извне, недостача — расход вовне.
 export async function postInventoryAction(_prev: FormState, formData: FormData): Promise<FormState> {
   const session = await requireAdmin();
+  assertLegacyUiEnabled();
   const s = scoped(session);
   const inventoryId = String(formData.get("inventoryId") ?? "");
   const inv = await s.inventory(inventoryId);
@@ -366,6 +373,7 @@ export async function deleteInventoryAction(
   formData: FormData,
 ): Promise<FormState> {
   const session = await requireAdmin();
+  assertLegacyUiEnabled();
   const s = scoped(session);
   const inv = await prisma.inventory.findFirst({
     where: { id: String(formData.get("inventoryId") ?? ""), companyId: s.companyId },

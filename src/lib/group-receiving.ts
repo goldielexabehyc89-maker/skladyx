@@ -7,6 +7,7 @@ import { nextNumber } from "@/lib/counters";
 import { getSettings } from "@/lib/settings";
 import { fmtDateTime } from "@/lib/format";
 import { coolingWorkflowEnabled } from "@/lib/roles";
+import { logEvent } from "@/lib/events";
 import { parseScannedCode } from "@/lib/qr";
 import { eanItemIdInTx } from "@/lib/barcodes";
 import { startCoolingInTx } from "@/lib/cooling";
@@ -85,7 +86,7 @@ export async function createHandlingGroup(input: {
       where: { companyId_dedupeKey: { companyId: input.companyId, dedupeKey: input.dedupeKey } },
     });
     if (existing)
-      return { groupId: existing.id, created: false, status: existing.status, qrCode: null, taskId: null, taskRes: null };
+      return { groupId: existing.id, created: false, status: existing.status, qrCode: null, taskId: null, taskRes: null, itemName: null as string | null };
 
     // товар: свой, активный, партионный
     const item = await tx.item.findFirst({ where: { id: input.itemId, companyId: input.companyId } });
@@ -173,11 +174,26 @@ export async function createHandlingGroup(input: {
       dedupeKey: `group:${group.id}:place`,
     });
 
-    return { groupId: group.id, created: true, status, qrCode, taskId: taskRes.task.id, taskRes };
+    return { groupId: group.id, created: true, status, qrCode, taskId: taskRes.task.id, taskRes, itemName: item.name as string | null };
   });
 
-  // события задачи — после коммита (без push, только Event + realtime)
-  if (out.created && out.taskRes) await emitTaskCreated(out.taskRes);
+  // события — после коммита (без push, только Event + realtime). Идемпотентно:
+  // при повторной приёмке с тем же dedupeKey created=false → второй Event не пишем,
+  // время первого не меняется. Стабильный ключ гарантирует единственность записи.
+  if (out.created) {
+    if (out.taskRes) await emitTaskCreated(out.taskRes);
+    const route = out.status === "AWAITING_COOLING" ? "охлаждение" : "хранение";
+    await logEvent({
+      companyId: input.companyId,
+      type: "group_received",
+      key: `group_received:${out.groupId}`,
+      title: "Приёмка группы",
+      body: `${out.itemName ?? "товар"} · ${input.qty} шт · ${input.temperature}°C · маршрут: ${route}`,
+      url: "/warehouse/tasks",
+      warehouseIds: [input.warehouseId],
+      actorId: input.acceptedById,
+    });
+  }
   return { groupId: out.groupId, created: out.created, status: out.status, qrCode: out.qrCode, taskId: out.taskId };
 }
 
@@ -241,7 +257,7 @@ export async function completeGroupPlacement(input: {
         userId: input.userId,
       });
       const unblocked = await completeWorkflowTaskInTransaction(tx, task.id);
-      return { companyId: input.companyId, warehouseId: group.warehouseId, title: task.title, taskId: task.id, unblocked, coolingTaskRes: taskRes as TaskCreateResult | null };
+      return { companyId: input.companyId, warehouseId: group.warehouseId, title: task.title, taskId: task.id, unblocked, coolingTaskRes: taskRes as TaskCreateResult | null, groupId: group.id, cellCode: cell.code, targetKind };
     }
 
     // STORAGE: нижний доступный уровень + ячейка не должна быть зарезервирована под охлаждение.
@@ -287,12 +303,24 @@ export async function completeGroupPlacement(input: {
 
     // завершить задачу (+ разблокировать зависимости)
     const unblocked = await completeWorkflowTaskInTransaction(tx, task.id);
-    return { companyId: input.companyId, warehouseId: group.warehouseId, title: task.title, taskId: task.id, unblocked, coolingTaskRes: null as TaskCreateResult | null };
+    return { companyId: input.companyId, warehouseId: group.warehouseId, title: task.title, taskId: task.id, unblocked, coolingTaskRes: null as TaskCreateResult | null, groupId: group.id, cellCode: cell.code, targetKind };
   });
 
-  // события после коммита + перераспределение очереди (без push)
+  // события после коммита + перераспределение очереди (без push). Размещение единично:
+  // повторный вызов на завершённой задаче/размещённой группе бросает исключение выше, сюда не
+  // доходит; стабильный ключ group_placed:<groupId> гарантирует единственность записи в Ленте.
   await emitTaskCompleted(res);
   if (res.coolingTaskRes) await emitTaskCreated(res.coolingTaskRes);
+  await logEvent({
+    companyId: res.companyId,
+    type: "group_placed",
+    key: `group_placed:${res.groupId}`,
+    title: "Размещение",
+    body: `Группа размещена в ячейку ${res.cellCode}${res.targetKind === "COOLING" ? " (охлаждение)" : ""}`,
+    url: "/warehouse/tasks",
+    warehouseIds: [res.warehouseId],
+    actorId: input.userId,
+  });
   await rebalanceQueuedTasks(res.companyId, { warehouseId: res.warehouseId });
   return { warehouseId: res.warehouseId };
 }

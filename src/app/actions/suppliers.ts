@@ -2,7 +2,7 @@
 
 import { revalidatePath } from "next/cache";
 import { prisma } from "@/lib/db";
-import { requireAdmin } from "@/lib/auth";
+import { requireAdmin , assertLegacyUiEnabled } from "@/lib/auth";
 import { scoped } from "@/lib/tenant";
 import type { FormState } from "@/app/actions/warehouses";
 
@@ -11,6 +11,7 @@ export async function createSupplierAction(
   formData: FormData,
 ): Promise<FormState> {
   const session = await requireAdmin();
+  assertLegacyUiEnabled();
   const s = scoped(session);
 
   const name = String(formData.get("name") ?? "").trim();
@@ -39,6 +40,7 @@ export async function createSupplierInlineAction(
   name: string,
 ): Promise<{ error?: string; id?: string; name?: string }> {
   const session = await requireAdmin();
+  assertLegacyUiEnabled();
   const s = scoped(session);
 
   const trimmed = name.trim();
@@ -64,6 +66,7 @@ export async function updateSupplierAction(
   formData: FormData,
 ): Promise<FormState> {
   const session = await requireAdmin();
+  assertLegacyUiEnabled();
   const s = scoped(session);
   const id = String(formData.get("id") ?? "");
   const supplier = await prisma.supplier.findFirst({ where: { id, companyId: s.companyId } });

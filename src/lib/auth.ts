@@ -5,7 +5,7 @@ import { prisma } from "@/lib/db";
 import { normalizePhone } from "@/lib/phone";
 import { setSession, clearSession, type SessionData, type Role } from "@/lib/session";
 import { sanitizeRoles } from "@/lib/jwt";
-import { hasRole, hasAnyRole, tenantAuthEnabled, isWarehouseViewer } from "@/lib/roles";
+import { hasRole, hasAnyRole, tenantAuthEnabled, isWarehouseViewer, legacyWarehouseUiEnabled } from "@/lib/roles";
 import { currentSession, resolveHostCompany } from "@/lib/tenant-auth";
 
 export async function hashPassword(plain: string): Promise<string> {
@@ -110,4 +110,12 @@ export async function requireWarehouseViewerPage(): Promise<SessionData> {
   if (!session) redirect("/login");
   if (!isWarehouseViewer(session)) redirect("/warehouse");
   return session;
+}
+
+// Этап 5/Пакет 11: единый серверный fail-closed guard для СТАРЫХ (legacy) mutating-actions.
+// Когда старый интерфейс выключен (LEGACY_WAREHOUSE_UI_ENABLED=false), любые старые действия
+// (заказы поставщикам, заявки/сборка, прямая выдача, списания, инвентаризации, скан-назначение,
+// поставщики) запрещены на сервере — не только скрыты в навигации. Вызывать первой строкой действия.
+export function assertLegacyUiEnabled(): void {
+  if (!legacyWarehouseUiEnabled()) throw new Error("LEGACY_DISABLED");
 }

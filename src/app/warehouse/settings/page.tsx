@@ -33,11 +33,11 @@ export default async function SettingsPage() {
   const checks = readiness.checks;
 
   const businessFlags: { label: string; on: boolean }[] = [
-    { label: "Групповая приёмка (GROUP_RECEIVING)", on: groupReceivingEnabled() },
-    { label: "Охлаждение (COOLING_WORKFLOW)", on: coolingWorkflowEnabled() },
-    { label: "Сборка внешних заказов (EXTERNAL_ORDER_PICKING)", on: externalOrderPickingEnabled() },
-    { label: "Контроль заказа (ORDER_CONTROL)", on: orderControlEnabled() },
-    { label: "Размещение/выдача (ORDER_ISSUE)", on: orderIssueEnabled() },
+    { label: "Групповая приёмка", on: groupReceivingEnabled() },
+    { label: "Охлаждение", on: coolingWorkflowEnabled() },
+    { label: "Сборка заказов", on: externalOrderPickingEnabled() },
+    { label: "Контроль заказа", on: orderControlEnabled() },
+    { label: "Размещение и выдача", on: orderIssueEnabled() },
   ];
 
   const apiOn = integrationApiEnabled();
@@ -158,7 +158,7 @@ export default async function SettingsPage() {
         </div>
 
         <div className="mt-4 border-t border-[#eee] pt-3">
-          <div className="mb-1.5 text-sm font-semibold">Бизнес-процессы (флаги окружения)</div>
+          <div className="mb-1.5 text-sm font-semibold">Бизнес-процессы</div>
           <div className="flex flex-col gap-1.5 text-sm">
             {businessFlags.map((f) => (
               <div key={f.label} className="flex items-center justify-between gap-3 rounded-lg bg-[#f7f8fc] px-3 py-2">
@@ -168,7 +168,7 @@ export default async function SettingsPage() {
             ))}
           </div>
           <p className="mt-1 text-xs text-neutral-400">
-            Только просмотр. Бизнес-процессы включаются переменными окружения на сервере, не из интерфейса.
+            Только просмотр. Набор процессов настраивается на сервере, не из интерфейса.
           </p>
         </div>
       </Card>

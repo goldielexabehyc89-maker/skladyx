@@ -1,8 +1,9 @@
 import { notFound } from "next/navigation";
-import { requireUser } from "@/lib/auth";
+import { requireWarehouseViewerPage } from "@/lib/auth";
 import { scoped } from "@/lib/tenant";
 import { prisma } from "@/lib/db";
 import { externalOrderPickingEnabled } from "@/lib/roles";
+import { warehouseAccess, isWhAllowed } from "@/lib/warehouse-access";
 import { PageShell } from "@/components/page-shell";
 import { Card, CardTitle, Badge, EmptyState } from "@/components/ui";
 import type { ExternalOrderStatus } from "@prisma/client";
@@ -26,11 +27,14 @@ const STATUS_RU: Record<ExternalOrderStatus, { label: string; tone: "neutral" | 
 export default async function ExternalOrderPage({ params }: { params: Promise<{ id: string }> }) {
   if (!externalOrderPickingEnabled()) notFound();
   const { id } = await params;
-  const session = await requireUser();
+  const session = await requireWarehouseViewerPage();
   const s = scoped(session);
 
   const order = await prisma.externalOrder.findFirst({ where: { id, companyId: s.companyId } });
   if (!order) notFound();
+  // Доступ к складу заказа обязателен (не только принадлежность тенанту).
+  const access = await warehouseAccess(session);
+  if (!isWhAllowed(access, order.warehouseId)) notFound();
   const lines = await prisma.externalOrderLine.findMany({ where: { orderId: order.id }, orderBy: { externalLineId: "asc" } });
   const items = await prisma.item.findMany({ where: { id: { in: lines.map((l) => l.itemId) } }, select: { id: true, name: true } });
   const itemName = new Map(items.map((i) => [i.id, i.name]));

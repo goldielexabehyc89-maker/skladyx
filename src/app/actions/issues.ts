@@ -3,7 +3,7 @@
 import { revalidatePath } from "next/cache";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/db";
-import { requireAdmin, requireUser } from "@/lib/auth";
+import { requireAdmin, requireUser , assertLegacyUiEnabled } from "@/lib/auth";
 import { scoped } from "@/lib/tenant";
 import { logEvent } from "@/lib/events";
 import { resolveQr, parseScannedCode } from "@/lib/qr";
@@ -31,6 +31,7 @@ export async function completeDirectIssueAction(
   employee: { userId?: string; badgeRaw?: string },
 ): Promise<DirectIssueResult> {
   const session = await requireAdmin();
+  assertLegacyUiEnabled();
   const s = scoped(session);
   const settings = await getSettings(s.companyId);
   if (!settings.directIssueEnabled)
@@ -233,6 +234,7 @@ export async function completeDirectIssueAction(
 // Подтверждение получения сотрудником (кнопка в «Мои ТМЦ»).
 export async function confirmIssueAction(formData: FormData): Promise<void> {
   const session = await requireUser();
+  assertLegacyUiEnabled();
   const s = scoped(session);
   const issueId = String(formData.get("issueId") ?? "");
   const issue = await s.issue(issueId);
@@ -293,6 +295,7 @@ export async function confirmIssueAction(formData: FormData): Promise<void> {
 // выдать заново. Сама выдача остаётся в истории со статусом «отменена».
 export async function cancelIssueAction(_prev: FormState, formData: FormData): Promise<FormState> {
   const session = await requireAdmin();
+  assertLegacyUiEnabled();
   const s = scoped(session);
   const issue = await s.issue(String(formData.get("issueId") ?? ""));
   if (issue.status === "CANCELLED") return { error: "Выдача уже отменена" };
