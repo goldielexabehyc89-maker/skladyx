@@ -22,7 +22,10 @@ export async function loginAction(_prev: LoginState, formData: FormData): Promis
   redirect(next.startsWith("/") ? next : "/warehouse");
 }
 
+// Пакет 10 (fix): logout НЕ делает server-redirect на /login. Причина: при server-action redirect
+// клиент получает встроенный RSC-рендер /login, который в отдельных случаях резолвит организацию по
+// неверному host и показывает «Организация не найдена». Здесь только очищаем cookie; переход на /login
+// выполняет клиент ПОЛНОЙ навигацией (window.location) — свежий серверный рендер по актуальному Host.
 export async function logoutAction(): Promise<void> {
   await doLogout();
-  redirect("/login");
 }

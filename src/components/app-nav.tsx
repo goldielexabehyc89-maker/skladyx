@@ -152,6 +152,14 @@ function NavContent({
 }) {
   const pathname = usePathname();
   const groups = groupsFor(role, canStartShift, tasksEnabled, canReceive, groupReceiving, legacyUi);
+  const [loggingOut, setLoggingOut] = useState(false);
+  // Пакет 10 (fix): server-logout очищает cookie, затем ПОЛНАЯ навигация на /login (window.location) —
+  // свежий серверный рендер по актуальному Host, без встроенного/закэшированного RSC другого host.
+  async function handleLogout() {
+    setLoggingOut(true);
+    try { await logoutAction(); } catch { /* всё равно уходим на /login */ }
+    window.location.assign("/login");
+  }
 
   const itemClass = (active: boolean) =>
     clsx(
@@ -224,15 +232,15 @@ function NavContent({
         )}
       >
         {!collapsed && <span className="truncate text-sm font-medium text-[#555]">{name}</span>}
-        <form action={logoutAction}>
-          <button
-            type="submit"
-            title="Выйти"
-            className="rounded-lg border border-[#e4e4f0] bg-white px-3 py-1.5 text-xs font-medium text-[#666] transition hover:bg-neutral-50"
-          >
-            {collapsed ? "⎋" : "Выйти"}
-          </button>
-        </form>
+        <button
+          type="button"
+          onClick={handleLogout}
+          disabled={loggingOut}
+          title="Выйти"
+          className="rounded-lg border border-[#e4e4f0] bg-white px-3 py-1.5 text-xs font-medium text-[#666] transition hover:bg-neutral-50 disabled:opacity-60"
+        >
+          {collapsed ? "⎋" : loggingOut ? "…" : "Выйти"}
+        </button>
       </div>
     </div>
   );
