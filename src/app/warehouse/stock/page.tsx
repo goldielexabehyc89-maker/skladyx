@@ -8,6 +8,7 @@ import { PageShell } from "@/components/page-shell";
 import { DataTable, type Column } from "@/components/data-table";
 import { fmtQty } from "@/lib/format";
 import { StockTable, type StockRow } from "./stock-table";
+import { stockGroupedCount, stockGroupedPage, type StockGroupFilter } from "@/lib/stock-query";
 import type { Prisma, HandlingGroupStatus } from "@prisma/client";
 
 // Пакет 11: остатки на новой модели — StockBalance + зоны/ячейки + состояние группы
@@ -38,17 +39,17 @@ export default async function StockPage({
   const grouped = sp.grouped === "1";
   const q = (sp.q ?? "").trim();
 
-  // ── where на уровне БД ──
-  const and: Prisma.StockBalanceWhereInput[] = [{ companyId: s.companyId, qty: { gt: 0 }, employeeId: null }];
-  // склад (с проверкой доступа)
-  if (sp.warehouse) and.push(isWhAllowed(access, sp.warehouse) ? { warehouseId: sp.warehouse } : { warehouseId: NONE });
-  else if (!access.all) and.push({ warehouseId: { in: access.ids } });
-  // зона: виртуальная (zoneId) ИЛИ физические ячейки этой зоны
-  if (sp.zone) {
-    const zoneCells = await prisma.cell.findMany({ where: { companyId: s.companyId, zoneId: sp.zone }, select: { id: true } });
-    and.push({ OR: [{ zoneId: sp.zone }, { cellId: { in: zoneCells.map((c) => c.id) } }] });
-  }
-  // поиск: товар / EAN / код ячейки / название зоны — резолвим в id и фильтруем в БД
+  // ── единый набор резолвленных фильтров (для плоского where и группового raw одновременно) ──
+  // склад: конкретный (после проверки доступа; NONE → «нет доступа»), либо ограничение доступа.
+  const warehouseId = sp.warehouse ? (isWhAllowed(access, sp.warehouse) ? sp.warehouse : NONE) : undefined;
+  const allowedWarehouseIds = access.all ? null : access.ids;
+  // зона: ячейки выбранной зоны (для условия zoneId ИЛИ cellId в ячейках зоны).
+  let zoneCellIds: string[] = [];
+  if (sp.zone) zoneCellIds = (await prisma.cell.findMany({ where: { companyId: s.companyId, zoneId: sp.zone }, select: { id: true } })).map((c) => c.id);
+  // поиск: товар/EAN → itemId, код ячейки → cellId, название зоны → zoneId. null — поиск не задан.
+  let qItemIds: string[] | null = null;
+  let qCellIds: string[] = [];
+  let qZoneIds: string[] = [];
   if (q) {
     const [byEan, byName, qCells, qZones] = await Promise.all([
       prisma.itemBarcode.findMany({ where: { companyId: s.companyId, code: { contains: q, mode: "insensitive" } }, select: { itemId: true } }),
@@ -56,14 +57,35 @@ export default async function StockPage({
       prisma.cell.findMany({ where: { companyId: s.companyId, code: { contains: q, mode: "insensitive" } }, select: { id: true } }),
       prisma.warehouseZone.findMany({ where: { companyId: s.companyId, name: { contains: q, mode: "insensitive" } }, select: { id: true } }),
     ]);
-    const itemIds = [...new Set([...byEan.map((b) => b.itemId), ...byName.map((i) => i.id)])];
+    qItemIds = [...new Set([...byEan.map((b) => b.itemId), ...byName.map((i) => i.id)])];
+    qCellIds = qCells.map((c) => c.id);
+    qZoneIds = qZones.map((z) => z.id);
+  }
+
+  // Плоский where (Prisma) из тех же резолвленных множеств.
+  const and: Prisma.StockBalanceWhereInput[] = [{ companyId: s.companyId, qty: { gt: 0 }, employeeId: null }];
+  if (warehouseId !== undefined) and.push({ warehouseId });
+  else if (allowedWarehouseIds) and.push({ warehouseId: { in: allowedWarehouseIds } });
+  if (sp.zone) and.push({ OR: [{ zoneId: sp.zone }, { cellId: { in: zoneCellIds } }] });
+  if (qItemIds != null) {
     const or: Prisma.StockBalanceWhereInput[] = [];
-    if (itemIds.length) or.push({ itemId: { in: itemIds } });
-    if (qCells.length) or.push({ cellId: { in: qCells.map((c) => c.id) } });
-    if (qZones.length) or.push({ zoneId: { in: qZones.map((z) => z.id) } });
+    if (qItemIds.length) or.push({ itemId: { in: qItemIds } });
+    if (qCellIds.length) or.push({ cellId: { in: qCellIds } });
+    if (qZoneIds.length) or.push({ zoneId: { in: qZoneIds } });
     and.push(or.length ? { OR: or } : { id: NONE });
   }
   const where: Prisma.StockBalanceWhereInput = { AND: and };
+
+  // Структурированный фильтр для группового режима (тот же смысл, серверная агрегация/резерв).
+  const groupFilter: StockGroupFilter = {
+    companyId: s.companyId,
+    ...(warehouseId !== undefined ? { warehouseId } : {}),
+    allowedWarehouseIds,
+    ...(sp.zone ? { zoneId: sp.zone, zoneCellIds } : {}),
+    qItemIds,
+    qCellIds,
+    qZoneIds,
+  };
 
   // справочники для селектов фильтра (склады/зоны доступа)
   const [warehouses, zones] = await Promise.all([
@@ -77,44 +99,38 @@ export default async function StockPage({
 
   const inputCls = "min-h-11 w-full rounded-xl border border-[#e4e4f0] px-3 py-2 text-base outline-none focus:border-brand";
 
-  // ── Групповой режим: агрегация по товару в БД (groupBy), без загрузки всех остатков ──
-  let grpTotal = 0;
+  // ── общая пагинация ──
+  let totalRows = 0;
+  let page = 1;
   let grpRows: { name: string; ean: string; uom: string; qty: number; reserved: number }[] = [];
-  // ── Плоский режим ──
-  let flatTotal = 0;
   let rows: StockRow[] = [];
 
   if (grouped) {
-    const agg = await prisma.stockBalance.groupBy({ by: ["itemId"], where, _sum: { qty: true } });
-    const itemIds = agg.map((a) => a.itemId);
-    const [items, barcodes, resv] = await Promise.all([
-      prisma.item.findMany({ where: { id: { in: itemIds } }, include: { uom: true } }),
-      prisma.itemBarcode.findMany({ where: { companyId: s.companyId, itemId: { in: itemIds }, isActive: true }, orderBy: { createdAt: "asc" }, select: { itemId: true, code: true } }),
-      // активные резервы (ограниченный набор открытых заказов) → сумма по товару через строку заказа
-      prisma.stockReservation.findMany({ where: { companyId: s.companyId, status: "ACTIVE", line: { itemId: { in: itemIds } } }, select: { qty: true, line: { select: { itemId: true } } } }),
+    // Групповой режим: серверная пагинация + корректный резерв (по совпадению lotId/sourceLocKey
+    // с выборкой) — src/lib/stock-query.ts. EAN/uom подгружаются только для товаров страницы.
+    totalRows = await stockGroupedCount(groupFilter);
+    const pageCount = Math.max(1, Math.ceil(totalRows / PAGE_SIZE));
+    page = Math.min(Math.max(1, Number(sp.page) || 1), pageCount);
+    const pageAgg = await stockGroupedPage(groupFilter, page, PAGE_SIZE);
+    const pageItemIds = pageAgg.map((a) => a.itemId);
+    const [items, barcodes] = await Promise.all([
+      prisma.item.findMany({ where: { id: { in: pageItemIds } }, include: { uom: true } }),
+      prisma.itemBarcode.findMany({ where: { companyId: s.companyId, itemId: { in: pageItemIds }, isActive: true }, orderBy: { createdAt: "asc" }, select: { itemId: true, code: true } }),
     ]);
-    const itemById = new Map(items.map((i) => [i.id, i]));
+    const uomByItem = new Map(items.map((i) => [i.id, i.uom.name]));
     const eanByItem = new Map<string, string>();
     for (const b of barcodes) if (!eanByItem.has(b.itemId)) eanByItem.set(b.itemId, b.code);
-    const reservedByItem = new Map<string, number>();
-    for (const r of resv) { const id = r.line.itemId; reservedByItem.set(id, (reservedByItem.get(id) ?? 0) + r.qty.toNumber()); }
-    grpRows = agg
-      .map((a) => {
-        const item = itemById.get(a.itemId);
-        return {
-          name: item?.name ?? "—",
-          ean: eanByItem.get(a.itemId) ?? "",
-          uom: item?.uom.name ?? "",
-          qty: a._sum.qty ? a._sum.qty.toNumber() : 0,
-          reserved: reservedByItem.get(a.itemId) ?? 0,
-        };
-      })
-      .sort((x, y) => x.name.localeCompare(y.name, "ru"));
-    grpTotal = grpRows.length;
+    grpRows = pageAgg.map((a) => ({
+      name: a.name,
+      ean: eanByItem.get(a.itemId) ?? "",
+      uom: uomByItem.get(a.itemId) ?? "",
+      qty: a.qty,
+      reserved: a.reserved,
+    }));
   } else {
-    flatTotal = await prisma.stockBalance.count({ where });
-    const pageCount = Math.max(1, Math.ceil(flatTotal / PAGE_SIZE));
-    const page = Math.min(Math.max(1, Number(sp.page) || 1), pageCount);
+    totalRows = await prisma.stockBalance.count({ where });
+    const pageCount = Math.max(1, Math.ceil(totalRows / PAGE_SIZE));
+    page = Math.min(Math.max(1, Number(sp.page) || 1), pageCount);
     const pageBalances = await prisma.stockBalance.findMany({
       where,
       orderBy: [{ itemId: "asc" }, { id: "asc" }],
@@ -170,10 +186,8 @@ export default async function StockPage({
     });
   }
 
-  const totalRows = grouped ? grpTotal : flatTotal;
+  // totalRows и page уже вычислены в ветке (серверная пагинация); grpRows — уже страница.
   const pageCount = Math.max(1, Math.ceil(totalRows / PAGE_SIZE));
-  const page = Math.min(Math.max(1, Number(sp.page) || 1), pageCount);
-  const pageGrpRows = grouped ? grpRows.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE) : [];
 
   const qs = (p: number) => {
     const params = new URLSearchParams();
@@ -238,7 +252,7 @@ export default async function StockPage({
               },
             ] satisfies Column<(typeof grpRows)[number]>[]
           }
-          rows={pageGrpRows}
+          rows={grpRows}
           rowKey={(g) => `${g.name}#${g.uom}`}
           minWidth="min-w-[560px]"
           mobileCard={(g) => (
