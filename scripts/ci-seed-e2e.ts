@@ -16,7 +16,7 @@ import { PrismaClient, type Role } from "@prisma/client";
 import bcrypt from "bcryptjs";
 import { ensureStandardZones, createCellsInZone } from "@/lib/cells";
 import { updateSettings } from "@/lib/settings";
-import { createHandlingGroup, completeGroupPlacement } from "@/lib/group-receiving";
+import { createHandlingGroup, completeGroupPlacement, prepareGroupPlacement } from "@/lib/group-receiving";
 import { startWorkflowTask } from "@/lib/workflow-tasks";
 import { importExternalOrder, reserveAndPlanOrder } from "@/lib/external-orders";
 import { createSessionToken } from "@/lib/jwt";
@@ -83,12 +83,15 @@ async function main() {
   // 1) приёмка группы (движок) → RECEIPT-движение + Event «Приёмка группы»
   const grp = await createHandlingGroup({ companyId, warehouseId: wh.id, itemId: item.id, qty: QTY, temperature: 4, acceptedById: receiver, dedupeKey: "ci-e2e-recv-1" });
 
-  // 2) размещение в STORAGE-ячейку (движок) → TRANSFER-движение + Event «Размещение» + IN_STORAGE
+  // 2) размещение в STORAGE-ячейку (движок): система назначает ячейку (prepare) → скан назначенной →
+  //    complete. На чистой БД единственная свободная STORAGE-ячейка — CELL_CODE (её и назначит prepare).
   const g = await prisma.handlingGroup.findUniqueOrThrow({ where: { id: grp.groupId } });
   if (g.status === "AWAITING_STORAGE") {
     const placeTask = await prisma.workflowTask.findFirstOrThrow({ where: { subjectId: grp.groupId, type: "PLACE_GROUP" } });
     await startWorkflowTask(loader, companyId, placeTask.id);
-    await completeGroupPlacement({ companyId, userId: loader, taskId: placeTask.id, cellCode: cellQr.code, ean: EAN });
+    const asg = await prepareGroupPlacement({ companyId, userId: loader, taskId: placeTask.id });
+    const asgQr = await prisma.qrCode.findFirstOrThrow({ where: { type: "CELL", refId: asg.cellId } });
+    await completeGroupPlacement({ companyId, userId: loader, taskId: placeTask.id, cellCode: asgQr.code, ean: EAN });
   }
 
   // 3) заказ с пользовательским номером + активный резерв (движок)
