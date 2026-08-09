@@ -6,7 +6,7 @@ import { scoped } from "@/lib/tenant";
 import { prisma } from "@/lib/db";
 import { groupReceivingEnabled } from "@/lib/roles";
 import { getActiveShift } from "@/lib/work-shift";
-import { createHandlingGroup, completeGroupPlacement, prepareGroupPlacement, GroupError } from "@/lib/group-receiving";
+import { createHandlingGroup, completeGroupPlacement, prepareGroupPlacement, verifyGroupPlacementEan, GroupError } from "@/lib/group-receiving";
 import { findItemByEan } from "@/lib/barcodes";
 
 // Этап 5/Пакет 4: групповая приёмка. Доступ — RECEIVER с активной сменой на его складе
@@ -135,6 +135,31 @@ export async function prepareGroupPlacementAction(
   }
 }
 
+// UI-005: авторитетная серверная сверка EAN на ПЕРВОМ скане размещения. Read-only (без движения/брони).
+// Успех — единственное основание показать клиенту «Товар подтверждён» и перейти к скану ячейки.
+export interface VerifyEanState {
+  error?: string;
+  ok?: boolean;
+  itemName?: string;
+}
+export async function verifyPlacementEanAction(
+  _prev: VerifyEanState,
+  formData: FormData,
+): Promise<VerifyEanState> {
+  if (!groupReceivingEnabled()) return { error: "Групповая приёмка сейчас отключена" };
+  const session = await requireUser();
+  const s = scoped(session);
+  const taskId = String(formData.get("taskId") ?? "").trim();
+  const ean = String(formData.get("ean") ?? "").trim();
+  if (!ean) return { error: "Отсканируйте заводской штрихкод товара (EAN)" };
+  try {
+    const r = await verifyGroupPlacementEan({ companyId: s.companyId, userId: session.userId, taskId, ean });
+    return { ok: true, itemName: r.itemName };
+  } catch (e) {
+    return { error: msg(e) };
+  }
+}
+
 export async function completeGroupPlacementAction(
   _prev: PlacementState,
   formData: FormData,
@@ -153,6 +178,9 @@ export async function completeGroupPlacementAction(
     return { error: msg(e) };
   }
   // Событие «Размещение» пишется в движке completeGroupPlacement (стабильный ключ, единично).
-  revalidatePath("/warehouse/tasks");
+  // UI-005: НЕ вызываем revalidatePath здесь — иначе Next мгновенно перерисует страницу задач и снимет
+  // карточку вместе с заметным успехом «Размещено» до того, как погрузчик его увидит. Экран этого
+  // клиента обновляет сам сканер (router.refresh при закрытии по «Готово»); другие клиенты — realtime/SSE
+  // (пока скан-шторка открыта, обновление отложено).
   return {};
 }

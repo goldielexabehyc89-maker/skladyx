@@ -179,11 +179,13 @@ export default async function TasksPage({
   // (prepareGroupPlacement) НЕ вызывается на сервер-рендере/GET/prefetch/refresh — иначе обычное
   // открытие страницы создавало бы бронь. Бронь создаёт клиент только по явному «Начать размещение»
   // (PLACE-001). Здесь лишь передаём контекст задачи; назначенный код появляется после действия.
-  let placement: { taskId: string; routeLabel: string } | null = null;
+  // TASK-006: маршрут из СТРУКТУРИРОВАННЫХ данных группы (статус/зона), без парсинга title/description.
+  // source — фактическая зона ожидающей группы (приёмка); targetZone — целевая зона маршрута.
+  let placement: { taskId: string; source: string; targetZone: string } | null = null;
   if (current && current.type === "PLACE_GROUP" && current.status === "IN_PROGRESS" && groupReceivingEnabled()) {
     const group = await prisma.handlingGroup.findFirst({ where: { id: current.subjectId ?? "", companyId: s.companyId } });
     if (group && (group.status === "AWAITING_STORAGE" || group.status === "AWAITING_COOLING")) {
-      placement = { taskId: current.id, routeLabel: group.status === "AWAITING_COOLING" ? "охлаждение" : "хранение" };
+      placement = { taskId: current.id, source: "Приёмка", targetZone: group.status === "AWAITING_COOLING" ? "Охлаждение" : "Хранение" };
     }
   }
 

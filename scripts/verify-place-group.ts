@@ -10,7 +10,7 @@
 /* eslint-disable no-console */
 import { PrismaClient, type Role } from "@prisma/client";
 import bcrypt from "bcryptjs";
-import { createHandlingGroup, prepareGroupPlacement, completeGroupPlacement } from "@/lib/group-receiving";
+import { createHandlingGroup, prepareGroupPlacement, completeGroupPlacement, verifyGroupPlacementEan } from "@/lib/group-receiving";
 import { ensureStandardZones, createCellsInZone, assertCellNotHeldByGroup, lockCell } from "@/lib/cells";
 import { startWorkflowTask, cancelWorkflowTask } from "@/lib/workflow-tasks";
 import { updateSettings } from "@/lib/settings";
@@ -136,6 +136,17 @@ async function main() {
     ok("повтор prepare → та же ячейка", a1b.cellId === a1.cellId, `${a1b.cellCode}`);
     ok("ровно одна активная бронь по задаче", (await prisma.cellReservation.count({ where: { taskId: a1.taskId, status: "ACTIVE" } })) === 1);
 
+    console.log("V) серверная сверка EAN на первом скане (UI-005): read-only, без движения/брони");
+    const mvBeforeV = await prisma.stockMovement.count({ where: { companyId } });
+    const badEan = await err(async () => { await verifyGroupPlacementEan({ companyId, userId: L1, taskId: a1.taskId, ean: "0000000000000" }); });
+    ok("неизвестный/неверный EAN отклонён на первом шаге", badEan.includes("Неизвестный") || badEan.includes("не тот товар"), badEan);
+    let vName = "";
+    const okEan = await err(async () => { vName = (await verifyGroupPlacementEan({ companyId, userId: L1, taskId: a1.taskId, ean })).itemName; });
+    ok("правильный EAN подтверждён сервером (есть имя товара)", okEan === "" && !!vName, okEan || "нет имени");
+    ok("сверка EAN не создала движения", (await prisma.stockMovement.count({ where: { companyId } })) === mvBeforeV);
+    ok("сверка EAN не изменила бронь и статус группы",
+      (await prisma.cellReservation.count({ where: { taskId: a1.taskId, status: "ACTIVE" } })) === 1 && (await grp(g1.groupId)).status === "AWAITING_STORAGE");
+
     console.log("3) чужая свободная ячейка отклоняется, движения нет");
     const g1row = await grp(g1.groupId);
     const recvBefore = await bal(g1row.lotId, `Z:${(await prisma.warehouseZone.findFirstOrThrow({ where: { warehouseId: W, kind: "RECEIVING" } })).id}`);
@@ -145,11 +156,16 @@ async function main() {
     ok("движения нет: остаток RECEIVING не изменён, группа AWAITING, бронь активна",
       recvBefore?.qty.toNumber() === recvAfter?.qty.toNumber() && (await grp(g1.groupId)).status === "AWAITING_STORAGE" && (await prisma.cellReservation.count({ where: { taskId: a1.taskId, status: "ACTIVE" } })) === 1);
 
-    console.log("4) назначенная ячейка успешно завершает размещение, бронь RELEASED");
+    console.log("4) назначенная ячейка успешно завершает размещение, бронь RELEASED, ровно одно движение");
+    const mvBefore4 = await prisma.stockMovement.count({ where: { companyId, lotId: g1row.lotId } });
     const done = await err(async () => completeGroupPlacement({ companyId, userId: L1, taskId: a1.taskId, cellCode: await cellQr(a1.cellId), ean }));
     ok("размещение в назначенную ячейку → успех", done === "", done);
     ok("группа IN_STORAGE, задача COMPLETED", (await grp(g1.groupId)).status === "IN_STORAGE" && (await taskOf(g1.groupId))?.status === "COMPLETED");
     ok("бронь размещения RELEASED", (await prisma.cellReservation.count({ where: { taskId: a1.taskId, status: "ACTIVE" } })) === 0 && (await prisma.cellReservation.count({ where: { taskId: a1.taskId, status: "RELEASED" } })) === 1);
+    ok("создано ровно одно движение размещения", (await prisma.stockMovement.count({ where: { companyId, lotId: g1row.lotId } })) === mvBefore4 + 1);
+    // повторное завершение (второе событие камеры) не создаёт второго движения
+    const dup = await err(async () => completeGroupPlacement({ companyId, userId: L1, taskId: a1.taskId, cellCode: await cellQr(a1.cellId), ean }));
+    ok("повтор завершения отклонён, второго движения нет", dup !== "" && (await prisma.stockMovement.count({ where: { companyId, lotId: g1row.lotId } })) === mvBefore4 + 1, dup);
 
     console.log("P2) первый кандидат конкурентно занят → автоматически назначается следующий (без выбора)");
     // имитируем конкурентное занятие первого кандидата P2-A посторонним остатком (старой операцией)

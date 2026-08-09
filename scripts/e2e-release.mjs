@@ -5,7 +5,7 @@
 // Запуск: E2E_IDS='{...}' node scripts/e2e-release.mjs
 /* eslint-disable no-console */
 import { spawn } from "node:child_process";
-import { mkdtempSync, existsSync } from "node:fs";
+import { mkdtempSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -94,6 +94,12 @@ async function main() {
   };
 
   const has = (t, sub) => t.includes(sub);
+  // Скриншоты (мобильная PLACE_GROUP) — только если задан SHOT_DIR.
+  const SHOT_DIR = process.env.SHOT_DIR || "";
+  const shot = async (name) => { if (!SHOT_DIR) return; try { const { data } = await page.send("Page.captureScreenshot", { format: "png" }); writeFileSync(join(SHOT_DIR, name + ".png"), Buffer.from(data, "base64")); } catch { /* ignore */ } };
+  // Установить значение первого видимого поля внутри активной скан-шторки (тот же путь, что ручной ввод).
+  const setSheetField = (val) => ev(`(()=>{const el=[...document.querySelectorAll('[data-workflow-sheet] input:not([type=hidden]),[data-workflow-sheet] select,[data-workflow-sheet] textarea')].find(e=>e.offsetParent!==null); if(!el) return 0; const set=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el),'value').set; set.call(el,${JSON.stringify(val)}); el.dispatchEvent(new Event('input',{bubbles:true})); return 1;})()`);
+  const sheetCount = () => ev(`[...document.querySelectorAll('[data-workflow-sheet] input:not([type=hidden]),[data-workflow-sheet] select,[data-workflow-sheet] textarea')].filter(e=>e.offsetParent!==null).length`);
 
   // ── ADMIN, десктоп ──
   await setViewport(false);
@@ -187,27 +193,83 @@ async function main() {
     ok("Рабочая роль: /warehouse/settings закрыт (редирект)", p !== "/warehouse/settings", p);
   }
 
-  // ── Новый сценарий размещения PLACE_GROUP (погрузчик): рендер НЕ назначает ячейку (P1);
-  //    назначение только по явному «Начать размещение»; система назначает, выбора нет ──
+  // ── PLACE_GROUP (погрузчик): компактная карточка (TASK-006) + серверная сверка EAN и заметная
+  //    обратная связь (UI-005). Мобильный виджет; по ходу снимаем скриншоты состояний. ──
   if (ids.loaderToken) {
     await setViewport(true);
     await setAuth(ids.loaderToken);
-    await goto("/warehouse/tasks", `document.body.innerText.includes("Начать размещение") || document.body.innerText.includes("Назначенная ячейка")`);
+    await goto("/warehouse/tasks", `document.body.innerText.includes("Разместить")`);
     t = await bodyText();
-    ok("Размещение (P1): рендер НЕ назначил ячейку — показана кнопка «Начать размещение»", has(t, "Начать размещение") && !has(t, "Назначенная ячейка"), t.slice(0, 0));
+    // TASK-006: компактная карточка — команда + маршрут, без типа/статуса/времени/описания
+    ok("TASK-006: карточка показывает «Разместить»", has(t, "Разместить"));
+    ok("TASK-006: карточка показывает источник маршрута «Приёмка» (стрелка — иконка ArrowRight)", has(t, "Приёмка"));
+    ok("TASK-006: до назначения цель — зона «Хранение»", has(t, "Хранение"));
+    ok("TASK-006: НЕТ типа задачи «Размещение группы»", !has(t, "Размещение группы"));
+    ok("TASK-006: НЕТ статуса «В работе» и времени «создано»", !has(t, "В работе") && !has(t, "создано"));
+    // P1: рендер не назначил ячейку — показана кнопка «Начать размещение», без списка рекомендаций
+    ok("Размещение (P1): рендер НЕ назначил ячейку (кнопка «Начать размещение»)", has(t, "Начать размещение"));
     ok("Размещение: НЕТ списка «Рекомендуемые»", !has(t, "Рекомендуемые"));
-    // явное действие погрузчика → назначение ячейки (после гидрации формы)
+    // TASK-005: текущая задача есть, пустых секций нет
+    ok("Очередь: показана «Текущая задача»", has(t, "Текущая задача"));
+    ok("Очередь: пустые секции скрыты", !has(t, "Очередь пуста") && !has(t, "Нет срочных задач"));
+
+    // явное «Начать размещение» → назначенный КОД в маршруте «Приёмка → <код>»
     await sleep(2000);
     await clickText("/Начать размещение/");
     let assigned = false;
-    for (let i = 0; i < 50; i++) { if ((await bodyText()).includes("Назначенная ячейка")) { assigned = true; break; } await sleep(200); }
-    ok("Размещение: после «Начать размещение» показан назначенный код", assigned);
+    for (let i = 0; i < 50; i++) { if ((await bodyText()).includes(ids.placeCellCode)) { assigned = true; break; } await sleep(200); }
+    ok("Размещение: после «Начать размещение» в карточке маршрут «Приёмка → <ячейка>»", assigned && has(await bodyText(), "Приёмка"), ids.placeCellCode);
 
-    // TASK-005: у погрузчика есть текущая задача, пустых секций очереди быть не должно
-    await goto("/warehouse/tasks", `document.body.innerText.includes("Текущая задача") || document.body.innerText.includes("Задач пока нет")`);
-    t = await bodyText();
-    ok("Очередь: показана «Текущая задача»", has(t, "Текущая задача"));
-    ok("Очередь: пустые секции скрыты (нет «Очередь пуста» / «Нет срочных задач»)", !has(t, "Очередь пуста") && !has(t, "Нет срочных задач"));
+    if (ids.ean && ids.placeCellQr && ids.placeWrongCellQr) {
+      // открыть скан-мастер
+      await sleep(500); await clickText("/Сканировать/");
+      const sheetUp = async () => { for (let i = 0; i < 40; i++) { if (await ev(`!!document.querySelector('[data-workflow-sheet]')`)) return true; await sleep(150); } return false; };
+      ok("Размещение: скан-мастер открыт (шаг EAN)", await sheetUp());
+      await shot("place-1-wait-ean"); // (1) ожидание EAN
+      ok("UI-005: на шаге EAN не более одного поля", (await sheetCount()) <= 1, String(await sheetCount()));
+
+      // (a) неправильный EAN → красная блокирующая ошибка (role=alert), без перехода к ячейке
+      await setSheetField("0000000000000"); await clickText("/Ввести/");
+      let eanErr = false;
+      for (let i = 0; i < 40; i++) { if (await ev(`!!document.querySelector('[role=alert]')`)) { eanErr = true; break; } await sleep(150); }
+      ok("UI-005: неправильный EAN → заметная ошибка (role=alert)", eanErr);
+      ok("UI-005: при ошибке EAN нет успеха «Товар подтверждён»", !(await bodyText()).includes("Товар подтверждён"));
+      await clickText("/Повторить/"); await sleep(600); // повтор скана товара
+
+      // (b) правильный EAN → зелёный успех (role=status) «Товар подтверждён» → авто-переход к ячейке
+      await setSheetField(ids.ean); await clickText("/Ввести/");
+      let eanOk = false;
+      for (let i = 0; i < 40; i++) { if ((await bodyText()).includes("Товар подтверждён")) { eanOk = true; break; } await sleep(120); }
+      ok("UI-005: правильный EAN → заметный зелёный успех «Товар подтверждён»", eanOk);
+      ok("UI-005: успех EAN озвучен (role=status)", await ev(`!!document.querySelector('[role=status]')`));
+      await shot("place-2-ean-ok"); // (2) успешный EAN
+      // авто-переход к шагу ячейки (появляется числовой/текстовый ввод ячейки или подсказка ячейки)
+      let atCell = false;
+      for (let i = 0; i < 40; i++) { if ((await bodyText()).includes(`Сканировать ячейку`) || (await ev(`!!document.querySelector('[data-workflow-sheet] input:not([type=hidden])')`) && !(await bodyText()).includes("Товар подтверждён"))) { atCell = true; break; } await sleep(150); }
+      ok("UI-005: после успеха EAN — авто-переход к скану ячейки", atCell);
+
+      // (c) неверная ячейка → красная ошибка, EAN повторно не сканируется
+      await setSheetField(ids.placeWrongCellQr); await clickText("/Ввести/");
+      let cellErr = false;
+      for (let i = 0; i < 40; i++) { if (await ev(`!!document.querySelector('[role=alert]')`)) { cellErr = true; break; } await sleep(150); }
+      t = await bodyText();
+      ok("UI-005: неверная ячейка → заметная ошибка (role=alert)", cellErr);
+      ok("UI-005: ошибка ячейки называет назначенную", has(t, "не назначенная") || has(t, ids.placeCellCode), t.slice(0, 0));
+      await shot("place-3-wrong-cell"); // (3) ошибка неверной ячейки
+      await clickText("/Повторить/"); await sleep(600); // остаёмся на шаге ячейки, EAN сохранён
+
+      // (d) правильная ячейка → зелёный успех «Размещено»
+      await sleep(400);
+      await setSheetField(ids.placeCellQr); await clickText("/Ввести/");
+      let placed = false;
+      for (let i = 0; i < 80; i++) { if ((await bodyText()).includes("Размещено")) { placed = true; break; } await sleep(100); }
+      await shot("place-4-placed"); // (4) успешное размещение
+      ok("UI-005: правильная ячейка → заметный зелёный успех «Размещено»", placed);
+      ok("UI-005: успех размещения озвучен (role=status)", await ev(`!!document.querySelector('[role=status]')`));
+      // завершение сценария: закрыть по «Готово», задача уходит из «Текущей»
+      await clickText("/Готово/"); await sleep(800);
+      ok("Размещение завершено: задача больше не текущая", !(await bodyText()).includes("Разместить"));
+    }
   }
 
   // ── ROLE-003: home/menu по активной смене (desktop). Пункты меню проверяем по ссылкам сайдбара

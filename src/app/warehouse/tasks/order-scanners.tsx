@@ -1,10 +1,10 @@
 "use client";
 
-import { useState, useTransition } from "react";
+import { useState, useTransition, useRef } from "react";
 import { useRouter } from "next/navigation";
 import { ScanLine } from "lucide-react";
 import { pickScanAction, completeMoveGroupAction } from "@/app/actions/external-orders";
-import { completeGroupPlacementAction } from "@/app/actions/group-receiving";
+import { completeGroupPlacementAction, verifyPlacementEanAction } from "@/app/actions/group-receiving";
 import { prepareCoolingRetrievalAction, placeCoolingRetrievalAction } from "@/app/actions/tasks";
 import { Button, Badge } from "@/components/ui";
 import { WorkflowSheet, type ScanFormat } from "@/components/workflow-sheet";
@@ -120,69 +120,115 @@ export function PickOrderScanner({ ctx, taskId }: { ctx: PickOrderCtx; taskId: s
 
 // ── Первичное размещение группы (PLACE_GROUP): EAN товара → QR/Code128 целевой ячейки ──
 // Сервер сам резолвит отсканированный код ячейки и проверяет его (не доверяет выбранному id).
+// UI-005: первый скан (EAN) проходит АВТОРИТЕТНУЮ серверную сверку до показа успеха; шаг ячейки —
+// completeGroupPlacementAction (движок повторно сверяет EAN и ячейку в транзакции). Явные состояния:
+// ожидание → проверка → подтверждено / ошибка. Успех — заметный зелёный, ошибка — красная блокирующая.
 export function PlaceGroupScanner({ placement, assignedCellCode }: { placement: Placement; assignedCellCode: string }) {
   const router = useRouter();
   const [open, setOpen] = useState(false);
   const [scanning, setScanning] = useState(false);
   const [step, setStep] = useState<"product" | "cell">("product");
-  const [eanRaw, setEanRaw] = useState("");
-  const [busy, startTransition] = useTransition();
+  const [eanRaw, setEanRaw] = useState("");          // подтверждённый сервером EAN (сохраняется при ошибке ячейки)
+  const [phase, setPhase] = useState<"idle" | "checking" | "confirmed" | "placed">("idle");
+  const [checkLabel, setCheckLabel] = useState("");  // «Проверяем товар…» / «Проверяем ячейку…»
+  const [okItem, setOkItem] = useState("");
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
-  const [finished, setFinished] = useState(false);
+  const [busy, startTransition] = useTransition();
+  const submitting = useRef(false);                  // защита от второго события камеры → второго движения
+  const advanceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  function reset() { setStep("product"); setEanRaw(""); setNotice(null); }
-  function closeAll() { setOpen(false); setScanning(false); reset(); setError(null); setFinished(false); router.refresh(); }
+  function vibrate(ms: number) { try { navigator.vibrate?.(ms); } catch { /* not supported */ } }
+  function openScan() { setStep("product"); setEanRaw(""); setPhase("idle"); setError(null); setScanning(true); }
+  function closeAll() {
+    if (advanceTimer.current) clearTimeout(advanceTimer.current);
+    setOpen(false); setScanning(false); setStep("product"); setEanRaw(""); setPhase("idle"); setError(null); submitting.current = false; router.refresh();
+  }
 
   function handleScan(raw: string) {
-    if (busy) return;
-    if (step === "product") { setEanRaw(raw); setStep("cell"); setNotice(`Товар отсканирован — сканируйте назначенную ячейку ${assignedCellCode}`); return; }
-    // step === "cell": финализируем размещение (сервер сверит с назначенной ячейкой)
+    if (busy || phase !== "idle" || submitting.current) return; // приостановить повторные события камеры во время проверки
+    const value = raw.trim();
+    if (!value) return;
+    if (step === "product") {
+      // Шаг EAN: авторитетная серверная сверка ДО показа успеха (не доверяем клиенту).
+      setScanning(false); setPhase("checking"); setCheckLabel("Проверяем товар…");
+      startTransition(async () => {
+        const fd = new FormData(); fd.set("taskId", placement.taskId); fd.set("ean", value);
+        const res = await verifyPlacementEanAction({}, fd);
+        if (res.error) { setPhase("idle"); setError(res.error); return; }        // ошибка — красное блокирующее, остаёмся на EAN
+        setEanRaw(value); setOkItem(res.itemName ?? ""); setPhase("confirmed"); vibrate(60);
+        // после короткой паузы — авто-переход к скану назначенной ячейки
+        advanceTimer.current = setTimeout(() => { setStep("cell"); setPhase("idle"); setScanning(true); }, 900);
+      });
+      return;
+    }
+    // Шаг ячейки: финализация (движок сверяет EAN и назначенную ячейку в транзакции).
+    submitting.current = true;
+    setScanning(false); setPhase("checking"); setCheckLabel("Проверяем ячейку…");
     startTransition(async () => {
-      const fd = new FormData();
-      fd.set("taskId", placement.taskId); fd.set("ean", eanRaw); fd.set("cellCode", raw);
+      const fd = new FormData(); fd.set("taskId", placement.taskId); fd.set("ean", eanRaw); fd.set("cellCode", value);
       const res = await completeGroupPlacementAction({}, fd);
-      if (res.error) { setError(res.error); return; }
-      setScanning(false); setFinished(true);
+      submitting.current = false;
+      if (res.error) {
+        // неверная ячейка и т.п. — EAN сохранён, остаёмся на шаге ячейки; называем нужную ячейку
+        const err = res.error.includes("назначенная") ? `${res.error} Нужна: ${assignedCellCode}` : res.error;
+        setPhase("idle"); setError(err); return;
+      }
+      setPhase("placed"); vibrate(120);
     });
   }
 
+  const cellHint = (<span>Ячейка <b className="font-mono text-lg">{assignedCellCode}</b> (QR/Code 128)</span>);
+  const modal =
+    phase === "checking" ? { tone: "neutral" as const, title: checkLabel }
+    : phase === "confirmed" ? { title: "Товар подтверждён", body: okItem || "EAN совпал с товаром группы" }
+    : phase === "placed" ? { title: "Размещено", body: `Ячейка ${assignedCellCode}`, actions: (<Button type="button" variant="primary" onClick={closeAll} className="w-full">Готово</Button>) }
+    : null;
+
   if (!open)
     return (
-      <Button type="button" variant="primary" onClick={() => setOpen(true)} className="w-full">
-        <ScanLine size={18} /> Разместить (сканирование)
+      <Button type="button" variant="primary" onClick={() => { setOpen(true); openScan(); }} className="w-full">
+        <ScanLine size={18} /> Сканировать
       </Button>
     );
 
   return (
     <WorkflowSheet
       title="Размещение группы"
-      subtitle={`Зона «${placement.routeLabel}»`}
+      subtitle={step === "product" ? "Шаг 1 · штрихкод товара (EAN)" : "Шаг 2 · назначенная ячейка"}
       scanning={scanning}
-      scanHint={step === "product" ? "Сканируйте EAN товара" : `Сканируйте назначенную ячейку ${assignedCellCode} (QR/Code 128)`}
+      scanHint={step === "product" ? "Сканируйте EAN товара" : cellHint}
       scanFormats={step === "product" ? PRODUCT : CELL}
       manualPlaceholder={step === "product" ? "EAN товара (8/13 цифр)" : `Код назначенной ячейки (${assignedCellCode})`}
       manualInputMode={step === "product" ? "numeric" : "text"}
       onScan={handleScan}
-      scanPaused={busy}
+      scanPaused={busy || phase !== "idle"}
       busy={busy}
       onBackToList={() => setScanning(false)}
       onClose={closeAll}
       error={error}
-      onErrorRetry={() => setError(null)}
-      onErrorExit={() => { setError(null); setScanning(false); reset(); }}
-      modal={finished ? { title: "Группа размещена", body: "Товар размещён в отсканированную ячейку", actions: (<Button type="button" variant="primary" onClick={closeAll} className="w-full">Ок</Button>) } : null}
+      onErrorRetry={() => { setError(null); setScanning(true); }}       // повтор скана текущего шага (EAN сохранён)
+      onErrorExit={() => { setError(null); setScanning(false); }}
+      modal={modal}
       footer={
-        <Button type="button" variant="primary" onClick={() => { setScanning(true); reset(); }} className="w-full">
-          <ScanLine size={18} /> Сканировать товар (EAN)
-        </Button>
+        step === "product" ? (
+          <Button type="button" variant="primary" onClick={openScan} className="w-full">
+            <ScanLine size={18} /> Сканировать товар (EAN)
+          </Button>
+        ) : (
+          <Button type="button" variant="primary" onClick={() => { setError(null); setScanning(true); }} className="w-full">
+            <ScanLine size={18} /> Сканировать ячейку {assignedCellCode}
+          </Button>
+        )
       }
     >
-      {notice && <p className="pb-1 text-sm font-medium text-green-600">{notice}</p>}
-      <p className="text-sm text-neutral-500">Система назначила ячейку. Отсканируйте EAN товара, затем именно назначенную ячейку зоны «{placement.routeLabel}».</p>
-      <div className="rounded-xl bg-[#eef7ee] px-3 py-2 text-sm text-green-800">
-        Назначенная ячейка: <b>{assignedCellCode}</b>
+      {/* Назначенная ячейка — постоянно крупно и заметно; код самый выделенный элемент. */}
+      <div className="rounded-xl bg-[#eef7ee] px-3 py-3 text-center">
+        <div className="text-xs font-medium text-green-700">Назначенная ячейка</div>
+        <div className="font-mono text-2xl font-extrabold tracking-tight text-green-900">{assignedCellCode}</div>
       </div>
+      <p className="text-sm text-neutral-500">
+        {step === "product" ? "Отсканируйте EAN товара — система сверит его с товаром группы." : "Отсканируйте именно назначенную ячейку."}
+      </p>
     </WorkflowSheet>
   );
 }

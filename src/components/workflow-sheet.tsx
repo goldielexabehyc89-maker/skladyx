@@ -15,7 +15,8 @@ export interface SheetModal {
   icon?: React.ReactNode; // по умолчанию зелёная галка
   title: React.ReactNode;
   body?: React.ReactNode;
-  actions: React.ReactNode; // кнопки окна (стек)
+  actions?: React.ReactNode; // кнопки окна (стек); можно опустить для авто-переходов (UI-005)
+  tone?: "success" | "neutral"; // UI-005: neutral — нейтральное окно «проверки» (без зелёной галки)
 }
 
 export function WorkflowSheet({
@@ -144,25 +145,28 @@ export function WorkflowSheet({
         </div>
       </div>
 
-      {/* Центральное окно (подтверждение шага / финал) */}
+      {/* Центральное окно (подтверждение шага / финал). UI-005: role=status/aria-live — озвучивается
+          скринридером; цвет не единственный сигнал (иконка + текст). */}
       {modal && (
-        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/50 p-6">
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/50 p-6" role="status" aria-live="polite">
           <div className="w-full max-w-xs rounded-3xl bg-white p-6 text-center shadow-[0_20px_60px_rgba(0,0,0,0.35)]">
             {modal.icon ?? (
-              <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-full bg-[#e8f5e9] text-3xl text-[#2e7d32]">
-                ✓
-              </div>
+              modal.tone === "neutral" ? (
+                <div className="mx-auto flex h-16 w-16 animate-pulse items-center justify-center rounded-full bg-[#eef0f8] text-3xl text-[#667eea]">⏳</div>
+              ) : (
+                <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-full bg-[#e8f5e9] text-3xl text-[#2e7d32]">✓</div>
+              )
             )}
             <div className="mt-3 text-lg font-bold text-[#1a1a1a]">{modal.title}</div>
             {modal.body && <div className="mt-1.5 text-sm text-neutral-500">{modal.body}</div>}
-            <div className="mt-5 flex flex-col gap-2">{modal.actions}</div>
+            {modal.actions && <div className="mt-5 flex flex-col gap-2">{modal.actions}</div>}
           </div>
         </div>
       )}
 
-      {/* Окно ошибки — одинаковое во всех процессах */}
+      {/* Окно ошибки — одинаковое во всех процессах. UI-005: role=alert (блокирующее, с иконкой и текстом). */}
       {error && (
-        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/50 p-6">
+        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/50 p-6" role="alert" aria-live="assertive">
           <div className="w-full max-w-xs rounded-3xl bg-white p-6 text-center shadow-[0_20px_60px_rgba(0,0,0,0.35)]">
             <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-full bg-[#ffebee] text-3xl text-[#c62828]">
               !

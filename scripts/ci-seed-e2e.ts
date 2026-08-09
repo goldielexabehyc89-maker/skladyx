@@ -133,12 +133,21 @@ async function main() {
     await createCellsInZone({ companyId, warehouseId: wh.id, zoneId: storage.id, codes: [CELL_CODE_2], level: 1 });
   const grp2 = await createHandlingGroup({ companyId, warehouseId: wh.id, itemId: item.id, qty: QTY, temperature: 4, acceptedById: receiver, dedupeKey: "ci-e2e-recv-2" });
   const g2 = await prisma.handlingGroup.findUniqueOrThrow({ where: { id: grp2.groupId } });
+  let placeCellCode = "", placeCellQr = "", placeWrongCellQr = "";
   if (g2.status === "AWAITING_STORAGE") {
     const place2 = await prisma.workflowTask.findFirstOrThrow({ where: { subjectId: grp2.groupId, type: "PLACE_GROUP" } });
     if (place2.status !== "IN_PROGRESS") {
       await prisma.workflowTask.update({ where: { id: place2.id }, data: { assignedUserId: loader, assignedShiftId: (await prisma.workShift.findFirstOrThrow({ where: { userId: loader, endedAt: null } })).id, status: "ASSIGNED" } });
       await startWorkflowTask(loader, companyId, place2.id);
     }
+    // Пакет F e2e: бронь НЕ создаём заранее (рендер/GET её не создаёт — «Начать размещение» в браузере
+    // создаст). Назначение детерминировано: единственная свободная STORAGE-ячейка минимального уровня и
+    // code ASC — CELL_CODE_2 (CELL_CODE занята grp; CI-CTRL-* сортируются после «CI-A-…»). Отдаём тесту
+    // код и QR назначенной ячейки для скана и QR валидной, но НЕ назначенной ячейки (CELL_CODE).
+    const cell2 = await prisma.cell.findFirstOrThrow({ where: { companyId, warehouseId: wh.id, code: CELL_CODE_2 } });
+    placeCellCode = CELL_CODE_2;
+    placeCellQr = (await prisma.qrCode.findFirstOrThrow({ where: { type: "CELL", refId: cell2.id } })).code;
+    placeWrongCellQr = (await prisma.qrCode.findFirstOrThrow({ where: { type: "CELL", refId: cell.id } })).code;
   }
 
   // проверка целостности созданного состояния
@@ -286,6 +295,9 @@ async function main() {
     correctToken,
     ctrlEanA: CTRL_EAN_A,
     ctrlEanB: CTRL_EAN_B,
+    placeCellCode,   // cell.code назначенной ячейки grp2 (для проверки карточки «Приёмка → <код>»)
+    placeCellQr,     // QR назначенной ячейки (скан правильной ячейки)
+    placeWrongCellQr, // QR валидной, но НЕ назначенной ячейки (скан неверной ячейки)
   }));
   process.exit(0);
 }

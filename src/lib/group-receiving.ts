@@ -9,7 +9,7 @@ import { fmtDateTime } from "@/lib/format";
 import { coolingWorkflowEnabled } from "@/lib/roles";
 import { logEvent } from "@/lib/events";
 import { parseScannedCode } from "@/lib/qr";
-import { eanItemIdInTx } from "@/lib/barcodes";
+import { eanItemIdInTx, findItemByEan } from "@/lib/barcodes";
 import { startCoolingInTx } from "@/lib/cooling";
 import {
   lockCompany,
@@ -258,6 +258,36 @@ export async function prepareGroupPlacement(input: {
     }
     throw new GroupError(kind === "STORAGE" ? "Нет свободной ячейки хранения для размещения" : "Нет свободной ячейки охлаждения для размещения");
   });
+}
+
+// ── Авторитетная серверная сверка EAN на ПЕРВОМ скане размещения (UI-005) ──
+// Read-only: НЕ создаёт движения, событий или брони. Проверяет: задача принадлежит исполнителю и
+// IN_PROGRESS; активная бронь относится к ЭТОЙ задаче; группа существует и ожидает размещения; EAN
+// активен, принадлежит организации и соответствует товару группы. Успех этой проверки — единственное
+// основание показать «Товар подтверждён». completeGroupPlacement всё равно повторно проверяет EAN и
+// ячейку в транзакции (клиентскому признаку verified не доверяем).
+export async function verifyGroupPlacementEan(input: {
+  companyId: string;
+  userId: string;
+  taskId: string;
+  ean: string;
+}): Promise<{ itemName: string }> {
+  const task = await prisma.workflowTask.findFirst({ where: { id: input.taskId, companyId: input.companyId } });
+  if (!task) throw new GroupError("Задача не найдена");
+  if (task.type !== "PLACE_GROUP") throw new GroupError("Это не задача размещения группы");
+  if (task.assignedUserId !== input.userId || task.status !== "IN_PROGRESS")
+    throw new GroupError("Проверить товар может только назначенный исполнитель с задачей «в работе»");
+  const reservation = await prisma.cellReservation.findFirst({ where: { taskId: task.id, status: "ACTIVE" } });
+  if (!reservation) throw new GroupError("Ячейка не назначена — откройте размещение заново");
+  const group = await prisma.handlingGroup.findFirst({ where: { id: task.subjectId ?? "", companyId: input.companyId } });
+  if (!group) throw new GroupError("Группа не найдена");
+  if (group.status !== "AWAITING_STORAGE" && group.status !== "AWAITING_COOLING")
+    throw new GroupError("Группа уже размещена");
+  const found = await findItemByEan(input.companyId, input.ean);
+  if (!found) throw new GroupError("Неизвестный, неактивный или чужой EAN — размещение отклонено");
+  if (found.item.id !== group.itemId) throw new GroupError("Отсканирован не тот товар (EAN не совпадает с группой)");
+  // товар совпал с группой → имя товара группы = имя найденного по EAN товара
+  return { itemName: found.item.name };
 }
 
 // ── Завершение размещения погрузчиком (атомарно) ──

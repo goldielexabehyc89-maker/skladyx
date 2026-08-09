@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { useActionState, useState } from "react";
+import { ArrowRight } from "lucide-react";
 import {
   startTaskAction,
   requestHandoffAction,
@@ -41,9 +42,11 @@ export interface IncomingHandoff {
 }
 export interface Placement {
   taskId: string;
-  routeLabel: string;
-  // Пакет 11 (коррекция P1): ячейку назначает система, но ТОЛЬКО по явному «Начать размещение»
-  // (клиентский вызов prepareGroupPlacementAction). Рендер страницы бронь не создаёт.
+  // TASK-006: маршрут из структурированных полей (не парсинг title/description). source — фактическая
+  // зона группы (приёмка), targetZone — целевая зона маршрута («Хранение»/«Охлаждение»). Конкретная
+  // ячейка приходит после «Начать размещение» (prepareGroupPlacementAction); рендер брони не создаёт.
+  source: string;
+  targetZone: string;
 }
 export interface Cooling {
   taskId: string;
@@ -163,26 +166,36 @@ function HandoffResponse({ handoffId }: { handoffId: string }) {
 // Пакет 11 (коррекция P1): бронь создаётся ТОЛЬКО по явному «Начать размещение» (клиентский вызов
 // prepareGroupPlacementAction). До успешной подготовки скан и ручное завершение недоступны. Повторное
 // «Начать размещение» идемпотентно возвращает ту же бронь. Ручной fallback использует ту же бронь.
+// TASK-006: компактная физическая задача — только команда «Разместить» и маршрут «<откуда> → <куда>».
+// Ни типа/статуса/времени задачи, ни title/description. Код целевой ячейки — самый заметный элемент.
 function PlacementBlock({ placement }: { placement: Placement }) {
   const [prep, prepareAct, preparing] = useActionState<PreparePlacementState, FormData>(prepareGroupPlacementAction, {});
-  if (!prep.cellCode) {
-    return (
-      <form action={prepareAct} className="flex flex-col gap-2">
-        <input type="hidden" name="taskId" value={placement.taskId} />
-        <p className="text-sm text-neutral-600">Зона «{placement.routeLabel}». Нажмите «Начать размещение» — система назначит конкретную ячейку.</p>
-        {prep.error && <p className="text-sm text-red-600">{prep.error}</p>}
-        <Button type="submit" variant="primary" disabled={preparing} className="w-full">
-          {preparing ? "Назначаем ячейку…" : prep.error ? "Повторить" : "Начать размещение"}
-        </Button>
-      </form>
-    );
-  }
+  const assigned = !!prep.cellCode;
+  const target = prep.cellCode ?? placement.targetZone;
   return (
-    <div className="flex flex-col gap-2">
-      <div className="rounded-xl bg-[#eef7ee] px-3 py-2 text-sm text-green-800">
-        Назначенная ячейка: <b>{prep.cellCode}</b> · зона «{placement.routeLabel}»
+    <div className="flex flex-col gap-3">
+      {/* Команда + маршрут (крупнее, но не hero). Цель — самый заметный элемент. */}
+      <div>
+        <div className="text-lg font-bold text-[#1a1a1a]">Разместить</div>
+        <div className="mt-1 flex min-w-0 items-center gap-2">
+          <span className="shrink-0 text-base text-neutral-500">{placement.source}</span>
+          <ArrowRight size={20} className="shrink-0 text-neutral-400" aria-hidden />
+          <span className={assigned
+            ? "min-w-0 truncate font-mono text-2xl font-extrabold tracking-tight text-[#1a1a1a]"
+            : "min-w-0 truncate text-lg font-semibold text-[#1a1a1a]"}>{target}</span>
+        </div>
       </div>
-      <PlaceGroupScanner placement={placement} assignedCellCode={prep.cellCode} />
+      {!assigned ? (
+        <form action={prepareAct} className="flex flex-col gap-2">
+          <input type="hidden" name="taskId" value={placement.taskId} />
+          {prep.error && <p role="alert" className="text-sm font-medium text-red-600">{prep.error}</p>}
+          <Button type="submit" variant="primary" disabled={preparing} className="w-full">
+            {preparing ? "Назначаем ячейку…" : prep.error ? "Повторить" : "Начать размещение"}
+          </Button>
+        </form>
+      ) : (
+        <PlaceGroupScanner placement={placement} assignedCellCode={prep.cellCode!} />
+      )}
     </div>
   );
 }
@@ -301,7 +314,16 @@ export function WorkerTasks({
       )}
 
       {/* TASK-005: карточку «Текущая задача» рендерим только когда задача есть */}
-      {current && (
+      {/* TASK-006: PLACE_GROUP «в работе» — компактная карточка (только команда и маршрут), без
+          title/description/TaskMeta/типа/статуса/времени. Остальные типы — прежний вид. */}
+      {current && placement && current.status === "IN_PROGRESS" ? (
+        <Card>
+          <CardTitle>Текущая задача</CardTitle>
+          <div className="rounded-xl border border-[#eee] p-3">
+            <PlacementBlock placement={placement} />
+          </div>
+        </Card>
+      ) : current && (
         <Card>
           <CardTitle>Текущая задача</CardTitle>
           <div className="rounded-xl border border-[#eee] p-3">
@@ -316,7 +338,6 @@ export function WorkerTasks({
                   <Button className="w-full">Открыть</Button>
                 </Link>
               )}
-              {placement && current.status === "IN_PROGRESS" && <PlacementBlock placement={placement} />}
               {cooling && current.status === "IN_PROGRESS" && <CoolingBlock cooling={cooling} />}
               {moveGroup && current.status === "IN_PROGRESS" && (
                 <>
