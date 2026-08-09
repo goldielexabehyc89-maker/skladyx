@@ -11,6 +11,7 @@ import {
   resolveControlShortage,
   resolveControlRemoval,
   completeOrderCorrection,
+  getControlOrderContext,
   OrderControlError,
 } from "@/lib/order-control";
 
@@ -21,6 +22,9 @@ export interface ControlActionState {
   error?: string;
   ok?: boolean;
   status?: string;
+  // UI-004: после успешной отметки товара клиент решает — авто-переход к скану следующего товара
+  // (остались непроверенные строки) или закрыть мастер и показать завершение проверки (все отмечены).
+  allMarked?: boolean;
 }
 
 const OFF: ControlActionState = { error: "Контроль заказов сейчас отключён" };
@@ -65,7 +69,8 @@ export async function markControlScanAction(_prev: ControlActionState, formData:
     return { error: msg(e) };
   }
   revalidatePath("/warehouse/tasks");
-  return { ok: true };
+  const ctx = await getControlOrderContext(s.companyId, taskId);
+  return { ok: true, allMarked: ctx?.allMarked ?? false };
 }
 
 // Сборщик разрешает НЕДОСТАЧУ: скан ожидаемого товара/группы + добавленное количество (без движения).

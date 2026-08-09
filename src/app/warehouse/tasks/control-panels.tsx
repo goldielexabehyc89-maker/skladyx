@@ -132,14 +132,22 @@ function ScanOrderManual({ taskId }: { taskId: string }) {
   );
 }
 
-// ── Контроль: пошагово (UI-004) — скан EAN товара → количество → тип/комментарий отдельным итогом ──
-// Одновременно виден только один шаг: сначала камера/ручной EAN, затем ТОЛЬКО поле количества,
-// затем итоговый шаг с необязательным типом расхождения и комментарием и подтверждением.
+// ── Контроль: строго пошагово (UI-004) — по одному полю на шаг ──
+// EAN → количество → тип/состояние → комментарий → итоговое подтверждение (без полей). После успешной
+// отметки: остались непроверенные строки → авто-переход к скану следующего EAN; все отмечены → закрыть
+// мастер и показать завершение. Ошибка сервера сохраняет EAN/количество/тип/комментарий (остаёмся на итоге).
+const TYPE_OPTIONS: { value: string; label: string }[] = [
+  { value: "", label: "без расхождения (по количеству)" },
+  { value: "EXCESS", label: "излишек / неожиданный товар" },
+  { value: "WRONG_ITEM", label: "не тот товар" },
+  { value: "DAMAGED", label: "повреждён" },
+  { value: "OTHER", label: "другое" },
+];
 function MarkGroupScanner({ taskId }: { taskId: string }) {
   const router = useRouter();
   const [open, setOpen] = useState(false);
   const [scanning, setScanning] = useState(false);
-  const [step, setStep] = useState<"product" | "qty" | "confirm">("product");
+  const [step, setStep] = useState<"product" | "qty" | "type" | "comment" | "confirm">("product");
   const [eanRaw, setEanRaw] = useState("");
   const [qty, setQty] = useState("");
   const [type, setType] = useState("");
@@ -148,6 +156,7 @@ function MarkGroupScanner({ taskId }: { taskId: string }) {
   const [error, setError] = useState<string | null>(null);
 
   function reset() { setStep("product"); setEanRaw(""); setQty(""); setType(""); setComment(""); }
+  function openScan() { setScanning(true); setStep("product"); }
   function handleScan(raw: string) {
     if (busy) return;
     const v = raw.trim();
@@ -157,7 +166,7 @@ function MarkGroupScanner({ taskId }: { taskId: string }) {
   function submitQty() {
     const n = Number(qty.replace(",", "."));
     if (!Number.isFinite(n) || n < 0) { setError("Укажите фактическое количество"); return; }
-    setStep("confirm");
+    setStep("type");
   }
   function submit() {
     const n = Number(qty.replace(",", "."));
@@ -167,23 +176,26 @@ function MarkGroupScanner({ taskId }: { taskId: string }) {
       fd.set("taskId", taskId); fd.set("ean", eanRaw); fd.set("countedQty", String(n));
       fd.set("discrepancyType", type); fd.set("comment", comment.trim());
       const res = await markControlScanAction({}, fd);
-      if (res.error) { setError(res.error); return; }
-      reset(); router.refresh();
+      if (res.error) { setError(res.error); return; } // остаёмся на итоге — EAN/кол-во/тип/коммент сохранены
+      router.refresh();
+      if (res.allMarked) { setOpen(false); reset(); }        // все строки отмечены → закрыть мастер
+      else { reset(); setScanning(true); }                    // остались строки → сразу скан следующего EAN
     });
   }
   const inputCls = "rounded-lg border border-[#e4e4f0] px-3 py-2 text-sm outline-none focus:border-brand";
+  const typeLabel = TYPE_OPTIONS.find((o) => o.value === type)?.label ?? "—";
   if (!open)
     return (
-      <Button type="button" variant="primary" onClick={() => { setOpen(true); setScanning(true); setStep("product"); }} className="w-full">
-        <ScanLine size={18} /> Проверить группу (сканирование)
+      <Button type="button" variant="primary" onClick={() => { setOpen(true); openScan(); }} className="w-full">
+        <ScanLine size={18} /> Проверить товар (сканирование)
       </Button>
     );
   return (
     <WorkflowSheet
-      title="Проверка группы"
-      subtitle={step === "product" ? "Шаг 1 · штрихкод товара" : step === "qty" ? "Шаг 2 · количество" : "Шаг 3 · итог"}
+      title="Проверка товара"
+      subtitle={step === "product" ? "Шаг 1 · штрихкод (EAN)" : step === "qty" ? "Шаг 2 · количество" : step === "type" ? "Шаг 3 · состояние" : step === "comment" ? "Шаг 4 · комментарий" : "Шаг 5 · подтверждение"}
       scanning={scanning}
-      scanHint="Сканируйте EAN товара"
+      scanHint="Сканируйте заводской штрихкод товара (EAN)"
       scanFormats={PRODUCT}
       manualPlaceholder="EAN товара (8/13 цифр)"
       manualInputMode="numeric"
@@ -194,29 +206,35 @@ function MarkGroupScanner({ taskId }: { taskId: string }) {
       onClose={() => { setOpen(false); setScanning(false); reset(); setError(null); }}
       error={error}
       onErrorRetry={() => setError(null)}
-      onErrorExit={() => { setError(null); setScanning(false); reset(); }}
+      onErrorExit={() => { setError(null); openScan(); }}
       footer={
         step === "qty" ? (
           <>
             <input autoFocus value={qty} onChange={(e) => setQty(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); submitQty(); } }} type="number" inputMode="decimal" step="1" placeholder="Фактическое количество" className={inputCls} />
             <Button type="button" variant="primary" onClick={submitQty} className="w-full">Дальше</Button>
-            <Button type="button" variant="ghost" onClick={() => { setScanning(true); setStep("product"); }} className="w-full">Назад</Button>
+            <Button type="button" variant="ghost" onClick={openScan} className="w-full">Назад</Button>
+          </>
+        ) : step === "type" ? (
+          <>
+            <select autoFocus value={type} onChange={(e) => setType(e.target.value)} className={inputCls}>
+              {TYPE_OPTIONS.map((o) => (<option key={o.value} value={o.value}>{o.label}</option>))}
+            </select>
+            <Button type="button" variant="primary" onClick={() => setStep("comment")} className="w-full">Дальше</Button>
+            <Button type="button" variant="ghost" onClick={() => setStep("qty")} className="w-full">Назад</Button>
+          </>
+        ) : step === "comment" ? (
+          <>
+            <input autoFocus value={comment} onChange={(e) => setComment(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); setStep("confirm"); } }} placeholder="комментарий (необязательно)" className={inputCls} />
+            <Button type="button" variant="primary" onClick={() => setStep("confirm")} className="w-full">Дальше</Button>
+            <Button type="button" variant="ghost" onClick={() => setStep("type")} className="w-full">Назад</Button>
           </>
         ) : step === "confirm" ? (
           <>
-            <select autoFocus value={type} onChange={(e) => setType(e.target.value)} className={inputCls}>
-              <option value="">авто (по количеству)</option>
-              <option value="EXCESS">излишек / неожиданный товар</option>
-              <option value="WRONG_ITEM">не тот товар</option>
-              <option value="DAMAGED">повреждён</option>
-              <option value="OTHER">другое</option>
-            </select>
-            <input value={comment} onChange={(e) => setComment(e.target.value)} placeholder="комментарий (необязательно)" className={inputCls} />
             <Button type="button" variant="primary" disabled={busy} onClick={submit} className="w-full">{busy ? "…" : "Отметить"}</Button>
-            <Button type="button" variant="ghost" onClick={() => setStep("qty")} className="w-full">Назад</Button>
+            <Button type="button" variant="ghost" onClick={() => setStep("comment")} className="w-full">Назад</Button>
           </>
         ) : (
-          <Button type="button" variant="primary" onClick={() => { setScanning(true); setStep("product"); }} className="w-full">
+          <Button type="button" variant="primary" onClick={openScan} className="w-full">
             <ScanLine size={18} /> Сканировать товар (EAN)
           </Button>
         )
@@ -225,10 +243,12 @@ function MarkGroupScanner({ taskId }: { taskId: string }) {
       {step !== "product" && (
         <div className="mb-1 rounded-lg bg-[#f7f8fc] px-3 py-2 text-sm">
           <div className="flex justify-between gap-2"><span className="text-neutral-500">Товар (EAN)</span><span className="font-mono text-xs">{eanRaw}</span></div>
-          {step === "confirm" && <div className="flex justify-between gap-2"><span className="text-neutral-500">Количество</span><span className="font-medium">{qty}</span></div>}
+          {(step === "type" || step === "comment" || step === "confirm") && <div className="flex justify-between gap-2"><span className="text-neutral-500">Количество</span><span className="font-medium">{qty}</span></div>}
+          {(step === "comment" || step === "confirm") && <div className="flex justify-between gap-2"><span className="text-neutral-500">Состояние</span><span className="font-medium">{typeLabel}</span></div>}
+          {step === "confirm" && comment.trim() && <div className="flex justify-between gap-2"><span className="text-neutral-500">Комментарий</span><span className="font-medium">{comment.trim()}</span></div>}
         </div>
       )}
-      <p className="text-sm text-neutral-500">Сканируйте каждый товар заказа и вводите фактическое количество. На итоговом шаге при необходимости отметьте тип расхождения.</p>
+      <p className="text-sm text-neutral-500">Сканируйте заводской штрихкод (EAN) каждого товара заказа и вводите фактическое количество. Неожиданный товар отметьте как «излишек» или «не тот товар».</p>
     </WorkflowSheet>
   );
 }
@@ -267,7 +287,7 @@ export function ControlOrderPanel({ ctx }: { ctx: ControlOrderCtx }) {
         </>
       ) : (
         <>
-          <div className="text-xs font-medium text-neutral-500">Строки заказа — проверьте каждую по QR</div>
+          <div className="text-xs font-medium text-neutral-500">Строки заказа — проверьте каждую по заводскому штрихкоду (EAN)</div>
           {ctx.lines.map((l) => {
             const marked = l.counted != null;
             const ok = marked && !l.discrepancyType;

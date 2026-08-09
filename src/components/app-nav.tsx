@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useSearchParams } from "next/navigation";
 import { clsx } from "clsx";
 import type { LucideIcon } from "lucide-react";
 import {
@@ -76,6 +76,18 @@ const TASKS_MONITOR: NavItem = { href: "/warehouse/tasks?view=monitor", label: "
 const RECEIVING_GROUP: NavItem = { href: "/warehouse/receiving", label: "Приёмка группами", icon: PackagePlus };
 
 const WORK_ROLES = ["RECEIVER", "LOADER", "PICKER", "CONTROLLER"] as const;
+
+// Активная ссылка. usePathname НЕ содержит query — для пунктов с ?view= (Мои задачи / Монитор задач)
+// сверяем и путь, и параметр view (useSearchParams). На /warehouse/tasks по умолчанию view=mine, поэтому
+// «Мои задачи» и «Монитор задач» никогда не подсвечиваются одновременно.
+function navIsActive(href: string, pathname: string, view: string | null): boolean {
+  const qi = href.indexOf("?");
+  if (qi === -1) return pathname.startsWith(href);
+  const path = href.slice(0, qi);
+  if (!pathname.startsWith(path)) return false;
+  const want = new URLSearchParams(href.slice(qi + 1)).get("view");
+  return (view ?? "mine") === want;
+}
 
 // Пакет 9B: пункты СТАРОГО интерфейса склада — скрываются при legacyUi=false (код страниц не удалён).
 const LEGACY_HREFS = new Set<string>([
@@ -170,6 +182,7 @@ function NavContent({
   onToggleCollapse?: () => void;
 }) {
   const pathname = usePathname();
+  const view = useSearchParams().get("view");
   const groups = groupsFor(role, activeShiftRole, canStartShift, tasksEnabled, canReceive, groupReceiving, legacyUi);
   const [loggingOut, setLoggingOut] = useState(false);
   // Пакет 10 (fix): server-logout очищает cookie, затем ПОЛНАЯ навигация на /login (window.location) —
@@ -224,7 +237,7 @@ function NavContent({
             )}
             <div className="flex flex-col gap-0.5">
               {g.items.map((item) => {
-                const active = pathname.startsWith(item.href);
+                const active = navIsActive(item.href, pathname, view);
                 const Icon = item.icon;
                 return (
                   <Link
@@ -232,6 +245,7 @@ function NavContent({
                     href={item.href}
                     onClick={onNavigate}
                     title={item.label}
+                    aria-current={active ? "page" : undefined}
                     className={itemClass(active)}
                   >
                     <Icon size={17} className="shrink-0" />
@@ -268,6 +282,7 @@ function NavContent({
 // Нижний таб-бар (только мобильный): главные разделы + «Ещё» с полным меню.
 function MobileTabBar({ role, activeShiftRole, tasksEnabled, groupReceiving, legacyUi, onMore }: { role: Role; activeShiftRole: Role | null; tasksEnabled: boolean; groupReceiving: boolean; legacyUi: boolean; onMore: () => void }) {
   const pathname = usePathname();
+  const view = useSearchParams().get("view");
   // ROLE-003: у рабочей роли главная вкладка — по активной смене (RECEIVER→Приёмка, иначе Задачи);
   // без смены — «Смена».
   const isLpc = !!activeShiftRole && (["LOADER", "PICKER", "CONTROLLER"] as string[]).includes(activeShiftRole);
@@ -314,12 +329,13 @@ function MobileTabBar({ role, activeShiftRole, tasksEnabled, groupReceiving, leg
     >
       <div className="grid grid-cols-4">
         {tabs.map((t) => {
-          const active = pathname.startsWith(t.href);
+          const active = navIsActive(t.href, pathname, view);
           const Icon = t.icon;
           return (
             <Link
               key={t.href}
               href={t.href}
+              aria-current={active ? "page" : undefined}
               className={clsx(
                 "flex min-h-14 flex-col items-center justify-center gap-1 whitespace-nowrap text-[11px] font-semibold",
                 active ? "text-[#4c5fd7]" : "text-neutral-500",

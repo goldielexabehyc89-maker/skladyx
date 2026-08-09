@@ -315,19 +315,72 @@ async function main() {
     ok("UI-004 CORRECT: открыт пошаговый лист", sh);
     ok("UI-004 CORRECT: на текущем шаге видно ≤1 поля", (await sheetFields()) <= 1, String(await sheetFields()));
   }
-  if (ids.controllerToken) {
-    await setAuth(ids.controllerToken); // контролёр с активной CONTROL_ORDER (скан заказа выполнен)
-    await goto("/warehouse/tasks", `document.body.innerText.includes("Проверить группу") || document.body.innerText.includes("Контроль заказа")`);
+  // CONTROL_ORDER: пройти весь мастер валидным EAN фикстуры — по одному полю на шаг, 0 на итоге,
+  // отметка успешна, авто-переход к следующей строке, закрытие после последней. И текст без «по QR».
+  if (ids.controllerToken && ids.ctrlEanA) {
+    await setViewport(false);
+    await setAuth(ids.controllerToken);
+    await goto("/warehouse/tasks", `document.body.innerText.includes("Проверить товар") || document.body.innerText.includes("Контроль заказа")`);
+    ok("UI-004 CONTROL: нет устаревшего текста «по QR»", !(await bodyText()).includes("по QR"));
     ok("UI-004 CONTROL: в панели нет inline-набора полей (0 select)", (await visIn('main select')) === 0);
     await sleep(1500);
-    await clickText(/Проверить группу/);
-    let sh2 = false; for (let i = 0; i < 40; i++) { if (await ev(`!!document.querySelector('[data-workflow-sheet]')`)) { sh2 = true; break; } await sleep(150); }
-    ok("UI-004 CONTROL: шаг скана — ≤1 поля", sh2 && (await sheetFields()) <= 1, String(await sheetFields()));
-    // ручной ввод EAN → шаг количества: только числовое поле, без select (тип/комментарий — отдельный итог)
-    await ev(`(()=>{const f=document.querySelector('[data-workflow-sheet] form'); if(!f) return 0; const i=f.querySelector('input'); const set=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(i),'value').set; set.call(i,'1'); i.dispatchEvent(new Event('input',{bubbles:true})); f.requestSubmit(); return 1;})()`);
-    let qtyStep = false; for (let i = 0; i < 40; i++) { if (await ev(`!!document.querySelector('[data-workflow-sheet] input[type="number"]')`)) { qtyStep = true; break; } await sleep(150); }
-    ok("UI-004 CONTROL: шаг количества — только число, без select (тип на отдельном шаге)",
-      qtyStep && (await visIn('[data-workflow-sheet] select')) === 0);
+    await clickText(/Проверить товар/);
+    const sheetUp = async () => { for (let i = 0; i < 40; i++) { if (await ev(`!!document.querySelector('[data-workflow-sheet]')`)) return true; await sleep(150); } return false; };
+    ok("UI-004 CONTROL: мастер открыт (шаг EAN)", (await sheetUp()) && (await sheetFields()) <= 1, String(await sheetFields()));
+    const setField = (val) => ev(`(()=>{const el=[...document.querySelectorAll('[data-workflow-sheet] input:not([type=hidden]),[data-workflow-sheet] select,[data-workflow-sheet] textarea')].find(e=>e.offsetParent!==null); if(!el) return 0; const set=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el),'value').set; set.call(el,${JSON.stringify(val)}); el.dispatchEvent(new Event('input',{bubbles:true})); el.dispatchEvent(new Event('change',{bubbles:true})); return 1;})()`);
+    const waitSel = async (sel) => { for (let i = 0; i < 30; i++) { if (await ev(`!!document.querySelector('${sel}')`)) return true; await sleep(150); } return false; };
+    // Пройти один товар по шагам; вернуть число полей на каждом шаге.
+    const markOne = async (ean) => {
+      await setField(ean); await clickText(/Ввести/);                       // EAN → количество
+      await waitSel('[data-workflow-sheet] input[type="number"]');
+      const qf = await sheetFields();
+      await setField("1"); await clickText(/Дальше/);                        // количество → состояние
+      await waitSel('[data-workflow-sheet] select');
+      const tf = await sheetFields();
+      await clickText(/Дальше/); await sleep(500);                           // состояние → комментарий
+      const cf = await sheetFields();
+      await clickText(/Дальше/); await sleep(500);                           // комментарий → итог
+      const ff = await sheetFields();
+      await clickText(/Отметить/); await sleep(1200);                        // отметка
+      return { qf, tf, cf, ff };
+    };
+    const r1 = await markOne(ids.ctrlEanA);
+    ok("UI-004 CONTROL: шаг «количество» — 1 поле", r1.qf === 1, String(r1.qf));
+    ok("UI-004 CONTROL: шаг «состояние» — 1 поле (select)", r1.tf === 1, String(r1.tf));
+    ok("UI-004 CONTROL: шаг «комментарий» — 1 поле", r1.cf === 1, String(r1.cf));
+    ok("UI-004 CONTROL: итоговый шаг — 0 полей", r1.ff === 0, String(r1.ff));
+    // 2 строки: после первой — авто-переход к скану следующего товара (мастер открыт, без «Сканировать товар»)
+    let advanced = false;
+    for (let i = 0; i < 40; i++) { if ((await ev(`!!document.querySelector('[data-workflow-sheet]')`)) && (await ev(`!!document.querySelector('[data-workflow-sheet] form input:not([type=hidden])')`))) { advanced = true; break; } await sleep(150); }
+    ok("UI-004 CONTROL: авто-переход к следующему товару (мастер открыт, скан активен)", advanced);
+    // вторая (последняя) строка → все отмечены → мастер закрывается, показывается завершение
+    await markOne(ids.ctrlEanB);
+    let closed = false;
+    for (let i = 0; i < 50; i++) { if (!(await ev(`!!document.querySelector('[data-workflow-sheet]')`))) { closed = true; break; } await sleep(200); }
+    ok("UI-004 CONTROL: после последней строки мастер закрыт (завершение проверки)", closed);
+  }
+
+  // ── P2 (aria-current): ссылки «Мои задачи» (?view=mine) и «Монитор задач» (?view=monitor) ──
+  const ariaCur = async (sel) => ev(`document.querySelector('${sel}')?.getAttribute('aria-current') ?? null`);
+  if (ids.adminLoadToken) {
+    await setViewport(false);
+    await setAuth(ids.adminLoadToken);
+    await goto("/warehouse/tasks?view=mine", `!!document.querySelector('aside a[href="/warehouse/tasks?view=mine"]')`);
+    ok("aria-current (desktop): mine активна на ?view=mine", (await ariaCur('aside a[href="/warehouse/tasks?view=mine"]')) === "page");
+    ok("aria-current (desktop): monitor НЕ активна на ?view=mine", (await ariaCur('aside a[href="/warehouse/tasks?view=monitor"]')) !== "page");
+    await goto("/warehouse/tasks?view=monitor", `!!document.querySelector('aside a[href="/warehouse/tasks?view=monitor"]')`);
+    ok("aria-current (desktop): monitor активна на ?view=monitor", (await ariaCur('aside a[href="/warehouse/tasks?view=monitor"]')) === "page");
+    ok("aria-current (desktop): mine НЕ активна на ?view=monitor", (await ariaCur('aside a[href="/warehouse/tasks?view=mine"]')) !== "page");
+    // mobile
+    await setViewport(true);
+    await goto("/warehouse/tasks?view=mine", `!!document.querySelector('nav a[href="/warehouse/tasks?view=mine"]')`);
+    ok("aria-current (моб): mine активна на ?view=mine", (await ariaCur('nav a[href="/warehouse/tasks?view=mine"]')) === "page");
+  }
+  if (ids.adminToken) {
+    await setViewport(true);
+    await setAuth(ids.adminToken);
+    await goto("/warehouse/tasks?view=monitor", `!!document.querySelector('nav a[href="/warehouse/tasks?view=monitor"]')`);
+    ok("aria-current (моб): monitor активна на ?view=monitor", (await ariaCur('nav a[href="/warehouse/tasks?view=monitor"]')) === "page");
   }
 
   console.log(failures === 0 ? "\nE2E RELEASE OK ✓" : `\nПРОВАЛЕНО: ${failures}`);

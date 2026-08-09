@@ -152,13 +152,24 @@ async function main() {
   //    (контролёр) «в работе», чтобы browser-e2e проверил ПОШАГОВОСТЬ этих панелей. Отдельный товар
   //    и ячейки — существующие остатки/история главной фикстуры не затрагиваются. Движки те же, что
   //    в verify-order-control (доказанно детерминированы на свежей БД).
-  const ctlItemName = "CI Контроль-товар";
-  let ctlItem = await prisma.item.findFirst({ where: { companyId, name: ctlItemName } });
-  if (!ctlItem) ctlItem = await prisma.item.create({ data: { companyId, name: ctlItemName, uomId: uom.id, tracking: "LOT" } });
-  const CTRL_EAN = ean13("460000000201");
-  if (!(await prisma.itemBarcode.findFirst({ where: { companyId, code: CTRL_EAN } })))
-    await prisma.itemBarcode.create({ data: { companyId, itemId: ctlItem.id, code: CTRL_EAN, symbology: "EAN13", source: "MANUAL", isActive: true } });
-  const ctrlCells = ["CI-CTRL-01", "CI-CTRL-02"];
+  // Два контрольных товара (для 2-строчного заказа контроля: авто-переход между строками в мастере).
+  const ctlItemA = await (async () => {
+    let it = await prisma.item.findFirst({ where: { companyId, name: "CI Контроль-товар A" } });
+    if (!it) it = await prisma.item.create({ data: { companyId, name: "CI Контроль-товар A", uomId: uom.id, tracking: "LOT" } });
+    return it;
+  })();
+  const ctlItemB = await (async () => {
+    let it = await prisma.item.findFirst({ where: { companyId, name: "CI Контроль-товар B" } });
+    if (!it) it = await prisma.item.create({ data: { companyId, name: "CI Контроль-товар B", uomId: uom.id, tracking: "LOT" } });
+    return it;
+  })();
+  const CTRL_EAN_A = ean13("460000000201");
+  const CTRL_EAN_B = ean13("460000000202");
+  const eanByItem = new Map<string, string>([[ctlItemA.id, CTRL_EAN_A], [ctlItemB.id, CTRL_EAN_B]]);
+  for (const [it, code] of [[ctlItemA.id, CTRL_EAN_A], [ctlItemB.id, CTRL_EAN_B]] as [string, string][])
+    if (!(await prisma.itemBarcode.findFirst({ where: { companyId, code } })))
+      await prisma.itemBarcode.create({ data: { companyId, itemId: it, code, symbology: "EAN13", source: "MANUAL", isActive: true } });
+  const ctrlCells = ["CI-CTRL-01", "CI-CTRL-02", "CI-CTRL-03"];
   for (const code of ctrlCells)
     if (!(await prisma.cell.findFirst({ where: { companyId, warehouseId: wh.id, code } })))
       await createCellsInZone({ companyId, warehouseId: wh.id, zoneId: storage.id, codes: [code], level: 1 });
@@ -168,21 +179,22 @@ async function main() {
   await ensureShift(pkA, "PICKER");
 
   let ctrlSeq = 0;
-  const seedCtrlGroup = async (cellCode: string, qty: number) => {
+  const seedCtrlGroup = async (itemId: string, cellCode: string, qty: number) => {
     const cellRow = await prisma.cell.findFirstOrThrow({ where: { companyId, warehouseId: wh.id, code: cellCode } });
     const number = 992000 + ++ctrlSeq;
     const receipt = await prisma.receipt.create({ data: { companyId, number, warehouseId: wh.id, status: "POSTED", postedAt: new Date(), note: "CI control seed", createdById: pkA } });
-    const line = await prisma.receiptLine.create({ data: { companyId, receiptId: receipt.id, itemId: ctlItem.id, qty } });
-    const lot = await prisma.lot.create({ data: { companyId, itemId: ctlItem.id, receiptLineId: line.id, qtyReceived: qty } });
-    await prisma.$transaction((tx) => applyLotMovement(tx, { companyId, docType: "RECEIPT", docId: receipt.id, itemId: ctlItem.id, lotId: lot.id, qty, from: null, to: { kind: "cell", warehouseId: wh.id, cellId: cellRow.id }, createdById: pkA }));
-    const grpRow = await prisma.handlingGroup.create({ data: { companyId, warehouseId: wh.id, itemId: ctlItem.id, lotId: lot.id, qty, temperature: 0, thresholdX: 5, status: "IN_STORAGE", dedupeKey: `ci-ctrl-${number}`, acceptedById: pkA } });
+    const line = await prisma.receiptLine.create({ data: { companyId, receiptId: receipt.id, itemId, qty } });
+    const lot = await prisma.lot.create({ data: { companyId, itemId, receiptLineId: line.id, qtyReceived: qty } });
+    await prisma.$transaction((tx) => applyLotMovement(tx, { companyId, docType: "RECEIPT", docId: receipt.id, itemId, lotId: lot.id, qty, from: null, to: { kind: "cell", warehouseId: wh.id, cellId: cellRow.id }, createdById: pkA }));
+    const grpRow = await prisma.handlingGroup.create({ data: { companyId, warehouseId: wh.id, itemId, lotId: lot.id, qty, temperature: 0, thresholdX: 5, status: "IN_STORAGE", dedupeKey: `ci-ctrl-${number}`, acceptedById: pkA } });
     await prisma.$transaction((tx) => createQrIn(tx, { companyId, type: "GROUP", refId: grpRow.id }));
   };
   const cellCodeQr = async (cellId: string) => (await prisma.qrCode.findFirstOrThrow({ where: { type: "CELL", refId: cellId } })).code;
-  // импорт → резерв → сборка до IN_CONTROL; возвращает orderId (сборку ведёт фактически назначенный сборщик)
-  const pickToControl = async (externalId: string, cellCode: string) => {
-    await seedCtrlGroup(cellCode, 1);
-    const impO = await importExternalOrder({ companyId, warehouseId: wh.id, externalId, createdById: pkA, arrivalAt: null, lines: [{ externalLineId: "1", itemId: ctlItem.id, requiredQty: 1 }] });
+  const groupEan = async (gid: string) => eanByItem.get((await prisma.handlingGroup.findFirstOrThrow({ where: { id: gid } })).itemId)!;
+  // импорт → резерв → сборка до IN_CONTROL; lines: [{itemId, cell}]. Возвращает orderId.
+  const pickToControl = async (externalId: string, lines: { itemId: string; cell: string }[]) => {
+    for (const l of lines) await seedCtrlGroup(l.itemId, l.cell, 1);
+    const impO = await importExternalOrder({ companyId, warehouseId: wh.id, externalId, createdById: pkA, arrivalAt: null, lines: lines.map((l, i) => ({ externalLineId: String(i + 1), itemId: l.itemId, requiredQty: 1 })) });
     await reserveAndPlanOrder({ companyId, orderId: impO.orderId, userId: pkA });
     let pt = await prisma.workflowTask.findFirst({ where: { type: "PICK_ORDER", subjectId: impO.orderId } });
     if (pt && pt.status === "QUEUED") { await rebalanceQueuedTasks(companyId, { warehouseId: wh.id }); pt = await prisma.workflowTask.findUniqueOrThrow({ where: { id: pt.id } }); }
@@ -192,7 +204,7 @@ async function main() {
     for (let i = 0; i < 20; i++) {
       const r = await prisma.stockReservation.findFirst({ where: { orderId: impO.orderId, status: "ACTIVE" } });
       if (!r) break;
-      await pickOrderScan({ companyId, userId: picker, taskId: pt.id, cellCode: await cellCodeQr(r.cellId!), ean: CTRL_EAN, qty: r.qty.toNumber() });
+      await pickOrderScan({ companyId, userId: picker, taskId: pt.id, cellCode: await cellCodeQr(r.cellId!), ean: await groupEan(r.handlingGroupId!), qty: r.qty.toNumber() });
     }
     return impO.orderId;
   };
@@ -207,12 +219,13 @@ async function main() {
 
   // Оба заказа собираем ПЕРВЫМИ (пока у сборщика нет срочной задачи — иначе срочная CORRECT_ORDER
   // заблокировала бы старт обычной сборки того же сборщика). Затем контроль обоих.
-  const o1 = await pickToControl("EO-CI-CORR", ctrlCells[0]);
-  const o2 = await pickToControl("EO-CI-CTRL", ctrlCells[1]);
+  // Заказ #1 (CORRECT) — 1 строка; заказ #2 (CONTROL, «в работе») — 2 строки для проверки авто-перехода.
+  const o1 = await pickToControl("EO-CI-CORR", [{ itemId: ctlItemA.id, cell: ctrlCells[0] }]);
+  const o2 = await pickToControl("EO-CI-CTRL", [{ itemId: ctlItemA.id, cell: ctrlCells[1] }, { itemId: ctlItemB.id, cell: ctrlCells[2] }]);
 
   // Заказ #1 → контроль с недостачей → FAILED → CORRECT_ORDER сборщику (пока ASSIGNED).
   const ct1 = await startCtl(o1);
-  await markOrderControlByScan({ companyId, userId: ctlU, taskId: ct1, ean: CTRL_EAN, countedQty: 0, discrepancyType: null }); // недостача
+  await markOrderControlByScan({ companyId, userId: ctlU, taskId: ct1, ean: CTRL_EAN_A, countedQty: 0, discrepancyType: null }); // недостача
   await finishOrderControl({ companyId, userId: ctlU, taskId: ct1 });
   const corr1 = await prisma.workflowTask.findFirstOrThrow({ where: { type: "CORRECT_ORDER", subjectId: o1 }, orderBy: { createdAt: "desc" } });
   const correctPickerId = corr1.assignedUserId!;
@@ -271,6 +284,8 @@ async function main() {
     adminLoadToken,
     controllerToken,
     correctToken,
+    ctrlEanA: CTRL_EAN_A,
+    ctrlEanB: CTRL_EAN_B,
   }));
   process.exit(0);
 }
