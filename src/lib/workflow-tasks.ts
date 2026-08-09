@@ -361,6 +361,16 @@ export async function cancelWorkflowTask(taskId: string): Promise<void> {
       if (activeMove)
         throw new EngineError("Активную перестановку нельзя отменить — завершите физическое перемещение группы");
     }
+    // Пакет 11 (коррекция): первичное размещение с назначенной ячейкой (активная бронь по задаче)
+    // нельзя отменить generic-отменой — иначе бронь осиротеет. Нужно завершить размещение.
+    if (t.type === "PLACE_GROUP") {
+      const activePlace = await tx.cellReservation.findFirst({
+        where: { taskId: t.id, status: "ACTIVE" },
+        select: { id: true },
+      });
+      if (activePlace)
+        throw new EngineError("Размещение с назначенной ячейкой нельзя отменить — завершите размещение группы");
+    }
     // Незавершённую (PENDING) передачу закрываем в ЭТОЙ ЖЕ транзакции — иначе устаревшая
     // передача могла бы «воскресить» отменённую задачу при accept/reject.
     await tx.taskHandoff.updateMany({

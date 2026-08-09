@@ -76,6 +76,7 @@ jobs:
           $V scripts/verify-legacy-guard.ts
           $V scripts/verify-stock-grouped.ts
           WORKFLOW_TASKS_ENABLED=true GROUP_RECEIVING_ENABLED=true $V scripts/verify-group-receiving.ts
+          WORKFLOW_TASKS_ENABLED=true GROUP_RECEIVING_ENABLED=true COOLING_WORKFLOW_ENABLED=true $V scripts/verify-place-group.ts
           WORKFLOW_TASKS_ENABLED=true GROUP_RECEIVING_ENABLED=true COOLING_WORKFLOW_ENABLED=true $V scripts/verify-cooling.ts
           WORKFLOW_TASKS_ENABLED=true EXTERNAL_ORDER_PICKING_ENABLED=true $V scripts/verify-external-orders.ts
           WORKFLOW_TASKS_ENABLED=true EXTERNAL_ORDER_PICKING_ENABLED=true $V scripts/verify-order-control.ts

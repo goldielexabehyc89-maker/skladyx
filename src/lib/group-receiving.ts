@@ -38,24 +38,6 @@ async function cellIsBusy(tx: Tx, cellId: string): Promise<boolean> {
   return !!bal || !!unit;
 }
 
-// минимальный уровень среди СВОБОДНЫХ активных STORAGE-ячеек склада (пустых и не зарезервированных
-// под охлаждение), или null. Пакет 5: активная бронь исключает ячейку из «есть свободная ниже».
-async function lowestEmptyStorageLevel(tx: Tx, companyId: string, warehouseId: string): Promise<number | null> {
-  const cells = await tx.cell.findMany({
-    where: { companyId, warehouseId, isActive: true, level: { not: null }, zone: { kind: "STORAGE" } },
-    select: { id: true, level: true },
-  });
-  if (cells.length === 0) return null;
-  const ids = cells.map((c) => c.id);
-  const [busyBal, busyUnit, reserved] = await Promise.all([
-    tx.stockBalance.findMany({ where: { cellId: { in: ids }, qty: { gt: 0 } }, select: { cellId: true } }),
-    tx.itemUnit.findMany({ where: { cellId: { in: ids } }, select: { cellId: true } }),
-    tx.cellReservation.findMany({ where: { cellId: { in: ids }, status: "ACTIVE" }, select: { cellId: true } }),
-  ]);
-  const busy = new Set<string>([...busyBal.map((b) => b.cellId!), ...busyUnit.map((u) => u.cellId!), ...reserved.map((r) => r.cellId)]);
-  const levels = cells.filter((c) => !busy.has(c.id)).map((c) => c.level!);
-  return levels.length ? Math.min(...levels) : null;
-}
 
 // ── Создание группы (идемпотентно по dedupeKey, атомарно) ──
 export async function createHandlingGroup(input: {
@@ -197,6 +179,82 @@ export async function createHandlingGroup(input: {
   return { groupId: out.groupId, created: out.created, status: out.status, qrCode: out.qrCode, taskId: out.taskId };
 }
 
+// Пакет 11 (коррекция): выбор ОДНОЙ конкретной целевой ячейки для размещения (в транзакции).
+// STORAGE — активная пустая ячейка минимального доступного уровня, затем code ASC; COOLING — активная
+// пустая COOLING-ячейка, code ASC. Исключаются: остаток qty>0, поштучные единицы, любые активные брони.
+async function pickPlacementCellInTx(
+  tx: Tx,
+  companyId: string,
+  warehouseId: string,
+  kind: "STORAGE" | "COOLING",
+): Promise<{ id: string; code: string } | null> {
+  const cells = await tx.cell.findMany({
+    where: { companyId, warehouseId, isActive: true, zone: { kind }, ...(kind === "STORAGE" ? { level: { not: null } } : {}) },
+    select: { id: true, code: true, level: true },
+  });
+  if (cells.length === 0) return null;
+  const ids = cells.map((c) => c.id);
+  const [bal, unit, reserved] = await Promise.all([
+    tx.stockBalance.findMany({ where: { cellId: { in: ids }, qty: { gt: 0 } }, select: { cellId: true } }),
+    tx.itemUnit.findMany({ where: { cellId: { in: ids } }, select: { cellId: true } }),
+    tx.cellReservation.findMany({ where: { cellId: { in: ids }, status: "ACTIVE" }, select: { cellId: true } }),
+  ]);
+  const busy = new Set<string>([...bal.map((b) => b.cellId!), ...unit.map((u) => u.cellId!), ...reserved.map((r) => r.cellId)]);
+  const free = cells.filter((c) => !busy.has(c.id));
+  if (free.length === 0) return null;
+  free.sort((a, b) => {
+    if (kind === "STORAGE") {
+      const dl = (a.level ?? 0) - (b.level ?? 0);
+      if (dl !== 0) return dl;
+    }
+    return a.code < b.code ? -1 : a.code > b.code ? 1 : 0;
+  });
+  return { id: free[0].id, code: free[0].code };
+}
+
+// Пакет 11 (коррекция): назначение целевой ячейки при ОТКРЫТИИ размещения (а не при приёмке — так
+// ячейка не занята бронью, пока задача в очереди). Идемпотентно: повторный вызов возвращает ту же
+// назначенную ячейку без второй брони (по taskId). Выбор и бронь — атомарно под lockCompany + lockCell.
+export async function prepareGroupPlacement(input: {
+  companyId: string;
+  userId: string;
+  taskId: string;
+}): Promise<{ cellId: string; cellCode: string }> {
+  return prisma.$transaction(async (tx) => {
+    await lockCompany(tx, input.companyId);
+    const task = await tx.workflowTask.findFirst({ where: { id: input.taskId, companyId: input.companyId } });
+    if (!task) throw new GroupError("Задача не найдена");
+    if (task.type !== "PLACE_GROUP") throw new GroupError("Это не задача размещения группы");
+    if (task.assignedUserId !== input.userId || task.status !== "IN_PROGRESS")
+      throw new GroupError("Назначить ячейку может только назначенный исполнитель с задачей «в работе»");
+    const group = await tx.handlingGroup.findFirst({ where: { id: task.subjectId ?? "", companyId: input.companyId } });
+    if (!group) throw new GroupError("Группа не найдена");
+    if (group.status !== "AWAITING_STORAGE" && group.status !== "AWAITING_COOLING")
+      throw new GroupError("Группа уже размещена");
+    const kind = group.status === "AWAITING_STORAGE" ? "STORAGE" : "COOLING";
+
+    // идемпотентность: активная бронь по этой задаче уже есть → возвращаем ту же ячейку
+    const existing = await tx.cellReservation.findFirst({ where: { taskId: task.id, status: "ACTIVE" } });
+    if (existing) {
+      const c = await tx.cell.findFirst({ where: { id: existing.cellId, companyId: input.companyId }, select: { code: true } });
+      return { cellId: existing.cellId, cellCode: c?.code ?? "" };
+    }
+
+    const picked = await pickPlacementCellInTx(tx, input.companyId, group.warehouseId, kind);
+    if (!picked)
+      throw new GroupError(kind === "STORAGE" ? "Нет свободной ячейки хранения для размещения" : "Нет свободной ячейки охлаждения для размещения");
+    await lockCell(tx, input.companyId, picked.id);
+    // повторная проверка под локом: ячейка свободна и не забронирована
+    if (await cellIsBusy(tx, picked.id)) throw new GroupError("Выбранная ячейка только что занята — повторите");
+    const taken = await tx.cellReservation.findFirst({ where: { cellId: picked.id, status: "ACTIVE" }, select: { id: true } });
+    if (taken) throw new GroupError("Выбранная ячейка только что забронирована — повторите");
+    await tx.cellReservation.create({
+      data: { companyId: input.companyId, warehouseId: group.warehouseId, cellId: picked.id, handlingGroupId: group.id, taskId: task.id, status: "ACTIVE" },
+    });
+    return { cellId: picked.id, cellCode: picked.code };
+  });
+}
+
 // ── Завершение размещения погрузчиком (атомарно) ──
 export async function completeGroupPlacement(input: {
   companyId: string;
@@ -225,83 +283,60 @@ export async function completeGroupPlacement(input: {
       throw new GroupError("Группа уже размещена");
     const targetKind = group.status === "AWAITING_STORAGE" ? "STORAGE" : "COOLING";
 
-    // Пакет 9B: целевую ячейку определяем ТОЛЬКО по отсканированному коду (QR/Code128), а не по
-    // присланному id — сервер резолвит код в ячейку и проверяет её принадлежность складу/зоне.
-    const scannedCellCode = parseScannedCode(input.cellCode);
-    if (!scannedCellCode) throw new GroupError("Неверный код ячейки");
-    const cellQr = await tx.qrCode.findUnique({ where: { code: scannedCellCode } });
+    // Пакет 11 (коррекция): целевую ячейку НЕ выбирает погрузчик — она назначена заранее
+    // (prepareGroupPlacement) и держится активной бронью по ЭТОЙ задаче. Отсканированный код обязан
+    // совпасть с назначенной ячейкой; любая другая (даже свободная и подходящая) — отклоняется.
+    const reservation = await tx.cellReservation.findFirst({ where: { taskId: task.id, status: "ACTIVE" } });
+    if (!reservation) throw new GroupError("Ячейка не назначена — откройте размещение заново");
+    const scannedCode = parseScannedCode(input.cellCode);
+    if (!scannedCode) throw new GroupError("Неверный код ячейки");
+    const cellQr = await tx.qrCode.findUnique({ where: { code: scannedCode } });
     if (!cellQr || cellQr.companyId !== input.companyId || cellQr.type !== "CELL")
       throw new GroupError("Это не код ячейки этой организации");
-    // целевая ячейка: та же компания+склад, активная, физическая нужного kind
+    if (cellQr.refId !== reservation.cellId) throw new GroupError("Отсканирована не назначенная ячейка");
+
     const cell = await tx.cell.findFirst({
-      where: { id: cellQr.refId, companyId: input.companyId, warehouseId: group.warehouseId },
+      where: { id: reservation.cellId, companyId: input.companyId, warehouseId: group.warehouseId },
       include: { zone: true },
     });
-    if (!cell) throw new GroupError("Ячейка не найдена на этом складе");
-    if (!cell.isActive) throw new GroupError("Ячейка отключена");
+    if (!cell) throw new GroupError("Назначенная ячейка не найдена");
+    if (!cell.isActive) throw new GroupError("Назначенная ячейка отключена");
     if (!cell.zone || cell.zone.kind !== targetKind)
-      throw new GroupError(targetKind === "STORAGE" ? "Нужна ячейка зоны хранения" : "Нужна ячейка зоны охлаждения");
+      throw new GroupError(targetKind === "STORAGE" ? "Назначенная ячейка не в зоне хранения" : "Назначенная ячейка не в зоне охлаждения");
 
-    // пустая (одна ячейка — одна группа). Берём per-cell advisory-lock ДО проверки занятости —
-    // тем же ключом, что и старые операции (assertCellNotHeldByGroup), — чтобы исключить гонку.
+    // повторная проверка занятости под локом (бронь держит ячейку, но подстрахуемся от гонок)
     await lockCell(tx, input.companyId, cell.id);
-    if (await cellIsBusy(tx, cell.id)) throw new GroupError("Ячейка занята — выберите пустую");
+    if (await cellIsBusy(tx, cell.id)) throw new GroupError("Назначенная ячейка занята — размещение отменено");
 
     // Пакет 5: группа > X при включённом флаге охлаждения — стартуем сессию охлаждения
-    // (перенос RECEIVING→COOLING, резерв ур.3+, срочная отложенная задача забора), а не просто IN_COOLING.
+    // (перенос RECEIVING→COOLING, верхний резерв ур.3+, срочная задача забора).
     if (targetKind === "COOLING" && coolingWorkflowEnabled()) {
-      const { taskRes } = await startCoolingInTx(tx, {
-        companyId: input.companyId,
-        group,
-        coolingCellId: cell.id,
-        userId: input.userId,
-      });
+      const { taskRes } = await startCoolingInTx(tx, { companyId: input.companyId, group, coolingCellId: cell.id, userId: input.userId });
+      // освобождаем бронь ПЕРВИЧНОГО размещения (по задаче); верхний резерв CoolingSession — отдельная
+      // бронь (sessionId, без handlingGroupId), её не трогаем.
+      await tx.cellReservation.update({ where: { id: reservation.id }, data: { status: "RELEASED", releasedAt: new Date() } });
       const unblocked = await completeWorkflowTaskInTransaction(tx, task.id);
       return { companyId: input.companyId, warehouseId: group.warehouseId, title: task.title, taskId: task.id, unblocked, coolingTaskRes: taskRes as TaskCreateResult | null, groupId: group.id, cellCode: cell.code, targetKind };
     }
 
-    // STORAGE: нижний доступный уровень + ячейка не должна быть зарезервирована под охлаждение.
-    if (targetKind === "STORAGE") {
-      if (cell.level == null) throw new GroupError("У ячейки хранения не настроен уровень");
-      const reserved = await tx.cellReservation.findFirst({ where: { cellId: cell.id, status: "ACTIVE" }, select: { id: true } });
-      if (reserved) throw new GroupError("Ячейка зарезервирована под охлаждение — выберите другую");
-      const minLevel = await lowestEmptyStorageLevel(tx, input.companyId, group.warehouseId);
-      if (minLevel != null && cell.level > minLevel)
-        throw new GroupError(`Есть свободная ячейка ниже (уровень ${minLevel}). Разместите там.`);
-    }
-
-    // полный перенос остатка группы из зоны RECEIVING → ячейку (через ядро)
-    const receiving = await tx.warehouseZone.findFirst({
-      where: { companyId: input.companyId, warehouseId: group.warehouseId, kind: "RECEIVING" },
-    });
+    // Прямое размещение (STORAGE, либо COOLING при выключенном флаге охлаждения — простой IN_COOLING
+    // без сессии): полный перенос остатка группы RECEIVING → назначенную ячейку (через ядро).
+    const receiving = await tx.warehouseZone.findFirst({ where: { companyId: input.companyId, warehouseId: group.warehouseId, kind: "RECEIVING" } });
     if (!receiving) throw new GroupError("На складе нет системной зоны приёмки");
-    const recvBal = await tx.stockBalance.findFirst({
-      where: { lotId: group.lotId, locKey: `Z:${receiving.id}`, qty: { gt: 0 } },
-    });
+    const recvBal = await tx.stockBalance.findFirst({ where: { lotId: group.lotId, locKey: `Z:${receiving.id}`, qty: { gt: 0 } } });
     if (!recvBal) throw new GroupError("Остаток группы в зоне приёмки не найден");
     // Группа неделима: остаток в RECEIVING должен ТОЧНО равняться количеству группы.
-    // Иначе (частичный расход/доп. приход в ту же зону) — отменяем, не размещаем «что нашлось».
     if (!recvBal.qty.equals(group.qty))
       throw new GroupError("Остаток группы в зоне приёмки не совпадает с её количеством — размещение отменено");
 
     await applyLotMovement(tx, {
-      companyId: input.companyId,
-      docType: "TRANSFER",
-      docId: group.id,
-      itemId: group.itemId,
-      lotId: group.lotId,
-      qty: group.qty,
+      companyId: input.companyId, docType: "TRANSFER", docId: group.id, itemId: group.itemId, lotId: group.lotId, qty: group.qty,
       from: { kind: "zone", warehouseId: group.warehouseId, zoneId: receiving.id },
       to: { kind: "cell", warehouseId: group.warehouseId, cellId: cell.id },
       createdById: input.userId,
     });
-
-    await tx.handlingGroup.update({
-      where: { id: group.id },
-      data: { status: targetKind === "STORAGE" ? "IN_STORAGE" : "IN_COOLING" },
-    });
-
-    // завершить задачу (+ разблокировать зависимости)
+    await tx.handlingGroup.update({ where: { id: group.id }, data: { status: targetKind === "STORAGE" ? "IN_STORAGE" : "IN_COOLING" } });
+    await tx.cellReservation.update({ where: { id: reservation.id }, data: { status: "RELEASED", releasedAt: new Date() } });
     const unblocked = await completeWorkflowTaskInTransaction(tx, task.id);
     return { companyId: input.companyId, warehouseId: group.warehouseId, title: task.title, taskId: task.id, unblocked, coolingTaskRes: null as TaskCreateResult | null, groupId: group.id, cellCode: cell.code, targetKind };
   });
@@ -325,35 +360,3 @@ export async function completeGroupPlacement(input: {
   return { warehouseId: res.warehouseId };
 }
 
-// ── Список подходящих пустых ячеек для размещения (UI) ──
-export async function eligibleCellsForGroup(
-  companyId: string,
-  warehouseId: string,
-  status: HandlingGroupStatus,
-): Promise<{ id: string; code: string; level: number | null; recommended: boolean }[]> {
-  const kind = status === "AWAITING_STORAGE" ? "STORAGE" : status === "AWAITING_COOLING" ? "COOLING" : null;
-  if (!kind) return [];
-  const cells = await prisma.cell.findMany({
-    where: { companyId, warehouseId, isActive: true, zone: { kind } },
-    select: { id: true, code: true, level: true },
-  });
-  if (cells.length === 0) return [];
-  const ids = cells.map((c) => c.id);
-  const [busyBal, busyUnit, reserved] = await Promise.all([
-    prisma.stockBalance.findMany({ where: { cellId: { in: ids }, qty: { gt: 0 } }, select: { cellId: true } }),
-    prisma.itemUnit.findMany({ where: { cellId: { in: ids } }, select: { cellId: true } }),
-    prisma.cellReservation.findMany({ where: { cellId: { in: ids }, status: "ACTIVE" }, select: { cellId: true } }),
-  ]);
-  // Пакет 5: зарезервированные под охлаждение ячейки не предлагаем для прямого размещения.
-  const busy = new Set<string>([...busyBal.map((b) => b.cellId!), ...busyUnit.map((u) => u.cellId!), ...reserved.map((r) => r.cellId)]);
-  let empty = cells.filter((c) => !busy.has(c.id));
-  if (kind === "STORAGE") empty = empty.filter((c) => c.level != null); // для STORAGE нужен уровень
-  empty.sort((a, b) => {
-    if (kind === "STORAGE") {
-      const dl = (a.level ?? 0) - (b.level ?? 0);
-      if (dl !== 0) return dl;
-    }
-    return a.code < b.code ? -1 : a.code > b.code ? 1 : 0;
-  });
-  return empty.map((c, i) => ({ id: c.id, code: c.code, level: c.level, recommended: i === 0 }));
-}

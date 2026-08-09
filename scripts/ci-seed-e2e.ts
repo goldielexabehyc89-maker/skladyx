@@ -27,6 +27,7 @@ function ean13(b12: string): string { let s = 0; for (let i = b12.length - 1, k 
 
 const WH_NAME = "CI-E2E";
 const CELL_CODE = "CI-A-01-01";
+const CELL_CODE_2 = "CI-A-01-02";
 const EAN = ean13("460000000001"); // валидная контрольная цифра
 const ITEM_NAME = "CI Тест-товар";
 const ORDER_EXT = "EO-CI-001";
@@ -94,6 +95,20 @@ async function main() {
   const imp = await importExternalOrder({ companyId, warehouseId: wh.id, externalId: ORDER_EXT, createdById: loader, arrivalAt: null, lines: [{ externalLineId: "1", itemId: item.id, requiredQty: QTY }] });
   await reserveAndPlanOrder({ companyId, orderId: imp.orderId, userId: loader });
 
+  // 4) вторая группа для UI-проверки НОВОГО сценария размещения: остаётся AWAITING_STORAGE с задачей
+  // PLACE_GROUP «в работе» у погрузчика → экран задач должен показать «Назначенная ячейка: <код>».
+  if (!(await prisma.cell.findFirst({ where: { companyId, warehouseId: wh.id, code: CELL_CODE_2 } })))
+    await createCellsInZone({ companyId, warehouseId: wh.id, zoneId: storage.id, codes: [CELL_CODE_2], level: 1 });
+  const grp2 = await createHandlingGroup({ companyId, warehouseId: wh.id, itemId: item.id, qty: QTY, temperature: 4, acceptedById: receiver, dedupeKey: "ci-e2e-recv-2" });
+  const g2 = await prisma.handlingGroup.findUniqueOrThrow({ where: { id: grp2.groupId } });
+  if (g2.status === "AWAITING_STORAGE") {
+    const place2 = await prisma.workflowTask.findFirstOrThrow({ where: { subjectId: grp2.groupId, type: "PLACE_GROUP" } });
+    if (place2.status !== "IN_PROGRESS") {
+      await prisma.workflowTask.update({ where: { id: place2.id }, data: { assignedUserId: loader, assignedShiftId: (await prisma.workShift.findFirstOrThrow({ where: { userId: loader, endedAt: null } })).id, status: "ASSIGNED" } });
+      await startWorkflowTask(loader, companyId, place2.id);
+    }
+  }
+
   // проверка целостности созданного состояния
   const bal = await prisma.stockBalance.findFirstOrThrow({ where: { companyId, cellId: cell.id, itemId: item.id, qty: { gt: 0 } } });
   const resv = await prisma.stockReservation.count({ where: { companyId, status: "ACTIVE", lotId: bal.lotId } });
@@ -111,8 +126,10 @@ async function main() {
     where: { companyId, id: receiver },
     include: { userRoles: { select: { role: true } } },
   });
+  const loaderU = await prisma.user.findFirstOrThrow({ where: { companyId, id: loader }, include: { userRoles: { select: { role: true } } } });
   const adminToken = await createSessionToken({ userId: admin.id, login: admin.phone ?? admin.email ?? "", name: admin.name, role: "ADMIN", roles: admin.userRoles.map((r) => r.role), companyId });
   const workToken = await createSessionToken({ userId: work.id, login: work.phone ?? work.email ?? "", name: work.name, role: "RECEIVER", roles: work.userRoles.map((r) => r.role), companyId });
+  const loaderToken = await createSessionToken({ userId: loaderU.id, login: loaderU.phone ?? loaderU.email ?? "", name: loaderU.name, role: "LOADER", roles: loaderU.userRoles.map((r) => r.role), companyId });
 
   console.log("CI E2E fixtures ready (through engines)");
   console.log("E2E_IDS=" + JSON.stringify({
@@ -128,6 +145,7 @@ async function main() {
     workPhone: RECV_PHONE,
     adminToken,
     workToken,
+    loaderToken,
   }));
   process.exit(0);
 }

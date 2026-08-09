@@ -134,8 +134,8 @@ export function PlaceGroupScanner({ placement }: { placement: Placement }) {
 
   function handleScan(raw: string) {
     if (busy) return;
-    if (step === "product") { setEanRaw(raw); setStep("cell"); setNotice("Товар отсканирован — сканируйте целевую ячейку"); return; }
-    // step === "cell": финализируем размещение
+    if (step === "product") { setEanRaw(raw); setStep("cell"); setNotice(`Товар отсканирован — сканируйте назначенную ячейку ${placement.assignedCellCode ?? ""}`); return; }
+    // step === "cell": финализируем размещение (сервер сверит с назначенной ячейкой)
     startTransition(async () => {
       const fd = new FormData();
       fd.set("taskId", placement.taskId); fd.set("ean", eanRaw); fd.set("cellCode", raw);
@@ -157,7 +157,7 @@ export function PlaceGroupScanner({ placement }: { placement: Placement }) {
       title="Размещение группы"
       subtitle={`Зона «${placement.routeLabel}»`}
       scanning={scanning}
-      scanHint={step === "product" ? "Сканируйте EAN товара" : "Сканируйте целевую ячейку (QR/Code 128)"}
+      scanHint={step === "product" ? "Сканируйте EAN товара" : `Сканируйте назначенную ячейку ${placement.assignedCellCode ?? ""} (QR/Code 128)`}
       scanFormats={step === "product" ? PRODUCT : CELL}
       onScan={handleScan}
       scanPaused={busy}
@@ -175,17 +175,10 @@ export function PlaceGroupScanner({ placement }: { placement: Placement }) {
       }
     >
       {notice && <p className="pb-1 text-sm font-medium text-green-600">{notice}</p>}
-      <p className="text-sm text-neutral-500">Отсканируйте EAN товара, затем QR/Code 128 целевой ячейки зоны «{placement.routeLabel}».</p>
-      {placement.cells.length > 0 && (
-        <>
-          <div className="pt-1 text-xs font-medium text-neutral-500">Рекомендуемые пустые ячейки</div>
-          {placement.cells.slice(0, 6).map((c) => (
-            <div key={c.id} className="rounded-xl bg-[#f7f8fc] px-3 py-2 text-xs text-neutral-600">
-              <b>{c.code}</b>{c.level != null ? ` · ур.${c.level}` : ""}{c.recommended ? " · рекомендуется" : ""}
-            </div>
-          ))}
-        </>
-      )}
+      <p className="text-sm text-neutral-500">Система назначила ячейку. Отсканируйте EAN товара, затем именно назначенную ячейку зоны «{placement.routeLabel}».</p>
+      <div className="rounded-xl bg-[#eef7ee] px-3 py-2 text-sm text-green-800">
+        Назначенная ячейка: <b>{placement.assignedCellCode ?? "—"}</b>
+      </div>
     </WorkflowSheet>
   );
 }

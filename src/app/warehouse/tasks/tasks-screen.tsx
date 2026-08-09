@@ -39,16 +39,12 @@ export interface IncomingHandoff {
   taskTitle: string;
   taskType: string;
 }
-export interface PlacementCell {
-  id: string;
-  code: string;
-  level: number | null;
-  recommended: boolean;
-}
 export interface Placement {
   taskId: string;
   routeLabel: string;
-  cells: PlacementCell[];
+  // Пакет 11 (коррекция): ячейку назначает система (prepareGroupPlacement). Погрузчик не выбирает.
+  assignedCellCode: string | null;
+  assignError: string | null;
 }
 export interface Cooling {
   taskId: string;
@@ -166,14 +162,15 @@ function HandoffResponse({ handoffId }: { handoffId: string }) {
 // Пакет 9B: первичное размещение группы (PLACE_GROUP) — основной путь скан (EAN товара → QR/Code128
 // целевой ячейки, сервер сам проверяет код ячейки), ручной ввод кодов — fallback.
 function PlacementBlock({ placement }: { placement: Placement }) {
-  if (placement.cells.length === 0)
-    return (
-      <p className="text-xs text-orange-600">
-        Нет пустой активной ячейки зоны «{placement.routeLabel}». Освободите ячейку и обновите.
-      </p>
-    );
+  if (placement.assignError)
+    return <p className="text-xs text-orange-600">{placement.assignError}</p>;
+  if (!placement.assignedCellCode)
+    return <p className="text-xs text-orange-600">Ячейка не назначена. Обновите страницу.</p>;
   return (
     <div className="flex flex-col gap-2">
+      <div className="rounded-xl bg-[#eef7ee] px-3 py-2 text-sm text-green-800">
+        Назначенная ячейка: <b>{placement.assignedCellCode}</b> · зона «{placement.routeLabel}»
+      </div>
       <PlaceGroupScanner placement={placement} />
       <ManualPlaceForm placement={placement} />
     </div>
@@ -187,14 +184,13 @@ function ManualPlaceForm({ placement }: { placement: Placement }) {
       <summary className="cursor-pointer">Ввести коды вручную (без камеры)</summary>
       <form action={action} className="mt-2 flex flex-col gap-2">
         <input type="hidden" name="taskId" value={placement.taskId} />
+        <p className="text-sm text-neutral-700">Назначенная ячейка: <b>{placement.assignedCellCode}</b></p>
         <input name="ean" required inputMode="numeric" placeholder="EAN товара (8/13 цифр)" className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm" />
-        <input name="cellCode" required placeholder="Код целевой ячейки (QR/Code 128)" className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm" />
+        <input name="cellCode" required placeholder={`Код назначенной ячейки (${placement.assignedCellCode})`} className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm" />
         {state.error && <p className="text-red-600">{state.error}</p>}
-        <Button type="submit" variant="ghost" disabled={pending}>{pending ? "…" : "Разместить по кодам"}</Button>
+        <Button type="submit" variant="ghost" disabled={pending}>{pending ? "…" : "Разместить в назначенную ячейку"}</Button>
       </form>
-      {placement.cells.length > 0 && (
-        <div className="mt-1 text-[11px] text-neutral-400">Рекомендуемые ячейки: {placement.cells.slice(0, 4).map((c) => c.code).join(", ")}</div>
-      )}
+      <div className="mt-1 text-[11px] text-neutral-400">Разместить можно только в назначенную ячейку {placement.assignedCellCode}.</div>
     </details>
   );
 }

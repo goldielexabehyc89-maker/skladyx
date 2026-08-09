@@ -6,7 +6,7 @@ import { scoped } from "@/lib/tenant";
 import { prisma } from "@/lib/db";
 import { groupReceivingEnabled } from "@/lib/roles";
 import { getActiveShift } from "@/lib/work-shift";
-import { createHandlingGroup, completeGroupPlacement, GroupError } from "@/lib/group-receiving";
+import { createHandlingGroup, completeGroupPlacement, prepareGroupPlacement, GroupError } from "@/lib/group-receiving";
 import { findItemByEan } from "@/lib/barcodes";
 
 // Этап 5/Пакет 4: групповая приёмка. Доступ — RECEIVER с активной сменой на его складе
@@ -86,6 +86,29 @@ export async function createGroupReceivingAction(
 
 export interface PlacementState {
   error?: string;
+}
+
+// Пакет 11 (коррекция): назначение целевой ячейки при открытии сценария размещения. Идемпотентно —
+// повторный вызов возвращает ту же ячейку. UI показывает «Назначенная ячейка: <код>».
+export interface PreparePlacementState {
+  error?: string;
+  cellCode?: string;
+}
+
+export async function prepareGroupPlacementAction(
+  _prev: PreparePlacementState,
+  formData: FormData,
+): Promise<PreparePlacementState> {
+  if (!groupReceivingEnabled()) return { error: "Групповая приёмка сейчас отключена" };
+  const session = await requireUser();
+  const s = scoped(session);
+  const taskId = String(formData.get("taskId") ?? "").trim();
+  try {
+    const r = await prepareGroupPlacement({ companyId: s.companyId, userId: session.userId, taskId });
+    return { cellCode: r.cellCode };
+  } catch (e) {
+    return { error: msg(e) };
+  }
 }
 
 export async function completeGroupPlacementAction(

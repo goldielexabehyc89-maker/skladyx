@@ -4,7 +4,7 @@
 /* eslint-disable no-console */
 import { PrismaClient, type Role } from "@prisma/client";
 import bcrypt from "bcryptjs";
-import { createHandlingGroup, completeGroupPlacement, eligibleCellsForGroup } from "@/lib/group-receiving";
+import { createHandlingGroup, completeGroupPlacement, prepareGroupPlacement } from "@/lib/group-receiving";
 import { ensureStandardZones, createCellsInZone, assertCellNotHeldByGroup } from "@/lib/cells";
 import { startWorkflowTask } from "@/lib/workflow-tasks";
 import { updateSettings } from "@/lib/settings";
@@ -69,11 +69,20 @@ async function oldOpPlace(cellId: string, lotId: string): Promise<string> {
 
 // Пакет 9B: размещение принимает отсканированный код ячейки (QR/Code128), не сырой id
 const cellQr = async (cid: string) => (await prisma.qrCode.findFirstOrThrow({ where: { type: "CELL", refId: cid } })).code;
-async function place(loader: string, groupId: string, cellId: string): Promise<string> {
+// Пакет 11 (коррекция): начать задачу (если ещё не в работе) и получить НАЗНАЧЕННУЮ системой ячейку.
+async function startAndPrepare(loader: string, groupId: string): Promise<{ taskId: string; cellId: string; cellCode: string }> {
   const t = await taskOf(groupId);
-  if (!t) return "нет задачи";
-  await startWorkflowTask(loader, companyId, t.id); // ASSIGNED → IN_PROGRESS
-  return err(async () => completeGroupPlacement({ companyId, userId: loader, taskId: t.id, cellCode: await cellQr(cellId), ean: eanOf(lotItem) }));
+  if (!t) throw new Error("нет задачи");
+  if (t.status !== "IN_PROGRESS") await startWorkflowTask(loader, companyId, t.id);
+  const r = await prepareGroupPlacement({ companyId, userId: loader, taskId: t.id });
+  return { taskId: t.id, cellId: r.cellId, cellCode: r.cellCode };
+}
+// Размещение в НАЗНАЧЕННУЮ ячейку (успех-путь).
+async function placeAssigned(loader: string, groupId: string): Promise<string> {
+  return err(async () => {
+    const a = await startAndPrepare(loader, groupId);
+    await completeGroupPlacement({ companyId, userId: loader, taskId: a.taskId, cellCode: await cellQr(a.cellId), ean: eanOf(lotItem) });
+  });
 }
 
 async function provision() {
@@ -102,6 +111,8 @@ async function provision() {
 
 async function cleanup() {
   const whs = [W, DW].filter(Boolean);
+  // Пакет 11: брони размещения (CellReservation по taskId/handlingGroupId) — у cellId нет FK, чистим явно
+  await prisma.cellReservation.deleteMany({ where: { warehouseId: { in: whs } } });
   const groups = await prisma.handlingGroup.findMany({ where: { warehouseId: { in: whs } }, select: { id: true, lotId: true } });
   const lotIds = groups.map((g) => g.lotId);
   // Пакет 11: события Ленты, порождённые тест-группами (стабильные ключи) — чистим по ключу
@@ -120,6 +131,24 @@ async function cleanup() {
     await prisma.receiptLine.deleteMany({ where: { id: { in: rlIds } } });
     await prisma.receipt.deleteMany({ where: { id: { in: [...new Set(recs.map((r) => r.receiptId))] } } });
   }
+  // Любые приёмки на тест-складах (createHandlingGroup + mkWarehouseLot) — полная чистка, иначе FK
+  // (Receipt.warehouseId) не даст удалить склад и приёмки накопятся между прогонами.
+  const whReceipts = await prisma.receipt.findMany({ where: { warehouseId: { in: whs } }, select: { id: true } });
+  const whReceiptIds = whReceipts.map((r) => r.id);
+  if (whReceiptIds.length) {
+    const whLines = await prisma.receiptLine.findMany({ where: { receiptId: { in: whReceiptIds } }, select: { id: true } });
+    const whLineIds = whLines.map((l) => l.id);
+    const whLots = await prisma.lot.findMany({ where: { receiptLineId: { in: whLineIds } }, select: { id: true } });
+    const whLotIds = whLots.map((l) => l.id);
+    await prisma.stockMovement.deleteMany({ where: { lotId: { in: whLotIds } } });
+    await prisma.stockBalance.deleteMany({ where: { lotId: { in: whLotIds } } });
+    await prisma.lot.deleteMany({ where: { id: { in: whLotIds } } });
+    await prisma.receiptLine.deleteMany({ where: { id: { in: whLineIds } } });
+    await prisma.receipt.deleteMany({ where: { id: { in: whReceiptIds } } });
+  }
+  // подстраховка: любые остатки/движения на тест-складах (в т.ч. инъекции в тестах)
+  await prisma.stockMovement.deleteMany({ where: { OR: [{ fromWarehouseId: { in: whs } }, { toWarehouseId: { in: whs } }] } });
+  await prisma.stockBalance.deleteMany({ where: { warehouseId: { in: whs } } });
   const cells = await prisma.cell.findMany({ where: { warehouseId: { in: whs } }, select: { id: true } });
   await prisma.qrCode.deleteMany({ where: { type: { in: ["CELL", "GROUP"] }, refId: { in: cells.map((c) => c.id) } } });
   await prisma.workShift.deleteMany({ where: { userId: { in: UIDS } } });
@@ -203,100 +232,104 @@ async function main() {
   const t12 = await taskOf(g12.groupId);
   ok("задача авто-назначена LOADER-смене (движок очереди)", !!t12 && t12.assignedUserId === L1 && t12.status === "ASSIGNED");
 
-  console.log("13) STORAGE: выбирается минимальный доступный уровень");
+  console.log("13) STORAGE: система назначает минимальный доступный уровень; чужую ячейку отклоняет");
   const S1 = (await createCellsInZone({ companyId, warehouseId: W, zoneId: zStorage, codes: ["P4S1"], level: 1 }), (await prisma.cell.findFirstOrThrow({ where: { warehouseId: W, code: "P4S1" } })).id);
   const S2 = (await createCellsInZone({ companyId, warehouseId: W, zoneId: zStorage, codes: ["P4S2"], level: 2 }), (await prisma.cell.findFirstOrThrow({ where: { warehouseId: W, code: "P4S2" } })).id);
   const gS = await G(3);
-  const elig = await eligibleCellsForGroup(companyId, W, "AWAITING_STORAGE");
-  ok("рекомендуется нижний уровень (P4S1, level 1)", elig[0]?.code === "P4S1" && elig[0]?.recommended === true);
-  ok("размещение в S2 при свободной S1 → отказ", (await place(L1, gS.groupId, S2)).includes("свободная ячейка ниже"));
-  ok("размещение в S1 (нижний уровень) → успех", (await place(L1, gS.groupId, S1)) === "");
+  const a13 = await startAndPrepare(L1, gS.groupId);
+  ok("система назначила минимальный уровень (P4S1)", a13.cellCode === "P4S1", a13.cellCode);
+  const wrong13 = await err(async () => completeGroupPlacement({ companyId, userId: L1, taskId: a13.taskId, cellCode: await cellQr(S2), ean: eanOf(lotItem) }));
+  ok("скан НЕ назначенной ячейки (S2) → отказ", wrong13.includes("не назначенная"), wrong13);
+  const okPlace13 = await err(async () => completeGroupPlacement({ companyId, userId: L1, taskId: a13.taskId, cellCode: await cellQr(S1), ean: eanOf(lotItem) }));
+  ok("размещение в назначенную (S1) → успех", okPlace13 === "", okPlace13);
   ok("после размещения: группа IN_STORAGE", (await prisma.handlingGroup.findUniqueOrThrow({ where: { id: gS.groupId } })).status === "IN_STORAGE");
-  // Пакет 11: событие «Размещение» идемпотентно — стабильный ключ; повторное размещение той же
-  // группы отклоняется движком, второе Event не пишется, время первого не меняется.
+  // Пакет 11: событие «Размещение» идемпотентно — стабильный ключ; повтор отклоняется, второе Event не пишется.
   const plKey = `group_placed:${gS.groupId}`;
   const pEv1 = await prisma.event.findMany({ where: { companyId, type: "group_placed", key: plKey } });
   ok("group_placed: ровно одно событие (стабильный ключ)", pEv1.length === 1);
   const pT1 = pEv1[0]?.createdAt.getTime();
-  // точный повтор напрямую в движок (без startWorkflowTask, чтобы не трогать авто-назначение
-  // грузчика для последующих тестов): задача уже COMPLETED → completeGroupPlacement отклоняет
-  const gsTask = await taskOf(gS.groupId);
-  await err(async () => completeGroupPlacement({ companyId, userId: L1, taskId: gsTask!.id, cellCode: await cellQr(S1), ean: eanOf(lotItem) }));
+  await err(async () => completeGroupPlacement({ companyId, userId: L1, taskId: a13.taskId, cellCode: await cellQr(S1), ean: eanOf(lotItem) }));
   const pEv2 = await prisma.event.findMany({ where: { companyId, type: "group_placed", key: plKey } });
   ok("group_placed: повтор не создаёт второе событие", pEv2.length === 1);
   ok("group_placed: время первого события не изменилось", pEv2[0]?.createdAt.getTime() === pT1);
 
-  console.log("14) занятая/чужая/неверная зона → отказ");
-  const gS14 = await G(3);
-  ok("размещение в занятую S1 → отказ", (await place(L1, gS14.groupId, S1)).includes("занята"));
-  // виртуальная зона RECEIVING как ячейка не существует; неверная зона = COOLING для STORAGE-маршрута
+  console.log("14) занятая ячейка исключается из назначения (следующий уровень)");
   const C1 = (await createCellsInZone({ companyId, warehouseId: W, zoneId: zCooling, codes: ["P4C1"], level: null }), (await prisma.cell.findFirstOrThrow({ where: { warehouseId: W, code: "P4C1" } })).id);
-  ok("STORAGE-группа в COOLING-ячейку → отказ", (await place(L1, gS14.groupId, C1)).includes("зоны хранения"));
-  // разместим gS14 в S2, чтобы освободить L1
-  ok("gS14 размещена в S2 (следующий уровень)", (await place(L1, gS14.groupId, S2)) === "");
+  const gS14 = await G(3);
+  const a14 = await startAndPrepare(L1, gS14.groupId);
+  ok("S1 занята → система назначает следующий уровень (P4S2)", a14.cellCode === "P4S2", a14.cellCode);
+  ok("gS14 размещена в назначенную (S2) → успех", (await err(async () => completeGroupPlacement({ companyId, userId: L1, taskId: a14.taskId, cellCode: await cellQr(S2), ean: eanOf(lotItem) }))) === "");
 
-  console.log("15) COOLING: только пустая COOLING-ячейка");
+  console.log("15) COOLING: система назначает COOLING-ячейку (флаг охлаждения off → простой IN_COOLING)");
   const gC = await G(8); // AWAITING_COOLING
-  ok("COOLING-группа в STORAGE-ячейку → отказ", (await place(L1, gC.groupId, S1)).includes("зоны охлаждения"));
-  ok("COOLING-группа в пустую COOLING-ячейку → успех", (await place(L1, gC.groupId, C1)) === "");
+  const aC = await startAndPrepare(L1, gC.groupId);
+  ok("назначена COOLING-ячейка (P4C1)", aC.cellCode === "P4C1", aC.cellCode);
+  const wrongC = await err(async () => completeGroupPlacement({ companyId, userId: L1, taskId: aC.taskId, cellCode: await cellQr(S1), ean: eanOf(lotItem) }));
+  ok("скан НЕ назначенной (STORAGE) ячейки → отказ", wrongC.includes("не назначенная"), wrongC);
+  ok("размещение в назначенную COOLING-ячейку → успех", (await err(async () => completeGroupPlacement({ companyId, userId: L1, taskId: aC.taskId, cellCode: await cellQr(C1), ean: eanOf(lotItem) }))) === "");
   ok("группа IN_COOLING", (await prisma.handlingGroup.findUniqueOrThrow({ where: { id: gC.groupId } })).status === "IN_COOLING");
 
-  console.log("16) полный перенос + завершение задачи атомарны");
-  const S3 = (await createCellsInZone({ companyId, warehouseId: W, zoneId: zStorage, codes: ["P4S3"], level: 1 }), (await prisma.cell.findFirstOrThrow({ where: { warehouseId: W, code: "P4S3" } })).id);
+  console.log("16) полный перенос + завершение задачи атомарны (в назначенную ячейку)");
+  await createCellsInZone({ companyId, warehouseId: W, zoneId: zStorage, codes: ["P4S3"], level: 1 });
   const g16 = await G(3, 7);
-  ok("размещение g16 в S3 успех", (await place(L1, g16.groupId, S3)) === "");
+  const a16 = await startAndPrepare(L1, g16.groupId);
+  ok("g16 размещена в назначенную ячейку успех", (await err(async () => completeGroupPlacement({ companyId, userId: L1, taskId: a16.taskId, cellCode: await cellQr(a16.cellId), ean: eanOf(lotItem) }))) === "");
   const g16row = await prisma.handlingGroup.findUniqueOrThrow({ where: { id: g16.groupId } });
   const recvGone = await bal(g16row.lotId, `Z:${zRecv}`);
-  const inCell = await bal(g16row.lotId, `C:${S3}`);
+  const inCell = await bal(g16row.lotId, `C:${a16.cellId}`);
   const t16 = await taskOf(g16.groupId);
-  ok("остаток полностью перенесён RECEIVING→ячейку, задача COMPLETED", (!recvGone || recvGone.qty.toNumber() === 0) && !!inCell && inCell.qty.toNumber() === 7 && t16?.status === "COMPLETED");
+  ok("остаток полностью перенесён RECEIVING→назначенную ячейку, задача COMPLETED", (!recvGone || recvGone.qty.toNumber() === 0) && !!inCell && inCell.qty.toNumber() === 7 && t16?.status === "COMPLETED");
 
-  console.log("17) две конкурентные попытки занять одну ячейку → успешна одна");
-  const C2 = (await createCellsInZone({ companyId, warehouseId: W, zoneId: zCooling, codes: ["P4C2"], level: null }), (await prisma.cell.findFirstOrThrow({ where: { warehouseId: W, code: "P4C2" } })).id);
+  console.log("17) две конкурентные группы получают РАЗНЫЕ назначенные ячейки");
+  await createCellsInZone({ companyId, warehouseId: W, zoneId: zStorage, codes: ["P4S4", "P4S5"], level: 1 }); // две свободные ячейки
   await mkShift(L2, "LOADER", W); // второй грузчик
-  const ga = await G(9), gb = await G(9); // две COOLING-группы
+  const ga = await G(3), gb = await G(3); // две STORAGE-группы
   const ta = await taskOf(ga.groupId), tb = await taskOf(gb.groupId);
-  await freeLoader(L1); // на случай оставшейся IN_PROGRESS от предыдущих блоков
-  // назначим/начнём: одна задача L1, другая L2 (движок балансирует; выставим явно для детерминизма)
+  await freeLoader(L1);
   await prisma.workflowTask.update({ where: { id: ta!.id }, data: { assignedUserId: L1, assignedShiftId: (await prisma.workShift.findFirstOrThrow({ where: { userId: L1, endedAt: null } })).id } });
   await prisma.workflowTask.update({ where: { id: tb!.id }, data: { assignedUserId: L2, assignedShiftId: (await prisma.workShift.findFirstOrThrow({ where: { userId: L2, endedAt: null } })).id } });
   await startWorkflowTask(L1, companyId, ta!.id);
   await startWorkflowTask(L2, companyId, tb!.id);
-  const qrC2 = await cellQr(C2);
+  const pa = await prepareGroupPlacement({ companyId, userId: L1, taskId: ta!.id });
+  const pb = await prepareGroupPlacement({ companyId, userId: L2, taskId: tb!.id });
+  ok("две группы → разные назначенные ячейки", pa.cellId !== pb.cellId, `${pa.cellCode}/${pb.cellCode}`);
   const [ra, rb] = await Promise.all([
-    err(() => completeGroupPlacement({ companyId, userId: L1, taskId: ta!.id, cellCode: qrC2, ean: eanOf(lotItem) })),
-    err(() => completeGroupPlacement({ companyId, userId: L2, taskId: tb!.id, cellCode: qrC2, ean: eanOf(lotItem) })),
+    err(async () => completeGroupPlacement({ companyId, userId: L1, taskId: ta!.id, cellCode: await cellQr(pa.cellId), ean: eanOf(lotItem) })),
+    err(async () => completeGroupPlacement({ companyId, userId: L2, taskId: tb!.id, cellCode: await cellQr(pb.cellId), ean: eanOf(lotItem) })),
   ]);
-  ok("одна конкурентная попытка успешна, вторая отклонена", (ra === "") !== (rb === ""), `ra="${ra}" rb="${rb}"`);
-  ok("в ячейке ровно одна группа", (await prisma.stockBalance.count({ where: { locKey: `C:${C2}`, qty: { gt: 0 } } })) === 1);
+  ok("обе группы размещены в свои назначенные ячейки", ra === "" && rb === "", `ra="${ra}" rb="${rb}"`);
 
-  console.log("18) tenant-изоляция");
-  await endShifts(L2); // после конкурентного теста снова единственная смена — L1 (детерминизм авто-назначения)
+  console.log("18) tenant-изоляция: скан ячейки чужого склада отклоняется");
+  await endShifts(L2);
   await freeLoader(L1);
+  // пул свободных STORAGE-ячеек для последующих назначений (18/19/22)
+  await createCellsInZone({ companyId, warehouseId: W, zoneId: zStorage, codes: ["P4S6", "P4S7", "P4S8", "P4S9"], level: 1 });
   const gT = await G(3);
+  const aT = await startAndPrepare(L1, gT.groupId);
   const demoCell = (await createCellsInZone({ companyId: demoId, warehouseId: DW, zoneId: (await prisma.warehouseZone.findFirstOrThrow({ where: { warehouseId: DW, kind: "STORAGE" } })).id, codes: ["DWS1"], level: 1 }), (await prisma.cell.findFirstOrThrow({ where: { warehouseId: DW, code: "DWS1" } })).id);
-  ok("размещение в ячейку чужого склада → отказ", /не код ячейки этой организации|не найдена на этом складе/.test(await place(L1, gT.groupId, demoCell)));
+  ok("скан ячейки чужого склада → отказ", /не код ячейки этой организации|не назначенная/.test(await err(async () => completeGroupPlacement({ companyId, userId: L1, taskId: aT.taskId, cellCode: await cellQr(demoCell), ean: eanOf(lotItem) }))));
 
-  console.log("19) инъецированная ошибка → нет частичного остатка/статуса/задачи");
-  // повторно занятая ячейка: попытка провалится ПОСЛЕ проверок, до движения — состояние не меняется
+  console.log("19) инъецированная ошибка (назначенная ячейка занята) → нет частичного состояния");
   await freeLoader(L1);
   const g19 = await G(3);
+  const a19 = await startAndPrepare(L1, g19.groupId);
+  // тест-манипуляция: имитируем занятие НАЗНАЧЕННОЙ ячейки посторонним остатком (гонка), минуя
+  // проверку брони — прямой вставкой StockBalance. Ожидаем отказ на проверке занятости под локом.
+  await prisma.stockBalance.create({ data: { companyId, itemId: lotItem, lotId: `inj-${a19.taskId}`, locKey: `C:${a19.cellId}`, warehouseId: W, cellId: a19.cellId, qty: 1 } });
   const before = await bal((await prisma.handlingGroup.findUniqueOrThrow({ where: { id: g19.groupId } })).lotId, `Z:${zRecv}`);
-  const t19 = await taskOf(g19.groupId);
-  await startWorkflowTask(L1, companyId, t19!.id);
-  const r19 = await err(async () => completeGroupPlacement({ companyId, userId: L1, taskId: t19!.id, cellCode: await cellQr(S1), ean: eanOf(lotItem) })); // S1 занята
+  const r19 = await err(async () => completeGroupPlacement({ companyId, userId: L1, taskId: a19.taskId, cellCode: await cellQr(a19.cellId), ean: eanOf(lotItem) }));
   const after = await bal((await prisma.handlingGroup.findUniqueOrThrow({ where: { id: g19.groupId } })).lotId, `Z:${zRecv}`);
   const g19row = await prisma.handlingGroup.findUniqueOrThrow({ where: { id: g19.groupId } });
-  const t19row = await prisma.workflowTask.findUniqueOrThrow({ where: { id: t19!.id } });
+  const t19row = await prisma.workflowTask.findUniqueOrThrow({ where: { id: a19.taskId } });
   ok("при отказе: остаток в RECEIVING не тронут, группа AWAITING, задача IN_PROGRESS",
-    !!r19 && before?.qty.toNumber() === after?.qty.toNumber() && g19row.status === "AWAITING_STORAGE" && t19row.status === "IN_PROGRESS");
+    r19.includes("занята") && before?.qty.toNumber() === after?.qty.toNumber() && g19row.status === "AWAITING_STORAGE" && t19row.status === "IN_PROGRESS", r19);
 
   console.log("20) push не создаётся");
   ok("нет push-подписок у тест-пользователей", (await prisma.pushSubscription.count({ where: { userId: { in: UIDS } } })) === 0);
 
   console.log("21) «одна ячейка = одна группа»: старые операции не докладывают в ячейку с группой");
-  // S3 содержит g16 (IN_STORAGE) из блока 16
-  const held = await err(() => prisma.$transaction((t) => assertCellNotHeldByGroup(t, companyId, S3)));
+  // назначенная ячейка a16.cellId содержит g16 (IN_STORAGE) из блока 16
+  const held = await err(() => prisma.$transaction((t) => assertCellNotHeldByGroup(t, companyId, a16.cellId)));
   ok("ячейка с размещённой группой → старая операция отклонена", held.includes("занята группой"), held);
   const emptyCode = "P4EMPTY";
   await createCellsInZone({ companyId, warehouseId: W, zoneId: zStorage, codes: [emptyCode], level: 1 });
@@ -307,32 +340,29 @@ async function main() {
   console.log("22) размещение отклоняется при несовпадении остатка в RECEIVING с количеством группы");
   await freeLoader(L1);
   const g22 = await G(3, 5);
+  const a22 = await startAndPrepare(L1, g22.groupId);
   const g22row = await prisma.handlingGroup.findUniqueOrThrow({ where: { id: g22.groupId } });
   // тест-манипуляция: имитируем расхождение остатка в зоне приёмки (5 → 4)
   await prisma.stockBalance.updateMany({ where: { lotId: g22row.lotId, locKey: `Z:${zRecv}` }, data: { qty: 4 } });
-  const t22 = await taskOf(g22.groupId);
-  await startWorkflowTask(L1, companyId, t22!.id);
-  const r22 = await err(async () => completeGroupPlacement({ companyId, userId: L1, taskId: t22!.id, cellCode: await cellQr(emptyCell), ean: eanOf(lotItem) }));
+  const r22 = await err(async () => completeGroupPlacement({ companyId, userId: L1, taskId: a22.taskId, cellCode: await cellQr(a22.cellId), ean: eanOf(lotItem) }));
   ok("несовпадение остатка → размещение отклонено", r22.includes("не совпадает"), r22);
-  ok("после отказа: группа AWAITING, в ячейку ничего не перенесено",
+  ok("после отказа: группа AWAITING, в назначенную ячейку ничего не перенесено",
     (await prisma.handlingGroup.findUniqueOrThrow({ where: { id: g22.groupId } })).status === "AWAITING_STORAGE" &&
-    (await bal(g22row.lotId, `C:${emptyCell}`)) === null);
+    (await bal(g22row.lotId, `C:${a22.cellId}`)) === null);
 
-  console.log("23) гонка: старая операция и размещение группы за одну пустую ячейку — успех один");
+  console.log("23) гонка: старая операция и размещение группы за назначенную ячейку — успех один");
   await freeLoader(L1);
   await createCellsInZone({ companyId, warehouseId: W, zoneId: zCooling, codes: ["P4RACE"], level: null });
-  const CC = (await prisma.cell.findFirstOrThrow({ where: { warehouseId: W, code: "P4RACE" } })).id;
   const gRace = await G(9); // AWAITING_COOLING
-  const tRace = await taskOf(gRace.groupId);
-  await startWorkflowTask(L1, companyId, tRace!.id);
+  const aRace = await startAndPrepare(L1, gRace.groupId); // назначит единственную свободную COOLING-ячейку (P4RACE)
   const LL = await mkWarehouseLot(2);
-  const qrCC = await cellQr(CC);
+  const qrCC = await cellQr(aRace.cellId);
   const [rGroup, rOld] = await Promise.all([
-    err(() => completeGroupPlacement({ companyId, userId: L1, taskId: tRace!.id, cellCode: qrCC, ean: eanOf(lotItem) })),
-    oldOpPlace(CC, LL),
+    err(async () => completeGroupPlacement({ companyId, userId: L1, taskId: aRace.taskId, cellCode: qrCC, ean: eanOf(lotItem) })),
+    oldOpPlace(aRace.cellId, LL),
   ]);
   ok("успешна ровно одна операция (вторая отклонена)", (rGroup === "") !== (rOld === ""), `group="${rGroup}" old="${rOld}"`);
-  ok("в ячейке ровно одна позиция (одна партия qty>0)", (await prisma.stockBalance.count({ where: { locKey: `C:${CC}`, qty: { gt: 0 } } })) === 1);
+  ok("в ячейке ровно одна позиция (одна партия qty>0)", (await prisma.stockBalance.count({ where: { locKey: `C:${aRace.cellId}`, qty: { gt: 0 } } })) === 1);
   // очистка вспомогательной партии LL
   await prisma.stockMovement.deleteMany({ where: { lotId: LL } });
   await prisma.stockBalance.deleteMany({ where: { lotId: LL } });

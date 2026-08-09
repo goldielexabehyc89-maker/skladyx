@@ -187,6 +187,16 @@ async function main() {
     ok("Рабочая роль: /warehouse/settings закрыт (редирект)", p !== "/warehouse/settings", p);
   }
 
+  // ── Новый сценарий размещения PLACE_GROUP (погрузчик): система назначает ячейку, нет выбора ──
+  if (ids.loaderToken) {
+    await setViewport(true);
+    await setAuth(ids.loaderToken);
+    await goto("/warehouse/tasks", `document.body.innerText.includes("Назначенная ячейка") || document.body.innerText.includes("Разместить")`);
+    t = await bodyText();
+    ok("Размещение: показана «Назначенная ячейка»", has(t, "Назначенная ячейка"));
+    ok("Размещение: НЕТ списка «Рекомендуемые пустые ячейки»", !has(t, "Рекомендуемые пустые ячейки") && !has(t, "Рекомендуемые ячейки"));
+  }
+
   console.log(failures === 0 ? "\nE2E RELEASE OK ✓" : `\nПРОВАЛЕНО: ${failures}`);
   process.exit(failures === 0 ? 0 : 1);
 }
