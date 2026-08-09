@@ -13,6 +13,18 @@ import { createGroupReceivingAction, resolveReceivingEanAction } from "@/app/act
 // используют одну и ту же машину состояний; ручной ввод не показывает много пустых полей сразу.
 type Step = "ean" | "qty" | "temp" | "confirm" | "done";
 
+// Токен идемпотентности приёмки. crypto.randomUUID доступен только в secure context (HTTPS/localhost);
+// по HTTP на не-loopback хосте он undefined и падает с TypeError. getRandomValues работает и в insecure
+// context; финальный запас — Math.random. Уникальности на цикл приёмки достаточно (сервер префиксует).
+function makeToken(): string {
+  const c = typeof crypto !== "undefined" ? crypto : undefined;
+  if (c && typeof c.randomUUID === "function") return c.randomUUID();
+  const a = new Uint8Array(16);
+  if (c && typeof c.getRandomValues === "function") c.getRandomValues(a);
+  else for (let i = 0; i < 16; i++) a[i] = Math.floor(Math.random() * 256);
+  return Array.from(a, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 export function ReceivingForm({ thresholdX }: { thresholdX: number }) {
   const [step, setStep] = useState<Step>("ean");
   const [scanning, setScanning] = useState(false);
@@ -29,7 +41,7 @@ export function ReceivingForm({ thresholdX }: { thresholdX: number }) {
   const qtyInput = useRef<HTMLInputElement>(null);
   const tempInput = useRef<HTMLInputElement>(null);
 
-  useEffect(() => { if (!token) setToken(crypto.randomUUID()); }, [token]);
+  useEffect(() => { if (!token) setToken(makeToken()); }, [token]);
   // автофокус на текущем шаге (UI-004)
   useEffect(() => {
     if (scanning) return;
@@ -45,7 +57,7 @@ export function ReceivingForm({ thresholdX }: { thresholdX: number }) {
 
   function resetAll() {
     setStep("ean"); setEan(""); setItemName(""); setQty(""); setTemp(""); setError(null);
-    setResult(null); setScanning(false); setToken(crypto.randomUUID());
+    setResult(null); setScanning(false); setToken(makeToken());
   }
 
   // Шаг EAN: серверная проверка штрихкода → название товара → шаг «количество».
