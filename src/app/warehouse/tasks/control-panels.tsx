@@ -13,7 +13,6 @@ import {
   type ControlActionState,
 } from "@/app/actions/order-control";
 import { Button, Badge } from "@/components/ui";
-import { QrScanner } from "@/components/qr-scanner";
 import { WorkflowSheet, type ScanFormat } from "@/components/workflow-sheet";
 const PRODUCT: ScanFormat[] = ["ean_8", "ean_13"];
 const ORDERF: ScanFormat[] = ["qr_code"];
@@ -133,35 +132,46 @@ function ScanOrderManual({ taskId }: { taskId: string }) {
   );
 }
 
-// ── Контроль: скан QR группы/товара камерой → количество (+ опц. тип для неожиданного товара) ──
+// ── Контроль: пошагово (UI-004) — скан EAN товара → количество → тип/комментарий отдельным итогом ──
+// Одновременно виден только один шаг: сначала камера/ручной EAN, затем ТОЛЬКО поле количества,
+// затем итоговый шаг с необязательным типом расхождения и комментарием и подтверждением.
 function MarkGroupScanner({ taskId }: { taskId: string }) {
   const router = useRouter();
   const [open, setOpen] = useState(false);
   const [scanning, setScanning] = useState(false);
-  const [step, setStep] = useState<"product" | "qty">("product");
+  const [step, setStep] = useState<"product" | "qty" | "confirm">("product");
   const [eanRaw, setEanRaw] = useState("");
   const [qty, setQty] = useState("");
   const [type, setType] = useState("");
+  const [comment, setComment] = useState("");
   const [busy, startTransition] = useTransition();
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
 
-  function reset() { setStep("product"); setEanRaw(""); setQty(""); setType(""); setNotice(null); }
+  function reset() { setStep("product"); setEanRaw(""); setQty(""); setType(""); setComment(""); }
   function handleScan(raw: string) {
     if (busy) return;
-    setEanRaw(raw); setScanning(false); setStep("qty"); setNotice("Товар отсканирован — введите количество");
+    const v = raw.trim();
+    if (!v) { setError("Отсканируйте заводской штрихкод товара (EAN)"); return; }
+    setEanRaw(v); setScanning(false); setStep("qty");
+  }
+  function submitQty() {
+    const n = Number(qty.replace(",", "."));
+    if (!Number.isFinite(n) || n < 0) { setError("Укажите фактическое количество"); return; }
+    setStep("confirm");
   }
   function submit() {
     const n = Number(qty.replace(",", "."));
-    if (!Number.isFinite(n) || n < 0) { setError("Укажите количество"); return; }
+    if (!Number.isFinite(n) || n < 0) { setError("Укажите фактическое количество"); return; }
     startTransition(async () => {
       const fd = new FormData();
-      fd.set("taskId", taskId); fd.set("ean", eanRaw); fd.set("countedQty", String(n)); fd.set("discrepancyType", type);
+      fd.set("taskId", taskId); fd.set("ean", eanRaw); fd.set("countedQty", String(n));
+      fd.set("discrepancyType", type); fd.set("comment", comment.trim());
       const res = await markControlScanAction({}, fd);
       if (res.error) { setError(res.error); return; }
       reset(); router.refresh();
     });
   }
+  const inputCls = "rounded-lg border border-[#e4e4f0] px-3 py-2 text-sm outline-none focus:border-brand";
   if (!open)
     return (
       <Button type="button" variant="primary" onClick={() => { setOpen(true); setScanning(true); setStep("product"); }} className="w-full">
@@ -171,7 +181,7 @@ function MarkGroupScanner({ taskId }: { taskId: string }) {
   return (
     <WorkflowSheet
       title="Проверка группы"
-      subtitle="Сканируйте EAN товара, затем количество"
+      subtitle={step === "product" ? "Шаг 1 · штрихкод товара" : step === "qty" ? "Шаг 2 · количество" : "Шаг 3 · итог"}
       scanning={scanning}
       scanHint="Сканируйте EAN товара"
       scanFormats={PRODUCT}
@@ -188,26 +198,37 @@ function MarkGroupScanner({ taskId }: { taskId: string }) {
       footer={
         step === "qty" ? (
           <>
-            <input autoFocus value={qty} onChange={(e) => setQty(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); submit(); } }} type="number" inputMode="decimal" step="1" placeholder="Фактическое количество" className="rounded-lg border border-[#e4e4f0] px-3 py-2 text-sm" />
-            <select value={type} onChange={(e) => setType(e.target.value)} className="rounded-lg border border-[#e4e4f0] px-3 py-2 text-sm">
+            <input autoFocus value={qty} onChange={(e) => setQty(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); submitQty(); } }} type="number" inputMode="decimal" step="1" placeholder="Фактическое количество" className={inputCls} />
+            <Button type="button" variant="primary" onClick={submitQty} className="w-full">Дальше</Button>
+            <Button type="button" variant="ghost" onClick={() => { setScanning(true); setStep("product"); }} className="w-full">Назад</Button>
+          </>
+        ) : step === "confirm" ? (
+          <>
+            <select autoFocus value={type} onChange={(e) => setType(e.target.value)} className={inputCls}>
               <option value="">авто (по количеству)</option>
               <option value="EXCESS">излишек / неожиданный товар</option>
               <option value="WRONG_ITEM">не тот товар</option>
               <option value="DAMAGED">повреждён</option>
               <option value="OTHER">другое</option>
             </select>
+            <input value={comment} onChange={(e) => setComment(e.target.value)} placeholder="комментарий (необязательно)" className={inputCls} />
             <Button type="button" variant="primary" disabled={busy} onClick={submit} className="w-full">{busy ? "…" : "Отметить"}</Button>
-            <Button type="button" variant="ghost" onClick={reset} className="w-full">Заново сканировать</Button>
+            <Button type="button" variant="ghost" onClick={() => setStep("qty")} className="w-full">Назад</Button>
           </>
         ) : (
-          <Button type="button" variant="primary" onClick={() => { setScanning(true); setStep("product"); setNotice(null); }} className="w-full">
+          <Button type="button" variant="primary" onClick={() => { setScanning(true); setStep("product"); }} className="w-full">
             <ScanLine size={18} /> Сканировать товар (EAN)
           </Button>
         )
       }
     >
-      {notice && <p className="pb-1 text-sm font-medium text-green-600">{notice}</p>}
-      <p className="text-sm text-neutral-500">Сканируйте каждый товар заказа и вводите фактическое количество. Неожиданный товар отметьте как «излишек» или «не тот товар».</p>
+      {step !== "product" && (
+        <div className="mb-1 rounded-lg bg-[#f7f8fc] px-3 py-2 text-sm">
+          <div className="flex justify-between gap-2"><span className="text-neutral-500">Товар (EAN)</span><span className="font-mono text-xs">{eanRaw}</span></div>
+          {step === "confirm" && <div className="flex justify-between gap-2"><span className="text-neutral-500">Количество</span><span className="font-medium">{qty}</span></div>}
+        </div>
+      )}
+      <p className="text-sm text-neutral-500">Сканируйте каждый товар заказа и вводите фактическое количество. На итоговом шаге при необходимости отметьте тип расхождения.</p>
     </WorkflowSheet>
   );
 }
@@ -278,15 +299,64 @@ export function ControlOrderPanel({ ctx }: { ctx: ControlOrderCtx }) {
   );
 }
 
-// ── Исправление: отдельное действие на каждое расхождение ──
+// ── Исправление: КАЖДОЕ расхождение отдельным действием, пошагово (UI-004) ──
+// открыть расхождение → EAN → количество → способ RETURN/DISCREPANCY (если применимо) →
+// необязательный комментарий → итог → подтверждение. Одновременно виден только один шаг; камера и
+// ручной ввод EAN — одна и та же машина состояний; ошибка сохраняет пройденные шаги.
 function ResolveDiscrepancy({ taskId, disc }: { taskId: string; disc: CorrectOrderCtx["discrepancies"][number] }) {
+  const router = useRouter();
   const isShortage = disc.type === "SHORTAGE";
   const isDamaged = disc.type === "DAMAGED" || disc.type === "OTHER";
+  const canChooseMethod = !isShortage && !isDamaged; // EXCESS/WRONG_ITEM — есть выбор RETURN/DISCREPANCY
   const action = isShortage ? resolveShortageAction : resolveRemovalAction;
-  const [state, formAction, pending] = useActionState<ControlActionState, FormData>(action, {});
-  const [ean, setEan] = useState("");
-  const [scanning, setScanning] = useState(false);
   const resolved = disc.resolutionStatus === "RESOLVED";
+
+  type Step = "product" | "qty" | "method" | "comment" | "confirm";
+  const [open, setOpen] = useState(false);
+  const [scanning, setScanning] = useState(false);
+  const [step, setStep] = useState<Step>("product");
+  const [ean, setEan] = useState("");
+  const [qty, setQty] = useState("");
+  const [disposition, setDisposition] = useState<"RETURN" | "DISCREPANCY">("RETURN");
+  const [comment, setComment] = useState("");
+  const [busy, startTransition] = useTransition();
+  const [error, setError] = useState<string | null>(null);
+  const inputCls = "rounded-lg border border-[#e4e4f0] px-3 py-2 text-sm outline-none focus:border-brand";
+
+  function reset() { setStep("product"); setEan(""); setQty(""); setDisposition(isDamaged ? "DISCREPANCY" : "RETURN"); setComment(""); }
+  function handleScan(raw: string) {
+    if (busy) return;
+    const v = raw.trim();
+    if (!v) { setError(isShortage ? "Отсканируйте EAN добавляемого товара" : "Отсканируйте EAN удаляемого товара"); return; }
+    setEan(v); setScanning(false); setStep("qty");
+  }
+  function submitQty() {
+    const n = Number(qty.replace(",", "."));
+    if (!Number.isFinite(n) || n <= 0) { setError("Количество — число больше нуля"); return; }
+    setStep(canChooseMethod ? "method" : "comment");
+  }
+  function submit() {
+    const n = Number(qty.replace(",", "."));
+    if (!Number.isFinite(n) || n <= 0) { setError("Количество — число больше нуля"); return; }
+    startTransition(async () => {
+      const fd = new FormData();
+      fd.set("taskId", taskId); fd.set("checkLineId", disc.checkLineId);
+      fd.set("ean", ean); fd.set("qty", String(n)); fd.set("comment", comment.trim());
+      if (!isShortage) fd.set("disposition", isDamaged ? "DISCREPANCY" : disposition);
+      const res = await action({}, fd);
+      if (res.error) { setError(res.error); return; }
+      setOpen(false); reset(); router.refresh();
+    });
+  }
+
+  const summary = (
+    <div className="mb-1 rounded-lg bg-[#f7f8fc] px-3 py-2 text-sm">
+      {ean && <div className="flex justify-between gap-2"><span className="text-neutral-500">{isShortage ? "Добавляемый EAN" : "Удаляемый EAN"}</span><span className="font-mono text-xs">{ean}</span></div>}
+      {(step === "method" || step === "comment" || step === "confirm") && qty && <div className="flex justify-between gap-2"><span className="text-neutral-500">Количество</span><span className="font-medium">{qty}</span></div>}
+      {step === "confirm" && !isShortage && <div className="flex justify-between gap-2"><span className="text-neutral-500">Способ</span><span className="font-medium">{(isDamaged ? "DISCREPANCY" : disposition) === "RETURN" ? "вернуть в хранение" : "изолировать в DISCREPANCY"}</span></div>}
+    </div>
+  );
+
   return (
     <div className="rounded-xl border border-[#eee] p-2.5">
       <div className="flex items-center justify-between gap-2">
@@ -296,32 +366,65 @@ function ResolveDiscrepancy({ taskId, disc }: { taskId: string; disc: CorrectOrd
         </Badge>
       </div>
       <div className="mt-0.5 text-xs text-neutral-600">нужно {disc.expected} · по факту {disc.counted}{disc.comment ? ` · ${disc.comment}` : ""}</div>
-      {!resolved && scanning && (
-        <div className="mt-2">
-          <QrScanner formats={PRODUCT} onScan={(raw) => { setEan(raw.trim()); setScanning(false); }} />
-          <Button type="button" variant="ghost" onClick={() => setScanning(false)} className="mt-1 w-full">Отмена</Button>
-        </div>
-      )}
       {!resolved && (
-        <form action={formAction} className="mt-2 flex flex-col gap-2">
-          <input type="hidden" name="taskId" value={taskId} />
-          <input type="hidden" name="checkLineId" value={disc.checkLineId} />
-          {/* Пакет 9B: EAN исправляемого товара — основной путь скан камерой, ручной ввод EAN — fallback */}
-          <div className="flex gap-2">
-            <input name="ean" value={ean} onChange={(e) => setEan(e.target.value)} required inputMode="numeric" placeholder={isShortage ? "EAN добавляемого товара" : "EAN удаляемого товара"} className="min-w-0 flex-1 rounded-lg border border-[#e4e4f0] px-2 py-1 text-sm" />
-            <Button type="button" variant="ghost" onClick={() => setScanning(true)}><ScanLine size={16} /> Скан</Button>
-          </div>
-          <input name="qty" required type="number" inputMode="decimal" step="1" placeholder="Количество" className="rounded-lg border border-[#e4e4f0] px-2 py-1 text-sm" />
-          {!isShortage && (
-            <select name="disposition" defaultValue={isDamaged ? "DISCREPANCY" : "RETURN"} className="rounded-lg border border-[#e4e4f0] px-2 py-1 text-sm">
-              {!isDamaged && <option value="RETURN">вернуть в хранение</option>}
-              <option value="DISCREPANCY">изолировать в DISCREPANCY</option>
-            </select>
-          )}
-          <input name="comment" placeholder="комментарий" className="rounded-lg border border-[#e4e4f0] px-2 py-1 text-sm" />
-          {state.error && <p className="text-xs text-red-600">{state.error}</p>}
-          <Button type="submit" variant="ghost" disabled={pending}>{pending ? "…" : isShortage ? "Подтвердить добавление" : "Подтвердить удаление"}</Button>
-        </form>
+        <Button type="button" variant="ghost" onClick={() => { setOpen(true); setScanning(true); reset(); setError(null); }} className="mt-2 w-full">
+          <ScanLine size={16} /> {isShortage ? "Добавить товар" : "Удалить товар"}
+        </Button>
+      )}
+      {open && (
+        <WorkflowSheet
+          title={isShortage ? "Добавить товар" : "Удалить товар"}
+          subtitle={step === "product" ? "Шаг 1 · штрихкод" : step === "qty" ? "Шаг 2 · количество" : step === "method" ? "Шаг 3 · способ" : step === "comment" ? "Комментарий (необязательно)" : "Итог"}
+          scanning={scanning}
+          scanHint={isShortage ? "Сканируйте EAN добавляемого товара" : "Сканируйте EAN удаляемого товара"}
+          scanFormats={PRODUCT}
+          manualPlaceholder={isShortage ? "EAN добавляемого товара" : "EAN удаляемого товара"}
+          manualInputMode="numeric"
+          onScan={handleScan}
+          scanPaused={busy}
+          busy={busy}
+          onBackToList={() => setScanning(false)}
+          onClose={() => { setOpen(false); setScanning(false); reset(); setError(null); }}
+          error={error}
+          onErrorRetry={() => setError(null)}
+          onErrorExit={() => { setError(null); setScanning(false); reset(); }}
+          footer={
+            step === "qty" ? (
+              <>
+                <input autoFocus value={qty} onChange={(e) => setQty(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); submitQty(); } }} type="number" inputMode="decimal" step="1" placeholder="Количество" className={inputCls} />
+                <Button type="button" variant="primary" onClick={submitQty} className="w-full">Дальше</Button>
+                <Button type="button" variant="ghost" onClick={() => { setScanning(true); setStep("product"); }} className="w-full">Назад</Button>
+              </>
+            ) : step === "method" ? (
+              <>
+                <select autoFocus value={disposition} onChange={(e) => setDisposition(e.target.value === "RETURN" ? "RETURN" : "DISCREPANCY")} className={inputCls}>
+                  <option value="RETURN">вернуть в хранение</option>
+                  <option value="DISCREPANCY">изолировать в DISCREPANCY</option>
+                </select>
+                <Button type="button" variant="primary" onClick={() => setStep("comment")} className="w-full">Дальше</Button>
+                <Button type="button" variant="ghost" onClick={() => setStep("qty")} className="w-full">Назад</Button>
+              </>
+            ) : step === "comment" ? (
+              <>
+                <input autoFocus value={comment} onChange={(e) => setComment(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); setStep("confirm"); } }} placeholder="комментарий (необязательно)" className={inputCls} />
+                <Button type="button" variant="primary" onClick={() => setStep("confirm")} className="w-full">Дальше</Button>
+                <Button type="button" variant="ghost" onClick={() => setStep(canChooseMethod ? "method" : "qty")} className="w-full">Назад</Button>
+              </>
+            ) : step === "confirm" ? (
+              <>
+                <Button type="button" variant="primary" disabled={busy} onClick={submit} className="w-full">{busy ? "…" : isShortage ? "Подтвердить добавление" : "Подтвердить удаление"}</Button>
+                <Button type="button" variant="ghost" onClick={() => setStep("comment")} className="w-full">Назад</Button>
+              </>
+            ) : (
+              <Button type="button" variant="primary" onClick={() => { setScanning(true); setStep("product"); }} className="w-full">
+                <ScanLine size={18} /> Сканировать EAN
+              </Button>
+            )
+          }
+        >
+          {step !== "product" && summary}
+          <div className="text-xs text-neutral-600">нужно {disc.expected} · по факту {disc.counted}</div>
+        </WorkflowSheet>
       )}
     </div>
   );

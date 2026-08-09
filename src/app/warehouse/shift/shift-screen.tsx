@@ -31,6 +31,8 @@ export function ShiftStart({
   workRoles: Role[];
   warehouses: { id: string; name: string }[];
 }) {
+  // ROLE-003: при успехе startWorkShiftAction сам делает серверный redirect на рабочий экран
+  // активной роли (RECEIVER→/warehouse/receiving, иначе →/warehouse/tasks); клиенту навигация не нужна.
   const [state, formAction, pending] = useActionState(startWorkShiftAction, initial);
 
   if (workRoles.length === 0) {
@@ -92,6 +94,7 @@ export function ShiftActive({
   warehouseName: string;
   startedAtIso: string;
 }) {
+  // SHIFT-002: при успехе endWorkShiftAction сам делает серверный redirect на /warehouse/shift.
   const [state, formAction, pending] = useActionState(endWorkShiftAction, initial);
   const duration = useDuration(startedAtIso);
   const started = new Date(startedAtIso);

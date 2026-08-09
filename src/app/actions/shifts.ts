@@ -1,6 +1,7 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
+import { redirect } from "next/navigation";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/db";
 import { requireUser } from "@/lib/auth";
@@ -70,8 +71,12 @@ export async function startWorkShiftAction(_prev: ShiftState, formData: FormData
   if (workflowTasksEnabled()) await rebalanceQueuedTasks(s.companyId, { warehouseId, role });
   revalidatePath("/warehouse/shift");
   revalidatePath("/warehouse/tasks");
+  revalidatePath("/warehouse/receiving");
   revalidatePath("/warehouse/employees");
-  return {};
+  // ROLE-003: серверный redirect сразу на рабочий экран активной роли (приёмщик → приёмка, остальные
+  // → задачи). Прямо на целевой маршрут (не через /warehouse) и без зависимости от гидрации клиента;
+  // свежий серверный рендер — layout/меню сразу видят новую активную смену.
+  redirect(role === "RECEIVER" ? "/warehouse/receiving" : "/warehouse/tasks");
 }
 
 // Завершить текущую смену. Пакет 2: назначенные, но не начатые задачи (ASSIGNED) вернуть
@@ -89,7 +94,7 @@ export async function endWorkShiftAction(_prev: ShiftState, _formData: FormData)
     await prisma.workShift.update({ where: { id: shift.id }, data: { endedAt: new Date() } });
     revalidatePath("/warehouse/shift");
     revalidatePath("/warehouse/employees");
-    return {};
+    redirect("/warehouse/shift");
   }
 
   let returned: { id: string; title: string; warehouseId: string }[] = [];
@@ -132,5 +137,7 @@ export async function endWorkShiftAction(_prev: ShiftState, _formData: FormData)
   revalidatePath("/warehouse/shift");
   revalidatePath("/warehouse/tasks");
   revalidatePath("/warehouse/employees");
-  return {};
+  // SHIFT-002/ROLE-003: после завершения — серверный redirect на экран смены; меню обновится
+  // (рабочий операционный пункт исчезнет).
+  redirect("/warehouse/shift");
 }

@@ -11,14 +11,18 @@ process.env.WORKFLOW_TASKS_ENABLED = "true";
 process.env.GROUP_RECEIVING_ENABLED = "true";
 process.env.COOLING_WORKFLOW_ENABLED = "true";
 process.env.EXTERNAL_ORDER_PICKING_ENABLED = "true";
+process.env.ORDER_CONTROL_ENABLED = "true"; // хук pickOrderScan создаёт CONTROL_ORDER при IN_CONTROL
 
 import { PrismaClient, type Role } from "@prisma/client";
 import bcrypt from "bcryptjs";
 import { ensureStandardZones, createCellsInZone } from "@/lib/cells";
 import { updateSettings } from "@/lib/settings";
 import { createHandlingGroup, completeGroupPlacement, prepareGroupPlacement } from "@/lib/group-receiving";
-import { startWorkflowTask } from "@/lib/workflow-tasks";
-import { importExternalOrder, reserveAndPlanOrder } from "@/lib/external-orders";
+import { startWorkflowTask, rebalanceQueuedTasks } from "@/lib/workflow-tasks";
+import { importExternalOrder, reserveAndPlanOrder, pickOrderScan } from "@/lib/external-orders";
+import { scanOrderForControl, markOrderControlByScan, finishOrderControl } from "@/lib/order-control";
+import { applyLotMovement } from "@/lib/stock";
+import { createQrIn } from "@/lib/qr";
 import { createSessionToken } from "@/lib/jwt";
 
 const prisma = new PrismaClient();
@@ -86,6 +90,25 @@ async function main() {
   // рабочий сотрудник БЕЗ активной смены (ROLE-003: home должен быть /warehouse/shift)
   const noShift = await mkUser(companyId, NOSHIFT_PHONE, "CI БезСмены", "PICKER", NOSHIFT_PASS, wh.id);
 
+  // ── ROLE-003 фикстуры: реальный старт смены и ADMIN с активной рабочей сменой ──
+  const addRole = async (userId: string, role: Role) => {
+    if (!(await prisma.userRole.findFirst({ where: { userId, role } }))) await prisma.userRole.create({ data: { userId, role } });
+  };
+  const ensureShift = async (userId: string, role: Role) => {
+    if (!(await prisma.workShift.findFirst({ where: { userId, endedAt: null } })))
+      await prisma.workShift.create({ data: { companyId, userId, warehouseId: wh.id, role } });
+  };
+  // приёмщик БЕЗ смены — для e2e «реально нажать Начать смену → /warehouse/receiving» (одна роль → выбор по умолчанию)
+  const startRecv = await mkUser(companyId, "+79000009904", "CI Старт-приёмщик", "RECEIVER", "CiStart-pass-9904", wh.id);
+  // ADMIN + активная смена RECEIVER (меню строится по активной смене, не по назначенным ролям)
+  const adminRecv = await mkUser(companyId, "+79000009905", "CI Админ-приёмщик", "ADMIN", "CiAdmR-pass-9905", wh.id);
+  await addRole(adminRecv, "RECEIVER"); await ensureShift(adminRecv, "RECEIVER");
+  // ADMIN + активная смена LOADER
+  const adminLoad = await mkUser(companyId, "+79000009906", "CI Админ-погрузчик", "ADMIN", "CiAdmL-pass-9906", wh.id);
+  await addRole(adminLoad, "LOADER"); await ensureShift(adminLoad, "LOADER");
+  // Дать ADMIN-фикстурам роль ADMIN в User.role (mkUser уже поставил role=ADMIN); userRoles: ADMIN + рабочая
+  await addRole(adminRecv, "ADMIN"); await addRole(adminLoad, "ADMIN");
+
   // 1) приёмка группы (движок) → RECEIPT-движение + Event «Приёмка группы»
   const grp = await createHandlingGroup({ companyId, warehouseId: wh.id, itemId: item.id, qty: QTY, temperature: 4, acceptedById: receiver, dedupeKey: "ci-e2e-recv-1" });
 
@@ -125,6 +148,81 @@ async function main() {
   if (!gFinal || gFinal.status !== "IN_STORAGE") throw new Error(`группа не IN_STORAGE: ${gFinal?.status}`);
   if (resv < 1) throw new Error("активный резерв не создан");
 
+  // ── Фикстура контроля/исправления (UI-004): живая CORRECT_ORDER (сборщик) и CONTROL_ORDER
+  //    (контролёр) «в работе», чтобы browser-e2e проверил ПОШАГОВОСТЬ этих панелей. Отдельный товар
+  //    и ячейки — существующие остатки/история главной фикстуры не затрагиваются. Движки те же, что
+  //    в verify-order-control (доказанно детерминированы на свежей БД).
+  const ctlItemName = "CI Контроль-товар";
+  let ctlItem = await prisma.item.findFirst({ where: { companyId, name: ctlItemName } });
+  if (!ctlItem) ctlItem = await prisma.item.create({ data: { companyId, name: ctlItemName, uomId: uom.id, tracking: "LOT" } });
+  const CTRL_EAN = ean13("460000000201");
+  if (!(await prisma.itemBarcode.findFirst({ where: { companyId, code: CTRL_EAN } })))
+    await prisma.itemBarcode.create({ data: { companyId, itemId: ctlItem.id, code: CTRL_EAN, symbology: "EAN13", source: "MANUAL", isActive: true } });
+  const ctrlCells = ["CI-CTRL-01", "CI-CTRL-02"];
+  for (const code of ctrlCells)
+    if (!(await prisma.cell.findFirst({ where: { companyId, warehouseId: wh.id, code } })))
+      await createCellsInZone({ companyId, warehouseId: wh.id, zoneId: storage.id, codes: [code], level: 1 });
+  const ctlU = await mkUser(companyId, "+79000009907", "CI Контролёр", "CONTROLLER", "CiCtl-pass-9907", wh.id);
+  const pkA = await mkUser(companyId, "+79000009908", "CI Сборщик-контроль", "PICKER", "CiPk-pass-9908", wh.id);
+  await ensureShift(ctlU, "CONTROLLER");
+  await ensureShift(pkA, "PICKER");
+
+  let ctrlSeq = 0;
+  const seedCtrlGroup = async (cellCode: string, qty: number) => {
+    const cellRow = await prisma.cell.findFirstOrThrow({ where: { companyId, warehouseId: wh.id, code: cellCode } });
+    const number = 992000 + ++ctrlSeq;
+    const receipt = await prisma.receipt.create({ data: { companyId, number, warehouseId: wh.id, status: "POSTED", postedAt: new Date(), note: "CI control seed", createdById: pkA } });
+    const line = await prisma.receiptLine.create({ data: { companyId, receiptId: receipt.id, itemId: ctlItem.id, qty } });
+    const lot = await prisma.lot.create({ data: { companyId, itemId: ctlItem.id, receiptLineId: line.id, qtyReceived: qty } });
+    await prisma.$transaction((tx) => applyLotMovement(tx, { companyId, docType: "RECEIPT", docId: receipt.id, itemId: ctlItem.id, lotId: lot.id, qty, from: null, to: { kind: "cell", warehouseId: wh.id, cellId: cellRow.id }, createdById: pkA }));
+    const grpRow = await prisma.handlingGroup.create({ data: { companyId, warehouseId: wh.id, itemId: ctlItem.id, lotId: lot.id, qty, temperature: 0, thresholdX: 5, status: "IN_STORAGE", dedupeKey: `ci-ctrl-${number}`, acceptedById: pkA } });
+    await prisma.$transaction((tx) => createQrIn(tx, { companyId, type: "GROUP", refId: grpRow.id }));
+  };
+  const cellCodeQr = async (cellId: string) => (await prisma.qrCode.findFirstOrThrow({ where: { type: "CELL", refId: cellId } })).code;
+  // импорт → резерв → сборка до IN_CONTROL; возвращает orderId (сборку ведёт фактически назначенный сборщик)
+  const pickToControl = async (externalId: string, cellCode: string) => {
+    await seedCtrlGroup(cellCode, 1);
+    const impO = await importExternalOrder({ companyId, warehouseId: wh.id, externalId, createdById: pkA, arrivalAt: null, lines: [{ externalLineId: "1", itemId: ctlItem.id, requiredQty: 1 }] });
+    await reserveAndPlanOrder({ companyId, orderId: impO.orderId, userId: pkA });
+    let pt = await prisma.workflowTask.findFirst({ where: { type: "PICK_ORDER", subjectId: impO.orderId } });
+    if (pt && pt.status === "QUEUED") { await rebalanceQueuedTasks(companyId, { warehouseId: wh.id }); pt = await prisma.workflowTask.findUniqueOrThrow({ where: { id: pt.id } }); }
+    const picker = pt?.assignedUserId;
+    if (!pt || !picker) throw new Error(`CI control: PICK не назначен (${pt?.status})`);
+    if (pt.status === "ASSIGNED") { const r = await startWorkflowTask(picker, companyId, pt.id); if (r.error) throw new Error(`CI control start PICK: ${r.error}`); }
+    for (let i = 0; i < 20; i++) {
+      const r = await prisma.stockReservation.findFirst({ where: { orderId: impO.orderId, status: "ACTIVE" } });
+      if (!r) break;
+      await pickOrderScan({ companyId, userId: picker, taskId: pt.id, cellCode: await cellCodeQr(r.cellId!), ean: CTRL_EAN, qty: r.qty.toNumber() });
+    }
+    return impO.orderId;
+  };
+  const orderQr = async (orderId: string) => (await prisma.qrCode.findFirstOrThrow({ where: { type: "ORDER", refId: orderId } })).code;
+  const startCtl = async (orderId: string) => {
+    let t = await prisma.workflowTask.findFirstOrThrow({ where: { type: "CONTROL_ORDER", subjectId: orderId }, orderBy: { createdAt: "desc" } });
+    if (t.status === "QUEUED") { await rebalanceQueuedTasks(companyId, { warehouseId: wh.id }); t = await prisma.workflowTask.findUniqueOrThrow({ where: { id: t.id } }); }
+    if (t.status === "ASSIGNED") await startWorkflowTask(ctlU, companyId, t.id);
+    await scanOrderForControl({ companyId, userId: ctlU, taskId: t.id, orderCode: await orderQr(orderId) });
+    return t.id;
+  };
+
+  // Оба заказа собираем ПЕРВЫМИ (пока у сборщика нет срочной задачи — иначе срочная CORRECT_ORDER
+  // заблокировала бы старт обычной сборки того же сборщика). Затем контроль обоих.
+  const o1 = await pickToControl("EO-CI-CORR", ctrlCells[0]);
+  const o2 = await pickToControl("EO-CI-CTRL", ctrlCells[1]);
+
+  // Заказ #1 → контроль с недостачей → FAILED → CORRECT_ORDER сборщику (пока ASSIGNED).
+  const ct1 = await startCtl(o1);
+  await markOrderControlByScan({ companyId, userId: ctlU, taskId: ct1, ean: CTRL_EAN, countedQty: 0, discrepancyType: null }); // недостача
+  await finishOrderControl({ companyId, userId: ctlU, taskId: ct1 });
+  const corr1 = await prisma.workflowTask.findFirstOrThrow({ where: { type: "CORRECT_ORDER", subjectId: o1 }, orderBy: { createdAt: "desc" } });
+  const correctPickerId = corr1.assignedUserId!;
+
+  // Заказ #2 → контроль «в работе» (скан заказа, без завершения): CONTROL_ORDER IN_PROGRESS у контролёра.
+  await startCtl(o2);
+
+  // Запускаем исправление сборщику → CORRECT_ORDER IN_PROGRESS (панель исправления отрисуется).
+  if (corr1.status === "ASSIGNED") await startWorkflowTask(correctPickerId, companyId, corr1.id);
+
   // Подписанные session-токены для e2e (аутентификация инъекцией cookie skx_session — без
   // зависимости от гидрации формы логина; при TENANT_AUTH=true сессия ре-валидируется из БД по host).
   const admin = await prisma.user.findFirstOrThrow({
@@ -142,6 +240,16 @@ async function main() {
   const loaderToken = await createSessionToken({ userId: loaderU.id, login: loaderU.phone ?? loaderU.email ?? "", name: loaderU.name, role: "LOADER", roles: loaderU.userRoles.map((r) => r.role), companyId });
   const noShiftToken = await createSessionToken({ userId: noShiftU.id, login: noShiftU.phone ?? noShiftU.email ?? "", name: noShiftU.name, role: "PICKER", roles: noShiftU.userRoles.map((r) => r.role), companyId });
 
+  const mkToken = async (userId: string, navRole: Role) => {
+    const u = await prisma.user.findFirstOrThrow({ where: { companyId, id: userId }, include: { userRoles: { select: { role: true } } } });
+    return createSessionToken({ userId: u.id, login: u.phone ?? u.email ?? "", name: u.name, role: navRole, roles: u.userRoles.map((r) => r.role), companyId });
+  };
+  const startToken = await mkToken(startRecv, "RECEIVER");      // приёмщик без смены — реальный старт смены
+  const adminRecvToken = await mkToken(adminRecv, "ADMIN");     // ADMIN + активная смена RECEIVER
+  const adminLoadToken = await mkToken(adminLoad, "ADMIN");     // ADMIN + активная смена LOADER
+  const controllerToken = await mkToken(ctlU, "CONTROLLER");    // CONTROL_ORDER «в работе»
+  const correctToken = await mkToken(correctPickerId, "PICKER"); // CORRECT_ORDER «в работе»
+
   console.log("CI E2E fixtures ready (through engines)");
   console.log("E2E_IDS=" + JSON.stringify({
     warehouseId: wh.id,
@@ -158,6 +266,11 @@ async function main() {
     workToken,
     loaderToken,
     noShiftToken,
+    startToken,
+    adminRecvToken,
+    adminLoadToken,
+    controllerToken,
+    correctToken,
   }));
   process.exit(0);
 }

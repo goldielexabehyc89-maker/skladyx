@@ -236,6 +236,100 @@ async function main() {
     ok("ROLE-003: рабочий без смены home → /warehouse/shift", (await homePath()) === "/warehouse/shift");
   }
 
+  // ── P1: реальный старт/завершение смены → полная навигация на рабочий экран и обновление меню ──
+  if (ids.startToken) {
+    await setViewport(false);
+    await setAuth(ids.startToken); // приёмщик БЕЗ смены (одна роль/склад — выбраны по умолчанию)
+    await goto("/warehouse/shift", `document.body.innerText.includes("Начать смену")`);
+    await sleep(1800); // гидрация формы серверного действия
+    await clickText(/^Начать смену$/);
+    let toRecv = false;
+    for (let i = 0; i < 70; i++) { if ((await pathname()) === "/warehouse/receiving") { toRecv = true; break; } await sleep(200); }
+    ok("SHIFT-001: старт RECEIVER → переход прямо на /warehouse/receiving", toRecv, await pathname());
+    ok("SHIFT-001: после старта в меню появилась «Приёмка»", await navHas("/warehouse/receiving"));
+    // завершить смену → /warehouse/shift, рабочий пункт исчезает
+    await goto("/warehouse/shift", `document.body.innerText.includes("Завершить смену")`);
+    await sleep(1500);
+    await clickText(/Завершить смену/);
+    let ended = false;
+    for (let i = 0; i < 70; i++) { const p = await pathname(); if (p === "/warehouse/shift" && (await bodyText()).includes("Начать смену")) { ended = true; break; } await sleep(200); }
+    ok("SHIFT-002: завершение смены → /warehouse/shift (форма старта)", ended);
+    ok("SHIFT-002: рабочий пункт «Приёмка» исчез из меню", !(await navHas("/warehouse/receiving")));
+  }
+
+  // ── P2: ADMIN — операционные пункты по активной смене; монитор всех задач — отдельный пункт ──
+  if (ids.adminToken) {
+    await setViewport(false);
+    await setAuth(ids.adminToken); // ADMIN без смены
+    await homePath();
+    ok("ROLE-003: ADMIN без смены — в меню «Монитор задач»", await navHas("/warehouse/tasks?view=monitor"));
+    ok("ROLE-003: ADMIN без смены — НЕТ «Приёмки» (роль не назначена/без смены)", !(await navHas("/warehouse/receiving")));
+    ok("ROLE-003: ADMIN без смены — НЕТ «Мои задачи»", !(await navHas("/warehouse/tasks?view=mine")));
+  }
+  if (ids.adminRecvToken) {
+    await setAuth(ids.adminRecvToken); // ADMIN + активная смена RECEIVER
+    ok("ROLE-003: ADMIN+RECEIVER home → /warehouse/receiving", (await homePath()) === "/warehouse/receiving");
+    ok("ROLE-003: ADMIN+RECEIVER — в меню «Приёмка»", await navHas("/warehouse/receiving"));
+    ok("ROLE-003: ADMIN+RECEIVER — «Монитор задач» остаётся", await navHas("/warehouse/tasks?view=monitor"));
+    ok("ROLE-003: ADMIN+RECEIVER — НЕТ «Мои задачи»", !(await navHas("/warehouse/tasks?view=mine")));
+  }
+  if (ids.adminLoadToken) {
+    await setAuth(ids.adminLoadToken); // ADMIN + активная смена LOADER
+    ok("ROLE-003: ADMIN+LOADER home → /warehouse/tasks", (await homePath()) === "/warehouse/tasks");
+    ok("ROLE-003: ADMIN+LOADER — в меню «Мои задачи» (?view=mine)", await navHas("/warehouse/tasks?view=mine"));
+    ok("ROLE-003: ADMIN+LOADER — «Монитор задач» остаётся", await navHas("/warehouse/tasks?view=monitor"));
+    ok("ROLE-003: ADMIN+LOADER — НЕТ «Приёмки»", !(await navHas("/warehouse/receiving")));
+  }
+  // ADMIN на мобиле: операционный таб по активной смене (нижний таб-бар — <nav>)
+  const tabHas = async (href) => ev(`!!document.querySelector('nav a[href="${href}"]')`);
+  if (ids.adminRecvToken) {
+    await setViewport(true);
+    await setAuth(ids.adminRecvToken);
+    await goto("/warehouse/receiving", `!!document.querySelector('nav a[href="/warehouse/receiving"]') || document.body.innerText.includes("Приёмка")`);
+    ok("ROLE-003 (моб): ADMIN+RECEIVER — таб «Приёмка»", await tabHas("/warehouse/receiving"));
+  }
+  if (ids.adminLoadToken) {
+    await setAuth(ids.adminLoadToken);
+    await goto("/warehouse/tasks", `!!document.querySelector('nav a[href="/warehouse/tasks?view=mine"]') || document.body.innerText.includes("Задач")`);
+    ok("ROLE-003 (моб): ADMIN+LOADER — таб «Мои задачи»", await tabHas("/warehouse/tasks?view=mine"));
+  }
+  if (ids.adminToken) {
+    await setAuth(ids.adminToken);
+    await goto("/warehouse", `location.pathname !== "/warehouse"`);
+    ok("ROLE-003 (моб): ADMIN без смены — таб «Монитор»", await tabHas("/warehouse/tasks?view=monitor"));
+  }
+
+  // ── P3 (UI-004): операционные панели — пошаговые, без набора полей сразу ──
+  const visIn = async (sel) => ev(`[...document.querySelectorAll('${sel}')].filter(e=>e.type!=="hidden" && e.offsetParent!==null).length`);
+  const sheetFields = () => visIn('[data-workflow-sheet] input, [data-workflow-sheet] select, [data-workflow-sheet] textarea');
+  if (ids.correctToken) {
+    await setViewport(false);
+    await setAuth(ids.correctToken); // сборщик с активной CORRECT_ORDER (расхождение — недостача)
+    await goto("/warehouse/tasks", `document.body.innerText.includes("Добавить товар") || document.body.innerText.includes("Удалить товар") || document.body.innerText.includes("Исправить заказ")`);
+    // до открытия шага в панели НЕТ набора полей: 0 видимых select и 0 числовых полей (старый баг — 4 поля сразу)
+    ok("UI-004 CORRECT: в панели нет одновременного набора полей (0 select, 0 number)",
+      (await visIn('main select')) === 0 && (await visIn('main input[type="number"]')) === 0);
+    await sleep(1500);
+    await clickText(/Добавить товар|Удалить товар/);
+    let sh = false; for (let i = 0; i < 40; i++) { if (await ev(`!!document.querySelector('[data-workflow-sheet]')`)) { sh = true; break; } await sleep(150); }
+    ok("UI-004 CORRECT: открыт пошаговый лист", sh);
+    ok("UI-004 CORRECT: на текущем шаге видно ≤1 поля", (await sheetFields()) <= 1, String(await sheetFields()));
+  }
+  if (ids.controllerToken) {
+    await setAuth(ids.controllerToken); // контролёр с активной CONTROL_ORDER (скан заказа выполнен)
+    await goto("/warehouse/tasks", `document.body.innerText.includes("Проверить группу") || document.body.innerText.includes("Контроль заказа")`);
+    ok("UI-004 CONTROL: в панели нет inline-набора полей (0 select)", (await visIn('main select')) === 0);
+    await sleep(1500);
+    await clickText(/Проверить группу/);
+    let sh2 = false; for (let i = 0; i < 40; i++) { if (await ev(`!!document.querySelector('[data-workflow-sheet]')`)) { sh2 = true; break; } await sleep(150); }
+    ok("UI-004 CONTROL: шаг скана — ≤1 поля", sh2 && (await sheetFields()) <= 1, String(await sheetFields()));
+    // ручной ввод EAN → шаг количества: только числовое поле, без select (тип/комментарий — отдельный итог)
+    await ev(`(()=>{const f=document.querySelector('[data-workflow-sheet] form'); if(!f) return 0; const i=f.querySelector('input'); const set=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(i),'value').set; set.call(i,'1'); i.dispatchEvent(new Event('input',{bubbles:true})); f.requestSubmit(); return 1;})()`);
+    let qtyStep = false; for (let i = 0; i < 40; i++) { if (await ev(`!!document.querySelector('[data-workflow-sheet] input[type="number"]')`)) { qtyStep = true; break; } await sleep(150); }
+    ok("UI-004 CONTROL: шаг количества — только число, без select (тип на отдельном шаге)",
+      qtyStep && (await visIn('[data-workflow-sheet] select')) === 0);
+  }
+
   console.log(failures === 0 ? "\nE2E RELEASE OK ✓" : `\nПРОВАЛЕНО: ${failures}`);
   process.exit(failures === 0 ? 0 : 1);
 }

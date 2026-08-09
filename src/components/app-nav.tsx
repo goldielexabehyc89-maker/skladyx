@@ -68,6 +68,11 @@ const SETTINGS: NavItem = { href: "/warehouse/settings", label: "Настрой�
 const MY: NavItem = { href: "/warehouse/my", label: "Мои ТМЦ", icon: Briefcase };
 const SHIFT: NavItem = { href: "/warehouse/shift", label: "Смена", icon: Clock };
 const TASKS: NavItem = { href: "/warehouse/tasks", label: "Задачи", icon: ListTodo };
+// ADMIN: рабочая очередь активной смены (?view=mine) отделена от административного монитора всех
+// задач (?view=monitor). Монитор — постоянное полномочие ADMIN; «Мои задачи» — только при активной
+// рабочей смене LOADER/PICKER/CONTROLLER (ROLE-003).
+const TASKS_MINE: NavItem = { href: "/warehouse/tasks?view=mine", label: "Мои задачи", icon: ListTodo };
+const TASKS_MONITOR: NavItem = { href: "/warehouse/tasks?view=monitor", label: "Монитор задач", icon: ListTodo };
 const RECEIVING_GROUP: NavItem = { href: "/warehouse/receiving", label: "Приёмка группами", icon: PackagePlus };
 
 const WORK_ROLES = ["RECEIVER", "LOADER", "PICKER", "CONTROLLER"] as const;
@@ -91,14 +96,22 @@ function groupsFor(
   groupReceiving: boolean,
   legacyUi: boolean,
 ): NavGroup[] {
-  const receivingItem = groupReceiving && canReceive ? [RECEIVING_GROUP] : [];
+  // ROLE-003: операционный рабочий пункт определяется АКТИВНОЙ сменой, а не назначенными ролями.
+  // RECEIVER-смена → «Приёмка»; LOADER/PICKER/CONTROLLER-смена → задачи (для ADMIN — «Мои задачи»
+  // ?view=mine); без активной рабочей смены операционного пункта нет. canReceive оставлен как
+  // дополнительный guard, но сам по себе (без активной смены) «Приёмку» не показывает.
+  const opItems = (tasksItem: NavItem): NavItem[] => {
+    if (activeShiftRole === "RECEIVER") return groupReceiving && canReceive ? [{ ...RECEIVING_GROUP, label: "Приёмка" }] : [];
+    if (activeShiftRole && (["LOADER", "PICKER", "CONTROLLER"] as string[]).includes(activeShiftRole)) return tasksEnabled ? [tasksItem] : [];
+    return [];
+  };
   let raw: NavGroup[];
   if (role === "ADMIN")
     raw = [
-      { title: "Работа", items: [ACTIVE, SCAN, RECEIPTS, STAGING, ...receivingItem, ...(canStartShift ? [SHIFT] : [])] },
+      { title: "Работа", items: [ACTIVE, SCAN, RECEIPTS, STAGING, ...opItems(TASKS_MINE), ...(canStartShift ? [SHIFT] : [])] },
       { title: "Документы", items: [ORDERS, PICKLISTS, TRANSFERS, ISSUES, WRITEOFFS, INVENTORIES] },
       { title: "Справочники", items: [STOCK, ITEMS, WAREHOUSES, SUPPLIERS, EMPLOYEES] },
-      { title: "Контроль", items: [...(tasksEnabled ? [TASKS] : []), HISTORY, FEED, SETTINGS] },
+      { title: "Контроль", items: [...(tasksEnabled ? [TASKS_MONITOR] : []), HISTORY, FEED, SETTINGS] },
       { title: "Моё", items: [MY] },
     ];
   else if (role === "STOREKEEPER")
@@ -113,14 +126,8 @@ function groupsFor(
   // всеми назначенными ролями. RECEIVER → «Приёмка» (без «Задач»); LOADER/PICKER/CONTROLLER → «Задачи»
   // (без «Приёмки»); без смены — только «Смена». Просмотр остаётся всегда.
   else if ((WORK_ROLES as readonly string[]).includes(role)) {
-    const opItems: NavItem[] = [];
-    if (activeShiftRole === "RECEIVER") {
-      if (groupReceiving) opItems.push({ ...RECEIVING_GROUP, label: "Приёмка" });
-    } else if (activeShiftRole && (["LOADER", "PICKER", "CONTROLLER"] as string[]).includes(activeShiftRole)) {
-      if (tasksEnabled) opItems.push(TASKS);
-    }
     raw = [
-      { title: "Работа", items: [...opItems, SHIFT] },
+      { title: "Работа", items: [...opItems(TASKS), SHIFT] },
       { title: "Просмотр", items: [STOCK, HISTORY] },
       { title: "Моё", items: [MY, FEED] },
     ];
@@ -263,12 +270,20 @@ function MobileTabBar({ role, activeShiftRole, tasksEnabled, groupReceiving, leg
   const pathname = usePathname();
   // ROLE-003: у рабочей роли главная вкладка — по активной смене (RECEIVER→Приёмка, иначе Задачи);
   // без смены — «Смена».
+  const isLpc = !!activeShiftRole && (["LOADER", "PICKER", "CONTROLLER"] as string[]).includes(activeShiftRole);
   const workTabs: NavItem[] =
     activeShiftRole === "RECEIVER"
       ? [...(groupReceiving ? [{ ...RECEIVING_GROUP, label: "Приёмка" }] : []), SHIFT, STOCK]
-      : activeShiftRole && (["LOADER", "PICKER", "CONTROLLER"] as string[]).includes(activeShiftRole)
+      : isLpc
         ? [...(tasksEnabled ? [TASKS] : []), SHIFT, STOCK]
         : [SHIFT, STOCK, { ...HISTORY, label: "История" }];
+  // ROLE-003: у ADMIN мобильный операционный таб — тоже по активной смене; без смены — «Монитор».
+  const adminTabs: NavItem[] =
+    activeShiftRole === "RECEIVER"
+      ? [...(groupReceiving ? [{ ...RECEIVING_GROUP, label: "Приёмка" }] : []), STOCK, { ...HISTORY, label: "История" }]
+      : isLpc
+        ? [...(tasksEnabled ? [{ ...TASKS_MINE, label: "Мои задачи" }] : []), STOCK, { ...HISTORY, label: "История" }]
+        : [...(tasksEnabled ? [{ ...TASKS_MONITOR, label: "Монитор" }] : []), STOCK, { ...HISTORY, label: "История" }];
   let tabs: NavItem[] =
     role === "EMPLOYEE"
       ? [MY, { ...SCAN, label: "Сканер" }, { ...FEED, label: "Лента" }]
@@ -276,7 +291,9 @@ function MobileTabBar({ role, activeShiftRole, tasksEnabled, groupReceiving, leg
         ? [STOCK, { ...HISTORY, label: "История" }, { ...FEED, label: "Лента" }]
         : (WORK_ROLES as readonly string[]).includes(role)
           ? workTabs
-          : [ACTIVE, { ...SCAN, label: "Сканер" }, STOCK];
+          : role === "ADMIN"
+            ? adminTabs
+            : [ACTIVE, { ...SCAN, label: "Сканер" }, STOCK];
 
   // Пакет 9B: старый интерфейс выключен → убираем legacy-вкладки и добираем безопасными разделами
   // (для ADMIN — монитор задач/справочники/контроль), сохраняя 3 слота + «Ещё».
