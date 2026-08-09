@@ -4,7 +4,6 @@ import { requireUser } from "@/lib/auth";
 import { scoped } from "@/lib/tenant";
 import { prisma } from "@/lib/db";
 import { hasRole, isWorkRole, workflowTasksEnabled, groupReceivingEnabled, coolingWorkflowEnabled, externalOrderPickingEnabled, orderControlEnabled, orderIssueEnabled } from "@/lib/roles";
-import { prepareGroupPlacement, GroupError } from "@/lib/group-receiving";
 import { getPickOrderContext, getMoveGroupContext } from "@/lib/external-orders";
 import { getControlOrderContext, getCorrectOrderContext } from "@/lib/order-control";
 import { getIssueOrderContext, getDeliverOrderContext } from "@/lib/order-issue";
@@ -176,24 +175,15 @@ export default async function TasksPage({
     include: { user: { select: { id: true, name: true } } },
   });
 
-  // Пакет 11 (коррекция): для текущей PLACE_GROUP-задачи «в работе» система САМА назначает одну
-  // конкретную ячейку (атомарно, идемпотентно) при открытии сценария размещения — погрузчик не
-  // выбирает. Показываем назначенный код; при отсутствии свободной ячейки — понятная ошибка
-  // (без движения и без завершения задачи).
-  let placement: { taskId: string; routeLabel: string; assignedCellCode: string | null; assignError: string | null } | null = null;
+  // Пакет 11 (коррекция P1): рендер /warehouse/tasks — ЧИСТО READ-ONLY. Назначение ячейки
+  // (prepareGroupPlacement) НЕ вызывается на сервер-рендере/GET/prefetch/refresh — иначе обычное
+  // открытие страницы создавало бы бронь. Бронь создаёт клиент только по явному «Начать размещение»
+  // (PLACE-001). Здесь лишь передаём контекст задачи; назначенный код появляется после действия.
+  let placement: { taskId: string; routeLabel: string } | null = null;
   if (current && current.type === "PLACE_GROUP" && current.status === "IN_PROGRESS" && groupReceivingEnabled()) {
     const group = await prisma.handlingGroup.findFirst({ where: { id: current.subjectId ?? "", companyId: s.companyId } });
     if (group && (group.status === "AWAITING_STORAGE" || group.status === "AWAITING_COOLING")) {
-      const routeLabel = group.status === "AWAITING_COOLING" ? "охлаждение" : "хранение";
-      let assignedCellCode: string | null = null;
-      let assignError: string | null = null;
-      try {
-        const r = await prepareGroupPlacement({ companyId: s.companyId, userId: session.userId, taskId: current.id });
-        assignedCellCode = r.cellCode;
-      } catch (e) {
-        assignError = e instanceof GroupError ? e.message : "Не удалось назначить ячейку";
-      }
-      placement = { taskId: current.id, routeLabel, assignedCellCode, assignError };
+      placement = { taskId: current.id, routeLabel: group.status === "AWAITING_COOLING" ? "охлаждение" : "хранение" };
     }
   }
 

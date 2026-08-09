@@ -182,17 +182,17 @@ export async function createHandlingGroup(input: {
 // Пакет 11 (коррекция): выбор ОДНОЙ конкретной целевой ячейки для размещения (в транзакции).
 // STORAGE — активная пустая ячейка минимального доступного уровня, затем code ASC; COOLING — активная
 // пустая COOLING-ячейка, code ASC. Исключаются: остаток qty>0, поштучные единицы, любые активные брони.
-async function pickPlacementCellInTx(
+async function candidatePlacementCellsInTx(
   tx: Tx,
   companyId: string,
   warehouseId: string,
   kind: "STORAGE" | "COOLING",
-): Promise<{ id: string; code: string } | null> {
+): Promise<{ id: string; code: string }[]> {
   const cells = await tx.cell.findMany({
     where: { companyId, warehouseId, isActive: true, zone: { kind }, ...(kind === "STORAGE" ? { level: { not: null } } : {}) },
     select: { id: true, code: true, level: true },
   });
-  if (cells.length === 0) return null;
+  if (cells.length === 0) return [];
   const ids = cells.map((c) => c.id);
   const [bal, unit, reserved] = await Promise.all([
     tx.stockBalance.findMany({ where: { cellId: { in: ids }, qty: { gt: 0 } }, select: { cellId: true } }),
@@ -201,7 +201,6 @@ async function pickPlacementCellInTx(
   ]);
   const busy = new Set<string>([...bal.map((b) => b.cellId!), ...unit.map((u) => u.cellId!), ...reserved.map((r) => r.cellId)]);
   const free = cells.filter((c) => !busy.has(c.id));
-  if (free.length === 0) return null;
   free.sort((a, b) => {
     if (kind === "STORAGE") {
       const dl = (a.level ?? 0) - (b.level ?? 0);
@@ -209,7 +208,7 @@ async function pickPlacementCellInTx(
     }
     return a.code < b.code ? -1 : a.code > b.code ? 1 : 0;
   });
-  return { id: free[0].id, code: free[0].code };
+  return free.map((c) => ({ id: c.id, code: c.code }));
 }
 
 // Пакет 11 (коррекция): назначение целевой ячейки при ОТКРЫТИИ размещения (а не при приёмке — так
@@ -240,18 +239,24 @@ export async function prepareGroupPlacement(input: {
       return { cellId: existing.cellId, cellCode: c?.code ?? "" };
     }
 
-    const picked = await pickPlacementCellInTx(tx, input.companyId, group.warehouseId, kind);
-    if (!picked)
-      throw new GroupError(kind === "STORAGE" ? "Нет свободной ячейки хранения для размещения" : "Нет свободной ячейки охлаждения для размещения");
-    await lockCell(tx, input.companyId, picked.id);
-    // повторная проверка под локом: ячейка свободна и не забронирована
-    if (await cellIsBusy(tx, picked.id)) throw new GroupError("Выбранная ячейка только что занята — повторите");
-    const taken = await tx.cellReservation.findFirst({ where: { cellId: picked.id, status: "ACTIVE" }, select: { id: true } });
-    if (taken) throw new GroupError("Выбранная ячейка только что забронирована — повторите");
-    await tx.cellReservation.create({
-      data: { companyId: input.companyId, warehouseId: group.warehouseId, cellId: picked.id, handlingGroupId: group.id, taskId: task.id, status: "ACTIVE" },
-    });
-    return { cellId: picked.id, cellCode: picked.code };
+    // PLACE-001: перебираем кандидатов в порядке (STORAGE: level ASC, code ASC; COOLING: code ASC).
+    // Каждого берём под lockCell и повторно проверяем занятость/бронь; если кандидат конкурентно занят
+    // (старой операцией/охлаждением/уникальным ключом брони) — переходим к следующему. Ошибку «нет
+    // свободной ячейки» возвращаем только после проверки всех кандидатов; выбор погрузчику не предлагаем.
+    const candidates = await candidatePlacementCellsInTx(tx, input.companyId, group.warehouseId, kind);
+    for (const cand of candidates) {
+      // lockCell берётся ДО повторной проверки: он сериализует нас со всеми, кто тоже создаёт бронь
+      // или размещает в эту ячейку (старые операции/охлаждение), поэтому после recheck гонки нет.
+      await lockCell(tx, input.companyId, cand.id);
+      if (await cellIsBusy(tx, cand.id)) continue;
+      const taken = await tx.cellReservation.findFirst({ where: { cellId: cand.id, status: "ACTIVE" }, select: { id: true } });
+      if (taken) continue;
+      await tx.cellReservation.create({
+        data: { companyId: input.companyId, warehouseId: group.warehouseId, cellId: cand.id, handlingGroupId: group.id, taskId: task.id, status: "ACTIVE" },
+      });
+      return { cellId: cand.id, cellCode: cand.code };
+    }
+    throw new GroupError(kind === "STORAGE" ? "Нет свободной ячейки хранения для размещения" : "Нет свободной ячейки охлаждения для размещения");
   });
 }
 

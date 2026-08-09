@@ -187,14 +187,21 @@ async function main() {
     ok("Рабочая роль: /warehouse/settings закрыт (редирект)", p !== "/warehouse/settings", p);
   }
 
-  // ── Новый сценарий размещения PLACE_GROUP (погрузчик): система назначает ячейку, нет выбора ──
+  // ── Новый сценарий размещения PLACE_GROUP (погрузчик): рендер НЕ назначает ячейку (P1);
+  //    назначение только по явному «Начать размещение»; система назначает, выбора нет ──
   if (ids.loaderToken) {
     await setViewport(true);
     await setAuth(ids.loaderToken);
-    await goto("/warehouse/tasks", `document.body.innerText.includes("Назначенная ячейка") || document.body.innerText.includes("Разместить")`);
+    await goto("/warehouse/tasks", `document.body.innerText.includes("Начать размещение") || document.body.innerText.includes("Назначенная ячейка")`);
     t = await bodyText();
-    ok("Размещение: показана «Назначенная ячейка»", has(t, "Назначенная ячейка"));
-    ok("Размещение: НЕТ списка «Рекомендуемые пустые ячейки»", !has(t, "Рекомендуемые пустые ячейки") && !has(t, "Рекомендуемые ячейки"));
+    ok("Размещение (P1): рендер НЕ назначил ячейку — показана кнопка «Начать размещение»", has(t, "Начать размещение") && !has(t, "Назначенная ячейка"), t.slice(0, 0));
+    ok("Размещение: НЕТ списка «Рекомендуемые»", !has(t, "Рекомендуемые"));
+    // явное действие погрузчика → назначение ячейки (после гидрации формы)
+    await sleep(2000);
+    await clickText("/Начать размещение/");
+    let assigned = false;
+    for (let i = 0; i < 50; i++) { if ((await bodyText()).includes("Назначенная ячейка")) { assigned = true; break; } await sleep(200); }
+    ok("Размещение: после «Начать размещение» показан назначенный код", assigned);
   }
 
   console.log(failures === 0 ? "\nE2E RELEASE OK ✓" : `\nПРОВАЛЕНО: ${failures}`);

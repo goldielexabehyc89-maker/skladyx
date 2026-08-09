@@ -11,7 +11,7 @@ import {
   placeCoolingRetrievalAction,
   type TaskActionState,
 } from "@/app/actions/tasks";
-import { completeGroupPlacementAction, type PlacementState } from "@/app/actions/group-receiving";
+import { completeGroupPlacementAction, prepareGroupPlacementAction, type PlacementState, type PreparePlacementState } from "@/app/actions/group-receiving";
 import { reportShortageAction, pickScanAction, completeMoveGroupAction, type OrderActionState } from "@/app/actions/external-orders";
 import { PickOrderScanner, MoveGroupScanner, PlaceGroupScanner, CoolingRetrievalScanner } from "./order-scanners";
 import { ControlOrderPanel, CorrectOrderPanel, type ControlOrderCtx, type CorrectOrderCtx } from "./control-panels";
@@ -42,9 +42,8 @@ export interface IncomingHandoff {
 export interface Placement {
   taskId: string;
   routeLabel: string;
-  // Пакет 11 (коррекция): ячейку назначает система (prepareGroupPlacement). Погрузчик не выбирает.
-  assignedCellCode: string | null;
-  assignError: string | null;
+  // Пакет 11 (коррекция P1): ячейку назначает система, но ТОЛЬКО по явному «Начать размещение»
+  // (клиентский вызов prepareGroupPlacementAction). Рендер страницы бронь не создаёт.
 }
 export interface Cooling {
   taskId: string;
@@ -161,36 +160,48 @@ function HandoffResponse({ handoffId }: { handoffId: string }) {
 
 // Пакет 9B: первичное размещение группы (PLACE_GROUP) — основной путь скан (EAN товара → QR/Code128
 // целевой ячейки, сервер сам проверяет код ячейки), ручной ввод кодов — fallback.
+// Пакет 11 (коррекция P1): бронь создаётся ТОЛЬКО по явному «Начать размещение» (клиентский вызов
+// prepareGroupPlacementAction). До успешной подготовки скан и ручное завершение недоступны. Повторное
+// «Начать размещение» идемпотентно возвращает ту же бронь. Ручной fallback использует ту же бронь.
 function PlacementBlock({ placement }: { placement: Placement }) {
-  if (placement.assignError)
-    return <p className="text-xs text-orange-600">{placement.assignError}</p>;
-  if (!placement.assignedCellCode)
-    return <p className="text-xs text-orange-600">Ячейка не назначена. Обновите страницу.</p>;
+  const [prep, prepareAct, preparing] = useActionState<PreparePlacementState, FormData>(prepareGroupPlacementAction, {});
+  if (!prep.cellCode) {
+    return (
+      <form action={prepareAct} className="flex flex-col gap-2">
+        <input type="hidden" name="taskId" value={placement.taskId} />
+        <p className="text-sm text-neutral-600">Зона «{placement.routeLabel}». Нажмите «Начать размещение» — система назначит конкретную ячейку.</p>
+        {prep.error && <p className="text-sm text-red-600">{prep.error}</p>}
+        <Button type="submit" variant="primary" disabled={preparing} className="w-full">
+          {preparing ? "Назначаем ячейку…" : prep.error ? "Повторить" : "Начать размещение"}
+        </Button>
+      </form>
+    );
+  }
   return (
     <div className="flex flex-col gap-2">
       <div className="rounded-xl bg-[#eef7ee] px-3 py-2 text-sm text-green-800">
-        Назначенная ячейка: <b>{placement.assignedCellCode}</b> · зона «{placement.routeLabel}»
+        Назначенная ячейка: <b>{prep.cellCode}</b> · зона «{placement.routeLabel}»
       </div>
-      <PlaceGroupScanner placement={placement} />
-      <ManualPlaceForm placement={placement} />
+      <PlaceGroupScanner placement={placement} assignedCellCode={prep.cellCode} />
+      <ManualPlaceForm placement={placement} assignedCellCode={prep.cellCode} />
     </div>
   );
 }
 
-function ManualPlaceForm({ placement }: { placement: Placement }) {
+function ManualPlaceForm({ placement, assignedCellCode }: { placement: Placement; assignedCellCode: string }) {
   const [state, action, pending] = useActionState<PlacementState, FormData>(completeGroupPlacementAction, {});
   return (
     <details className="text-xs text-neutral-500">
       <summary className="cursor-pointer">Ввести коды вручную (без камеры)</summary>
       <form action={action} className="mt-2 flex flex-col gap-2">
         <input type="hidden" name="taskId" value={placement.taskId} />
-        <p className="text-sm text-neutral-700">Назначенная ячейка: <b>{placement.assignedCellCode}</b></p>
+        <p className="text-sm text-neutral-700">Назначенная ячейка: <b>{assignedCellCode}</b></p>
         <input name="ean" required inputMode="numeric" placeholder="EAN товара (8/13 цифр)" className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm" />
-        <input name="cellCode" required placeholder={`Код назначенной ячейки (${placement.assignedCellCode})`} className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm" />
+        <input name="cellCode" required placeholder={`Код назначенной ячейки (${assignedCellCode})`} className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm" />
         {state.error && <p className="text-red-600">{state.error}</p>}
         <Button type="submit" variant="ghost" disabled={pending}>{pending ? "…" : "Разместить в назначенную ячейку"}</Button>
       </form>
-      <div className="mt-1 text-[11px] text-neutral-400">Разместить можно только в назначенную ячейку {placement.assignedCellCode}.</div>
+      <div className="mt-1 text-[11px] text-neutral-400">Разместить можно только в назначенную ячейку {assignedCellCode}.</div>
     </details>
   );
 }
