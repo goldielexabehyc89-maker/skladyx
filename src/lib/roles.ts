@@ -176,12 +176,19 @@ export function navRole(session: SessionData): Role {
 export function warehouseHomePath(session: SessionData, activeShiftRole?: Role | null): string {
   // Активная смена задаёт home рабочего сотрудника (приоритетнее административного профиля):
   // RECEIVER работает напрямую в «Приёмке», остальные рабочие роли — в «Задачах».
-  if (activeShiftRole === "RECEIVER") return "/warehouse/receiving";
-  if (activeShiftRole && isWorkRole(activeShiftRole)) return "/warehouse/tasks"; // LOADER/PICKER/CONTROLLER
   const role = navRole(session);
+  const isAdmin = role === "ADMIN";
   const legacyUi = legacyWarehouseUiEnabled();
   const newHome = workflowTasksEnabled() ? "/warehouse/tasks" : "/warehouse/stock";
-  if (role === "ADMIN" || role === "STOREKEEPER") return legacyUi ? "/warehouse/active" : newHome;
+  if (activeShiftRole === "RECEIVER") return "/warehouse/receiving";
+  if (activeShiftRole && isWorkRole(activeShiftRole))
+    // LOADER/PICKER/CONTROLLER. Обычная рабочая роль → /warehouse/tasks (поведение не меняем); ADMIN на
+    // смене → однозначный ?view=mine, чтобы «Мои задачи» подсвечивались (nav не гадает режим по умолчанию).
+    return isAdmin && workflowTasksEnabled() ? "/warehouse/tasks?view=mine" : "/warehouse/tasks";
+  // ADMIN без смены открывает МОНИТОР задач — home однозначный ?view=monitor (иначе nav считает режимом
+  // по умолчанию mine и «Монитор задач» не получает aria-current на голом /warehouse/tasks).
+  if (role === "ADMIN" || role === "STOREKEEPER")
+    return legacyUi ? "/warehouse/active" : isAdmin && workflowTasksEnabled() ? "/warehouse/tasks?view=monitor" : newHome;
   if (role === "OBSERVER") return "/warehouse/stock";
   if (role === "EMPLOYEE") return legacyUi ? "/warehouse/my" : newHome;
   return "/warehouse/shift"; // рабочая роль без активной смены → начать смену

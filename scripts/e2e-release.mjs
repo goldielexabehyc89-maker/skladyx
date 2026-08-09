@@ -361,26 +361,52 @@ async function main() {
   }
 
   // ── P2 (aria-current): ссылки «Мои задачи» (?view=mine) и «Монитор задач» (?view=monitor) ──
-  const ariaCur = async (sel) => ev(`document.querySelector('${sel}')?.getAttribute('aria-current') ?? null`);
+  // Проверяем НАЛИЧИЕ aria-current="page" среди ссылок с данным href (логотип-«home» может иметь тот же
+  // href, но без aria-current — учитываем именно навигационный пункт, а не первую попавшуюся ссылку).
+  const anyAria = async (sel) => ev(`[...document.querySelectorAll('${sel}')].some(e=>e.getAttribute('aria-current')==="page")`);
+  const MINE = "/warehouse/tasks?view=mine", MON = "/warehouse/tasks?view=monitor";
   if (ids.adminLoadToken) {
     await setViewport(false);
     await setAuth(ids.adminLoadToken);
-    await goto("/warehouse/tasks?view=mine", `!!document.querySelector('aside a[href="/warehouse/tasks?view=mine"]')`);
-    ok("aria-current (desktop): mine активна на ?view=mine", (await ariaCur('aside a[href="/warehouse/tasks?view=mine"]')) === "page");
-    ok("aria-current (desktop): monitor НЕ активна на ?view=mine", (await ariaCur('aside a[href="/warehouse/tasks?view=monitor"]')) !== "page");
-    await goto("/warehouse/tasks?view=monitor", `!!document.querySelector('aside a[href="/warehouse/tasks?view=monitor"]')`);
-    ok("aria-current (desktop): monitor активна на ?view=monitor", (await ariaCur('aside a[href="/warehouse/tasks?view=monitor"]')) === "page");
-    ok("aria-current (desktop): mine НЕ активна на ?view=monitor", (await ariaCur('aside a[href="/warehouse/tasks?view=mine"]')) !== "page");
-    // mobile
+    await goto(`/warehouse/tasks?view=mine`, `!!document.querySelector('aside a[href="${MINE}"]')`);
+    ok("aria-current (desktop): mine активна на ?view=mine", await anyAria(`aside a[href="${MINE}"]`));
+    ok("aria-current (desktop): monitor НЕ активна на ?view=mine", !(await anyAria(`aside a[href="${MON}"]`)));
+    await goto(`/warehouse/tasks?view=monitor`, `!!document.querySelector('aside a[href="${MON}"]')`);
+    ok("aria-current (desktop): monitor активна на ?view=monitor", await anyAria(`aside a[href="${MON}"]`));
+    ok("aria-current (desktop): mine НЕ активна на ?view=monitor", !(await anyAria(`aside a[href="${MINE}"]`)));
     await setViewport(true);
-    await goto("/warehouse/tasks?view=mine", `!!document.querySelector('nav a[href="/warehouse/tasks?view=mine"]')`);
-    ok("aria-current (моб): mine активна на ?view=mine", (await ariaCur('nav a[href="/warehouse/tasks?view=mine"]')) === "page");
+    await goto(`/warehouse/tasks?view=mine`, `!!document.querySelector('nav a[href="${MINE}"]')`);
+    ok("aria-current (моб): mine активна на ?view=mine", await anyAria(`nav a[href="${MINE}"]`));
   }
   if (ids.adminToken) {
     await setViewport(true);
     await setAuth(ids.adminToken);
-    await goto("/warehouse/tasks?view=monitor", `!!document.querySelector('nav a[href="/warehouse/tasks?view=monitor"]')`);
-    ok("aria-current (моб): monitor активна на ?view=monitor", (await ariaCur('nav a[href="/warehouse/tasks?view=monitor"]')) === "page");
+    await goto(`/warehouse/tasks?view=monitor`, `!!document.querySelector('nav a[href="${MON}"]')`);
+    ok("aria-current (моб): monitor активна на ?view=monitor", await anyAria(`nav a[href="${MON}"]`));
+  }
+
+  // ── P2 (домашний экран ADMIN): открытие /warehouse (как по логотипу) даёт однозначный режим и aria-current ──
+  if (ids.adminToken) {
+    // ADMIN без смены → монитор; подсвечен ТОЛЬКО «Монитор задач»
+    await setViewport(false);
+    await setAuth(ids.adminToken);
+    await goto("/warehouse", `location.pathname === "/warehouse/tasks"`);
+    ok("home ADMIN без смены → monitor подсвечен (desktop)", await anyAria(`aside a[href="${MON}"]`));
+    ok("home ADMIN без смены → mine НЕ подсвечен (desktop)", !(await anyAria(`aside a[href="${MINE}"]`)));
+    await setViewport(true);
+    await goto("/warehouse", `location.pathname === "/warehouse/tasks"`);
+    ok("home ADMIN без смены → monitor подсвечен (mobile)", await anyAria(`nav a[href="${MON}"]`));
+  }
+  if (ids.adminLoadToken) {
+    // ADMIN + смена LOADER → mine; подсвечен ТОЛЬКО «Мои задачи»
+    await setViewport(false);
+    await setAuth(ids.adminLoadToken);
+    await goto("/warehouse", `location.pathname === "/warehouse/tasks"`);
+    ok("home ADMIN+LOADER → mine подсвечен (desktop)", await anyAria(`aside a[href="${MINE}"]`));
+    ok("home ADMIN+LOADER → monitor НЕ подсвечен (desktop)", !(await anyAria(`aside a[href="${MON}"]`)));
+    await setViewport(true);
+    await goto("/warehouse", `location.pathname === "/warehouse/tasks"`);
+    ok("home ADMIN+LOADER → mine подсвечен (mobile)", await anyAria(`nav a[href="${MINE}"]`));
   }
 
   console.log(failures === 0 ? "\nE2E RELEASE OK ✓" : `\nПРОВАЛЕНО: ${failures}`);

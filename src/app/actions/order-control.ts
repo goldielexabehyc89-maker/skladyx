@@ -51,7 +51,7 @@ export async function scanOrderControlAction(_prev: ControlActionState, formData
   return { ok: true };
 }
 
-// Контролёр отмечает по СКАНУ QR группы/партии + количество (ручной ввод кода — fallback).
+// Контролёр отмечает по СКАНУ заводского штрихкода товара (EAN) + количество (ручной ввод EAN — fallback).
 export async function markControlScanAction(_prev: ControlActionState, formData: FormData): Promise<ControlActionState> {
   if (!orderControlEnabled()) return OFF;
   const session = await requireUser();
