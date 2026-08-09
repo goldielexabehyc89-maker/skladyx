@@ -11,7 +11,7 @@
 import { PrismaClient, type Role } from "@prisma/client";
 import bcrypt from "bcryptjs";
 import { createHandlingGroup, prepareGroupPlacement, completeGroupPlacement } from "@/lib/group-receiving";
-import { ensureStandardZones, createCellsInZone, assertCellNotHeldByGroup } from "@/lib/cells";
+import { ensureStandardZones, createCellsInZone, assertCellNotHeldByGroup, lockCell } from "@/lib/cells";
 import { startWorkflowTask, cancelWorkflowTask } from "@/lib/workflow-tasks";
 import { updateSettings } from "@/lib/settings";
 
@@ -22,14 +22,14 @@ const err = async (fn: () => Promise<unknown>): Promise<string> => { try { await
 
 const SLUG = "pg-place-demo";
 let companyId = "", uomId = "", itemId = "", ean = "";
-let W = "", W6 = "", W2 = "", zStorage = "", zCooling = "";
-let RUSER = "", L1 = "", L2 = "", L6 = "", Lw2 = "";
+let W = "", W6 = "", W2 = "", Wpar = "", zStorage = "", zCooling = "";
+let RUSER = "", L1 = "", L2 = "", L6 = "", Lw2 = "", Lpar = "";
 const UIDS: string[] = [];
 let seq = 0;
 const dk = () => `pg-${Date.now()}-${++seq}`;
 function ean13(b12: string): string { let s = 0; for (let i = b12.length - 1, k = 0; i >= 0; i--, k++) s += Number(b12[i]) * (k % 2 === 0 ? 3 : 1); return b12 + String((10 - (s % 10)) % 10); }
 
-const cellId = async (code: string) => (await prisma.cell.findFirstOrThrow({ where: { warehouseId: { in: [W, W6, W2] }, code } })).id;
+const cellId = async (code: string) => (await prisma.cell.findFirstOrThrow({ where: { warehouseId: { in: [W, W6, W2, Wpar] }, code } })).id;
 const cellQr = async (cid: string) => (await prisma.qrCode.findFirstOrThrow({ where: { type: "CELL", refId: cid } })).code;
 const taskOf = (groupId: string) => prisma.workflowTask.findFirst({ where: { subjectId: groupId, type: "PLACE_GROUP" } });
 const grp = (id: string) => prisma.handlingGroup.findUniqueOrThrow({ where: { id } });
@@ -106,13 +106,20 @@ async function provision() {
   await ensureStandardZones(companyId, W2);
   const z2 = (await prisma.warehouseZone.findFirstOrThrow({ where: { warehouseId: W2, kind: "STORAGE" } })).id;
   await createCellsInZone({ companyId, warehouseId: W2, zoneId: z2, codes: ["P2-A", "P2-B"], level: 1 });
+  // склад для параллельного теста: две свободные ячейки (PAR-A < PAR-B)
+  Wpar = (await prisma.warehouse.create({ data: { companyId, name: "PG Wpar", isActive: true } })).id;
+  await ensureStandardZones(companyId, Wpar);
+  const zpar = (await prisma.warehouseZone.findFirstOrThrow({ where: { warehouseId: Wpar, kind: "STORAGE" } })).id;
+  await createCellsInZone({ companyId, warehouseId: Wpar, zoneId: zpar, codes: ["PAR-A", "PAR-B"], level: 1 });
   RUSER = await mkUser("pg_r", "+79996660001", "RECEIVER", W);
   L1 = await mkUser("pg_l1", "+79996660002", "LOADER", W);
   L2 = await mkUser("pg_l2", "+79996660003", "LOADER", W);
   L6 = await mkUser("pg_l6", "+79996660004", "LOADER", W6);
   Lw2 = await mkUser("pg_lw2", "+79996660005", "LOADER", W2);
+  Lpar = await mkUser("pg_lpar", "+79996660006", "LOADER", Wpar);
   await mkShift(L1, W);
   await mkShift(Lw2, W2);
+  await mkShift(Lpar, Wpar);
 }
 
 async function main() {
@@ -154,6 +161,23 @@ async function main() {
     const ap2 = await prepareGroupPlacement({ companyId, userId: Lw2, taskId: tp2!.id });
     ok("P2: первый кандидат (P2-A) занят → назначен следующий (P2-B)", ap2.cellCode === "P2-B", ap2.cellCode);
     ok("P2: занятая ячейка НЕ забронирована", (await prisma.cellReservation.count({ where: { cellId: p2a, status: "ACTIVE" } })) === 0);
+
+    console.log("PAR) НАСТОЯЩАЯ параллельная транзакция держит первую ячейку под lockCell → назначается следующая");
+    const gpar = await G(Wpar, 3);
+    const tpar = await taskOf(gpar.groupId);
+    await startWorkflowTask(Lpar, companyId, tpar!.id);
+    const parA = await cellId("PAR-A");
+    // Конкурент: в отдельной транзакции берёт lockCell(PAR-A), занимает ячейку остатком и держит лок ~800мс до commit.
+    const competitor = prisma.$transaction(async (tx) => {
+      await lockCell(tx, companyId, parA);
+      await tx.stockBalance.create({ data: { companyId, itemId, lotId: "par-inj", locKey: `C:${parA}`, warehouseId: Wpar, cellId: parA, qty: 1 } });
+      await new Promise((r) => setTimeout(r, 800));
+    }, { timeout: 20000 });
+    await new Promise((r) => setTimeout(r, 300)); // дать конкуренту взять лок PAR-A первым
+    // prepare должен дождаться commit конкурента на lockCell(PAR-A), увидеть занятость и назначить PAR-B.
+    const [, parRes] = await Promise.all([competitor, prepareGroupPlacement({ companyId, userId: Lpar, taskId: tpar!.id })]);
+    ok("PAR: первая ячейка занята конкурентной транзакцией под lockCell → назначена следующая (PAR-B)", parRes.cellCode === "PAR-B", parRes.cellCode);
+    ok("PAR: бронь создана на PAR-B, а не на занятой PAR-A", (await prisma.cellReservation.count({ where: { taskId: tpar!.id, status: "ACTIVE", cellId: parRes.cellId } })) === 1 && parRes.cellId !== parA);
 
     console.log("5) две конкурентные группы → разные назначенные ячейки");
     await mkShift(L2, W);

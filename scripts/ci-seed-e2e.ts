@@ -35,6 +35,7 @@ const QTY = 1;
 const X = 8;
 const RECV_PHONE = "+79000009901", RECV_PASS = "CiRecv-pass-9901";
 const LOAD_PHONE = "+79000009902", LOAD_PASS = "CiLoad-pass-9902";
+const NOSHIFT_PHONE = "+79000009903", NOSHIFT_PASS = "CiNos-pass-9903";
 
 async function mkUser(companyId: string, phone: string, name: string, role: Role, pass: string, warehouseId: string) {
   let u = await prisma.user.findFirst({ where: { companyId, phone } });
@@ -72,13 +73,18 @@ async function main() {
     await prisma.itemBarcode.create({ data: { companyId, itemId: item.id, code: EAN, symbology: "EAN13", source: "MANUAL", isActive: true } });
   await updateSettings(companyId, { tempThresholdX: X });
 
-  // сотрудники + смены (RECEIVER — он же логин рабочей роли для e2e; LOADER — размещение)
+  // сотрудники + смены (RECEIVER — активная смена приёмщика; LOADER — активная смена, размещение;
+  // LOADER дополнительно получает роль RECEIVER — мультироль: меню должно идти по активной смене LOADER).
   const receiver = await mkUser(companyId, RECV_PHONE, "CI Приёмщик", "RECEIVER", RECV_PASS, wh.id);
   const loader = await mkUser(companyId, LOAD_PHONE, "CI Погрузчик", "LOADER", LOAD_PASS, wh.id);
+  if (!(await prisma.userRole.findFirst({ where: { userId: loader, role: "RECEIVER" } })))
+    await prisma.userRole.create({ data: { userId: loader, role: "RECEIVER" } }); // мультироль
   for (const [uid, role] of [[receiver, "RECEIVER"], [loader, "LOADER"]] as [string, Role][]) {
     if (!(await prisma.workShift.findFirst({ where: { userId: uid, endedAt: null } })))
       await prisma.workShift.create({ data: { companyId, userId: uid, warehouseId: wh.id, role } });
   }
+  // рабочий сотрудник БЕЗ активной смены (ROLE-003: home должен быть /warehouse/shift)
+  const noShift = await mkUser(companyId, NOSHIFT_PHONE, "CI БезСмены", "PICKER", NOSHIFT_PASS, wh.id);
 
   // 1) приёмка группы (движок) → RECEIPT-движение + Event «Приёмка группы»
   const grp = await createHandlingGroup({ companyId, warehouseId: wh.id, itemId: item.id, qty: QTY, temperature: 4, acceptedById: receiver, dedupeKey: "ci-e2e-recv-1" });
@@ -130,9 +136,11 @@ async function main() {
     include: { userRoles: { select: { role: true } } },
   });
   const loaderU = await prisma.user.findFirstOrThrow({ where: { companyId, id: loader }, include: { userRoles: { select: { role: true } } } });
+  const noShiftU = await prisma.user.findFirstOrThrow({ where: { companyId, id: noShift }, include: { userRoles: { select: { role: true } } } });
   const adminToken = await createSessionToken({ userId: admin.id, login: admin.phone ?? admin.email ?? "", name: admin.name, role: "ADMIN", roles: admin.userRoles.map((r) => r.role), companyId });
   const workToken = await createSessionToken({ userId: work.id, login: work.phone ?? work.email ?? "", name: work.name, role: "RECEIVER", roles: work.userRoles.map((r) => r.role), companyId });
   const loaderToken = await createSessionToken({ userId: loaderU.id, login: loaderU.phone ?? loaderU.email ?? "", name: loaderU.name, role: "LOADER", roles: loaderU.userRoles.map((r) => r.role), companyId });
+  const noShiftToken = await createSessionToken({ userId: noShiftU.id, login: noShiftU.phone ?? noShiftU.email ?? "", name: noShiftU.name, role: "PICKER", roles: noShiftU.userRoles.map((r) => r.role), companyId });
 
   console.log("CI E2E fixtures ready (through engines)");
   console.log("E2E_IDS=" + JSON.stringify({
@@ -149,6 +157,7 @@ async function main() {
     adminToken,
     workToken,
     loaderToken,
+    noShiftToken,
   }));
   process.exit(0);
 }

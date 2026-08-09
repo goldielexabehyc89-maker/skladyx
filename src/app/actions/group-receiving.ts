@@ -28,6 +28,30 @@ function msg(e: unknown): string {
   return "Не удалось выполнить приёмку";
 }
 
+// UI-004: шаг EAN приёмки — серверная проверка штрихкода и возврат названия товара для показа
+// перед вводом количества. Доступ тот же: активная смена RECEIVER. Секреты/ID не раскрываются.
+export interface ResolveEanState {
+  error?: string;
+  itemName?: string;
+  ean?: string;
+}
+
+export async function resolveReceivingEanAction(
+  _prev: ResolveEanState,
+  formData: FormData,
+): Promise<ResolveEanState> {
+  if (!groupReceivingEnabled()) return { error: "Групповая приёмка сейчас отключена" };
+  const session = await requireUser();
+  const s = scoped(session);
+  const shift = await getActiveShift(session.userId, s.companyId);
+  if (!shift || shift.role !== "RECEIVER") return { error: "Нужна активная смена приёмщика (RECEIVER)." };
+  const ean = String(formData.get("ean") ?? "").trim();
+  if (!ean) return { error: "Отсканируйте заводской штрихкод товара (EAN)" };
+  const found = await findItemByEan(s.companyId, ean);
+  if (!found) return { error: "Неизвестный, неактивный или чужой EAN — товар не найден" };
+  return { itemName: found.item.name, ean };
+}
+
 export async function createGroupReceivingAction(
   _prev: ReceivingState,
   formData: FormData,

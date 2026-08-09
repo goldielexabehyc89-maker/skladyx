@@ -70,6 +70,8 @@ export function PickOrderScanner({ ctx, taskId }: { ctx: PickOrderCtx; taskId: s
       scanning={scanning}
       scanHint={step === "cell" ? "Сканируйте ячейку (QR/Code 128, уровень 1-2)" : "Сканируйте EAN товара"}
       scanFormats={step === "cell" ? CELL : PRODUCT}
+      manualPlaceholder={step === "cell" ? "Код ячейки (QR/Code 128)" : "EAN товара (8/13 цифр)"}
+      manualInputMode={step === "product" ? "numeric" : "text"}
       onScan={handleScan}
       scanPaused={busy}
       busy={busy}
@@ -82,7 +84,7 @@ export function PickOrderScanner({ ctx, taskId }: { ctx: PickOrderCtx; taskId: s
       footer={
         step === "qty" ? (
           <>
-            <input value={qty} onChange={(e) => setQty(e.target.value)} type="number" inputMode="decimal" step="1" placeholder="Количество" className="rounded-lg border border-[#e4e4f0] px-3 py-2 text-sm" />
+            <input autoFocus value={qty} onChange={(e) => setQty(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); submitQty(); } }} type="number" inputMode="decimal" step="1" placeholder="Количество" className="rounded-lg border border-[#e4e4f0] px-3 py-2 text-sm" />
             <Button type="button" variant="primary" disabled={busy} onClick={submitQty} className="w-full">{busy ? "…" : "Собрать"}</Button>
             <Button type="button" variant="ghost" onClick={reset} className="w-full">Заново сканировать</Button>
           </>
@@ -159,6 +161,8 @@ export function PlaceGroupScanner({ placement, assignedCellCode }: { placement: 
       scanning={scanning}
       scanHint={step === "product" ? "Сканируйте EAN товара" : `Сканируйте назначенную ячейку ${assignedCellCode} (QR/Code 128)`}
       scanFormats={step === "product" ? PRODUCT : CELL}
+      manualPlaceholder={step === "product" ? "EAN товара (8/13 цифр)" : `Код назначенной ячейки (${assignedCellCode})`}
+      manualInputMode={step === "product" ? "numeric" : "text"}
       onScan={handleScan}
       scanPaused={busy}
       busy={busy}
@@ -259,6 +263,8 @@ export function CoolingRetrievalScanner({ cooling }: { cooling: Cooling }) {
       scanning={scanning}
       scanHint={step === "product" ? "Сканируйте EAN товара" : step === "target" ? "Сканируйте назначенную ячейку" : "Сканируйте ячейку охлаждения"}
       scanFormats={step === "product" ? PRODUCT : CELL}
+      manualPlaceholder={step === "product" ? "EAN товара (8/13 цифр)" : step === "target" ? "Код назначенной ячейки" : "Код ячейки охлаждения"}
+      manualInputMode={step === "product" ? "numeric" : "text"}
       onScan={handleScan}
       scanPaused={busy}
       busy={busy}
@@ -277,7 +283,7 @@ export function CoolingRetrievalScanner({ cooling }: { cooling: Cooling }) {
       footer={
         step === "temp" ? (
           <>
-            <input value={temp} onChange={(e) => setTemp(e.target.value)} type="number" inputMode="decimal" step="0.1" placeholder="Температура, °C" className="rounded-lg border border-[#e4e4f0] px-3 py-2 text-sm" />
+            <input autoFocus value={temp} onChange={(e) => setTemp(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); submitMeasure(); } }} type="number" inputMode="decimal" step="0.1" placeholder="Температура, °C" className="rounded-lg border border-[#e4e4f0] px-3 py-2 text-sm" />
             <Button type="button" variant="primary" disabled={busy} onClick={submitMeasure} className="w-full">{busy ? "…" : "Записать замер"}</Button>
             <Button type="button" variant="ghost" onClick={resetMeasure} className="w-full">Заново сканировать</Button>
           </>
@@ -342,6 +348,8 @@ export function MoveGroupScanner({ ctx }: { ctx: MoveGroupCtx }) {
       scanning={scanning}
       scanHint={step === "from" ? "Сканируйте исходную ячейку" : step === "product" ? "Сканируйте EAN товара" : "Сканируйте целевую ячейку"}
       scanFormats={step === "product" ? PRODUCT : CELL}
+      manualPlaceholder={step === "from" ? "Код исходной ячейки" : step === "product" ? "EAN товара (8/13 цифр)" : "Код целевой ячейки"}
+      manualInputMode={step === "product" ? "numeric" : "text"}
       onScan={handleScan}
       scanPaused={busy}
       busy={busy}

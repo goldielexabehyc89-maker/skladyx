@@ -175,6 +175,8 @@ function MarkGroupScanner({ taskId }: { taskId: string }) {
       scanning={scanning}
       scanHint="Сканируйте EAN товара"
       scanFormats={PRODUCT}
+      manualPlaceholder="EAN товара (8/13 цифр)"
+      manualInputMode="numeric"
       onScan={handleScan}
       scanPaused={busy}
       busy={busy}
@@ -186,7 +188,7 @@ function MarkGroupScanner({ taskId }: { taskId: string }) {
       footer={
         step === "qty" ? (
           <>
-            <input value={qty} onChange={(e) => setQty(e.target.value)} type="number" inputMode="decimal" step="1" placeholder="Фактическое количество" className="rounded-lg border border-[#e4e4f0] px-3 py-2 text-sm" />
+            <input autoFocus value={qty} onChange={(e) => setQty(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); submit(); } }} type="number" inputMode="decimal" step="1" placeholder="Фактическое количество" className="rounded-lg border border-[#e4e4f0] px-3 py-2 text-sm" />
             <select value={type} onChange={(e) => setType(e.target.value)} className="rounded-lg border border-[#e4e4f0] px-3 py-2 text-sm">
               <option value="">авто (по количеству)</option>
               <option value="EXCESS">излишек / неожиданный товар</option>
@@ -210,29 +212,6 @@ function MarkGroupScanner({ taskId }: { taskId: string }) {
   );
 }
 
-function MarkGroupManual({ taskId }: { taskId: string }) {
-  const [state, action, pending] = useActionState<ControlActionState, FormData>(markControlScanAction, {});
-  return (
-    <details className="text-xs text-neutral-500">
-      <summary className="cursor-pointer">Ввести код группы вручную (без камеры)</summary>
-      <form action={action} className="mt-2 flex flex-col gap-2">
-        <input type="hidden" name="taskId" value={taskId} />
-        <input name="ean" required placeholder="EAN товара (8/13 цифр)" className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm" />
-        <input name="countedQty" required type="number" inputMode="decimal" step="1" placeholder="Фактическое количество" className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm" />
-        <select name="discrepancyType" className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm">
-          <option value="">авто (по количеству)</option>
-          <option value="EXCESS">излишек / неожиданный товар</option>
-          <option value="WRONG_ITEM">не тот товар</option>
-          <option value="DAMAGED">повреждён</option>
-          <option value="OTHER">другое</option>
-        </select>
-        <input name="comment" placeholder="комментарий" className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm" />
-        {state.error && <p className="text-red-600">{state.error}</p>}
-        <Button type="submit" variant="ghost" disabled={pending}>{pending ? "…" : "Отметить по коду"}</Button>
-      </form>
-    </details>
-  );
-}
 
 function FinishControlForm({ ctx }: { ctx: ControlOrderCtx }) {
   const [state, action, pending] = useActionState<ControlActionState, FormData>(finishControlAction, {});
@@ -292,7 +271,6 @@ export function ControlOrderPanel({ ctx }: { ctx: ControlOrderCtx }) {
             </>
           )}
           <MarkGroupScanner taskId={ctx.taskId} />
-          <MarkGroupManual taskId={ctx.taskId} />
           <FinishControlForm ctx={ctx} />
         </>
       )}

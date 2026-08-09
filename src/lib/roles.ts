@@ -171,12 +171,18 @@ export function navRole(session: SessionData): Role {
 // `/warehouse` (redirect), и логотипом навигации — чтобы nav ссылался ПРЯМО на реальную страницу, а не
 // на редирект-маршрут `/warehouse` (иначе его prefetch кэширует редирект и перехватывает навигацию по
 // `/warehouse/*`). Логика зеркалит src/app/warehouse/page.tsx.
-export function warehouseHomePath(session: SessionData): string {
+// ROLE-003: основной рабочий экран определяется АКТИВНОЙ сменой, а не старшей назначенной ролью.
+// activeShiftRole — роль текущей WorkShift (или null, если смены нет).
+export function warehouseHomePath(session: SessionData, activeShiftRole?: Role | null): string {
+  // Активная смена задаёт home рабочего сотрудника (приоритетнее административного профиля):
+  // RECEIVER работает напрямую в «Приёмке», остальные рабочие роли — в «Задачах».
+  if (activeShiftRole === "RECEIVER") return "/warehouse/receiving";
+  if (activeShiftRole && isWorkRole(activeShiftRole)) return "/warehouse/tasks"; // LOADER/PICKER/CONTROLLER
   const role = navRole(session);
   const legacyUi = legacyWarehouseUiEnabled();
   const newHome = workflowTasksEnabled() ? "/warehouse/tasks" : "/warehouse/stock";
   if (role === "ADMIN" || role === "STOREKEEPER") return legacyUi ? "/warehouse/active" : newHome;
   if (role === "OBSERVER") return "/warehouse/stock";
   if (role === "EMPLOYEE") return legacyUi ? "/warehouse/my" : newHome;
-  return "/warehouse/shift"; // RECEIVER/LOADER/PICKER/CONTROLLER
+  return "/warehouse/shift"; // рабочая роль без активной смены → начать смену
 }

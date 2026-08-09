@@ -84,6 +84,7 @@ const LEGACY_HREFS = new Set<string>([
 // legacyUi — виден ли старый интерфейс (false → legacy-пункты убираются, пустые группы отбрасываются).
 function groupsFor(
   role: Role,
+  activeShiftRole: Role | null,
   canStartShift: boolean,
   tasksEnabled: boolean,
   canReceive: boolean,
@@ -108,13 +109,22 @@ function groupsFor(
       { title: "Контроль", items: [HISTORY, FEED] },
       { title: "Моё", items: [MY] },
     ];
-  // Новые рабочие роли (Этап 5): смена + задачи (за флагом) + приёмка группами (RECEIVER) + просмотр.
-  else if ((WORK_ROLES as readonly string[]).includes(role))
+  // Новые рабочие роли (Этап 5): ROLE-003 — операционный пункт определяется АКТИВНОЙ сменой, а не
+  // всеми назначенными ролями. RECEIVER → «Приёмка» (без «Задач»); LOADER/PICKER/CONTROLLER → «Задачи»
+  // (без «Приёмки»); без смены — только «Смена». Просмотр остаётся всегда.
+  else if ((WORK_ROLES as readonly string[]).includes(role)) {
+    const opItems: NavItem[] = [];
+    if (activeShiftRole === "RECEIVER") {
+      if (groupReceiving) opItems.push({ ...RECEIVING_GROUP, label: "Приёмка" });
+    } else if (activeShiftRole && (["LOADER", "PICKER", "CONTROLLER"] as string[]).includes(activeShiftRole)) {
+      if (tasksEnabled) opItems.push(TASKS);
+    }
     raw = [
-      { title: "Работа", items: [...(tasksEnabled ? [TASKS] : []), ...receivingItem, SHIFT] },
+      { title: "Работа", items: [...opItems, SHIFT] },
       { title: "Просмотр", items: [STOCK, HISTORY] },
       { title: "Моё", items: [MY, FEED] },
     ];
+  }
   // Наблюдатель — только просмотр: остатки, история, лента.
   else if (role === "OBSERVER") raw = [{ title: "Просмотр", items: [STOCK, HISTORY, FEED] }];
   else raw = [{ title: "Моё", items: [MY, FEED] }];
@@ -127,6 +137,7 @@ function groupsFor(
 
 function NavContent({
   role,
+  activeShiftRole,
   canStartShift,
   tasksEnabled,
   canReceive,
@@ -139,6 +150,7 @@ function NavContent({
   onToggleCollapse,
 }: {
   role: Role;
+  activeShiftRole: Role | null;
   canStartShift: boolean;
   tasksEnabled: boolean;
   canReceive: boolean;
@@ -151,7 +163,7 @@ function NavContent({
   onToggleCollapse?: () => void;
 }) {
   const pathname = usePathname();
-  const groups = groupsFor(role, canStartShift, tasksEnabled, canReceive, groupReceiving, legacyUi);
+  const groups = groupsFor(role, activeShiftRole, canStartShift, tasksEnabled, canReceive, groupReceiving, legacyUi);
   const [loggingOut, setLoggingOut] = useState(false);
   // Пакет 10 (fix): server-logout очищает cookie, затем ПОЛНАЯ навигация на /login (window.location) —
   // свежий серверный рендер по актуальному Host, без встроенного/закэшированного RSC другого host.
@@ -247,17 +259,23 @@ function NavContent({
 }
 
 // Нижний таб-бар (только мобильный): главные разделы + «Ещё» с полным меню.
-function MobileTabBar({ role, tasksEnabled, legacyUi, onMore }: { role: Role; tasksEnabled: boolean; legacyUi: boolean; onMore: () => void }) {
+function MobileTabBar({ role, activeShiftRole, tasksEnabled, groupReceiving, legacyUi, onMore }: { role: Role; activeShiftRole: Role | null; tasksEnabled: boolean; groupReceiving: boolean; legacyUi: boolean; onMore: () => void }) {
   const pathname = usePathname();
+  // ROLE-003: у рабочей роли главная вкладка — по активной смене (RECEIVER→Приёмка, иначе Задачи);
+  // без смены — «Смена».
+  const workTabs: NavItem[] =
+    activeShiftRole === "RECEIVER"
+      ? [...(groupReceiving ? [{ ...RECEIVING_GROUP, label: "Приёмка" }] : []), SHIFT, STOCK]
+      : activeShiftRole && (["LOADER", "PICKER", "CONTROLLER"] as string[]).includes(activeShiftRole)
+        ? [...(tasksEnabled ? [TASKS] : []), SHIFT, STOCK]
+        : [SHIFT, STOCK, { ...HISTORY, label: "История" }];
   let tabs: NavItem[] =
     role === "EMPLOYEE"
       ? [MY, { ...SCAN, label: "Сканер" }, { ...FEED, label: "Лента" }]
       : role === "OBSERVER"
         ? [STOCK, { ...HISTORY, label: "История" }, { ...FEED, label: "Лента" }]
         : (WORK_ROLES as readonly string[]).includes(role)
-          ? tasksEnabled
-            ? [TASKS, SHIFT, STOCK]
-            : [SHIFT, STOCK, MY]
+          ? workTabs
           : [ACTIVE, { ...SCAN, label: "Сканер" }, STOCK];
 
   // Пакет 9B: старый интерфейс выключен → убираем legacy-вкладки и добираем безопасными разделами
@@ -311,6 +329,7 @@ function MobileTabBar({ role, tasksEnabled, legacyUi, onMore }: { role: Role; ta
 export function AppNav({
   role,
   roles,
+  activeShiftRole,
   name,
   tasksEnabled,
   groupReceivingEnabled = false,
@@ -319,6 +338,7 @@ export function AppNav({
 }: {
   role: Role;
   roles: Role[];
+  activeShiftRole: Role | null;
   name: string;
   tasksEnabled: boolean;
   groupReceivingEnabled?: boolean;
@@ -343,6 +363,7 @@ export function AppNav({
       >
         <NavContent
           role={role}
+          activeShiftRole={activeShiftRole}
           canStartShift={canStartShift}
           tasksEnabled={tasksEnabled}
           canReceive={canReceive}
@@ -372,7 +393,7 @@ export function AppNav({
       </header>
 
       {/* Мобильный: нижний таб-бар */}
-      <MobileTabBar role={role} tasksEnabled={tasksEnabled} legacyUi={legacyUi} onMore={() => setMobileOpen(true)} />
+      <MobileTabBar role={role} activeShiftRole={activeShiftRole} tasksEnabled={tasksEnabled} groupReceiving={groupReceivingEnabled} legacyUi={legacyUi} onMore={() => setMobileOpen(true)} />
 
       {mobileOpen && (
         <div className="fixed inset-0 z-50 lg:hidden">
@@ -390,6 +411,7 @@ export function AppNav({
             </div>
             <NavContent
               role={role}
+              activeShiftRole={activeShiftRole}
               canStartShift={canStartShift}
               tasksEnabled={tasksEnabled}
               canReceive={canReceive}

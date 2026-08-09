@@ -183,109 +183,25 @@ function PlacementBlock({ placement }: { placement: Placement }) {
         Назначенная ячейка: <b>{prep.cellCode}</b> · зона «{placement.routeLabel}»
       </div>
       <PlaceGroupScanner placement={placement} assignedCellCode={prep.cellCode} />
-      <ManualPlaceForm placement={placement} assignedCellCode={prep.cellCode} />
     </div>
   );
 }
 
-function ManualPlaceForm({ placement, assignedCellCode }: { placement: Placement; assignedCellCode: string }) {
-  const [state, action, pending] = useActionState<PlacementState, FormData>(completeGroupPlacementAction, {});
-  return (
-    <details className="text-xs text-neutral-500">
-      <summary className="cursor-pointer">Ввести коды вручную (без камеры)</summary>
-      <form action={action} className="mt-2 flex flex-col gap-2">
-        <input type="hidden" name="taskId" value={placement.taskId} />
-        <p className="text-sm text-neutral-700">Назначенная ячейка: <b>{assignedCellCode}</b></p>
-        <input name="ean" required inputMode="numeric" placeholder="EAN товара (8/13 цифр)" className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm" />
-        <input name="cellCode" required placeholder={`Код назначенной ячейки (${assignedCellCode})`} className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm" />
-        {state.error && <p className="text-red-600">{state.error}</p>}
-        <Button type="submit" variant="ghost" disabled={pending}>{pending ? "…" : "Разместить в назначенную ячейку"}</Button>
-      </form>
-      <div className="mt-1 text-[11px] text-neutral-400">Разместить можно только в назначенную ячейку {assignedCellCode}.</div>
-    </details>
-  );
-}
 
 // Пакет 9B: двухфазный забор из охлаждения — основной путь скан (CoolingRetrievalScanner),
 // ручной ввод кодов — fallback. Фаза 1 — ячейка охлаждения + EAN + температура; если готово (≤ X) —
 // Фаза 2: показать назначенную ячейку и подтвердить её сканом (движение через ядро).
-const coolInput = "rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm";
 function CoolingBlock({ cooling }: { cooling: Cooling }) {
   return (
     <div className="flex flex-col gap-2">
       <CoolingRetrievalScanner cooling={cooling} />
-      <ManualCoolingForm cooling={cooling} />
     </div>
   );
 }
 
-function ManualCoolingForm({ cooling }: { cooling: Cooling }) {
-  const [prep, prepAction, prepPending] = useActionState<TaskActionState, FormData>(prepareCoolingRetrievalAction, {});
-  const [plc, plcAction, plcPending] = useActionState<TaskActionState, FormData>(placeCoolingRetrievalAction, {});
-  return (
-    <details className="text-xs text-neutral-500">
-      <summary className="cursor-pointer">Ввести коды вручную (без камеры)</summary>
-      <div className="mt-2 flex flex-col gap-3">
-        <form action={prepAction} className="flex flex-col gap-2">
-          <input type="hidden" name="taskId" value={cooling.taskId} />
-          <label className="text-xs font-medium text-neutral-500">Фаза 1 · замер (порог X = {cooling.thresholdX})</label>
-          <input name="fromCellCode" required placeholder="Ячейка охлаждения (QR/Code 128)" className={coolInput} />
-          <input name="ean" required inputMode="numeric" placeholder="EAN товара (8/13 цифр)" className={coolInput} />
-          <input name="temperature" type="number" inputMode="decimal" step="0.1" required placeholder="Температура, °C" className={coolInput} />
-          {prep.error && <p className="text-xs text-red-600">{prep.error}</p>}
-          {prep.ready === false && <p className="text-xs text-neutral-500">Выше X — записан новый цикл охлаждения.</p>}
-          <Button type="submit" variant="ghost" disabled={prepPending} className="w-full">{prepPending ? "…" : "Записать замер"}</Button>
-        </form>
-        {prep.ready && prep.targetCellCode && (
-          <form action={plcAction} className="flex flex-col gap-2 border-t border-[#eee] pt-2">
-            <input type="hidden" name="taskId" value={cooling.taskId} />
-            <p className="text-xs font-medium text-green-700">Готово к вывозу → ячейка <b>{prep.targetCellCode}</b>. Введите коды ячейки охлаждения, EAN и целевой ячейки.</p>
-            <input name="fromCellCode" required placeholder="Ячейка охлаждения (QR/Code 128)" className={coolInput} />
-            <input name="ean" required inputMode="numeric" placeholder="EAN товара (8/13 цифр)" className={coolInput} />
-            <input name="targetCellCode" required placeholder="Целевая ячейка (QR/Code 128)" className={coolInput} />
-            {plc.error && <p className="text-xs text-red-600">{plc.error}</p>}
-            <Button type="submit" variant="ghost" disabled={plcPending} className="w-full">{plcPending ? "…" : "Разместить в назначенную ячейку"}</Button>
-          </form>
-        )}
-      </div>
-    </details>
-  );
-}
 
 // Пакет 6: ручной ввод ОТСКАНИРОВАННЫХ кодов (fallback к камере + путь без камеры). Отправляет
 // коды QR (не скрытые id) — серверная сверка ячейка/группа/резерв ↔ заказ в actions/external-orders.
-function ManualPickForm({ taskId }: { taskId: string }) {
-  const [state, action, pending] = useActionState<OrderActionState, FormData>(pickScanAction, {});
-  return (
-    <details className="text-xs text-neutral-500">
-      <summary className="cursor-pointer">Ввести коды вручную (без камеры)</summary>
-      <form action={action} className="mt-2 flex flex-col gap-2">
-        <input type="hidden" name="taskId" value={taskId} />
-        <input name="cellCode" required placeholder="Код QR ячейки (1-2)" className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm" />
-        <input name="ean" required inputMode="numeric" placeholder="EAN товара (8/13 цифр)" className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm" />
-        <input name="qty" required type="number" inputMode="decimal" step="1" placeholder="Количество" className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm" />
-        {state.error && <p className="text-red-600">{state.error}</p>}
-        <Button type="submit" variant="ghost" disabled={pending}>{pending ? "…" : "Собрать по кодам"}</Button>
-      </form>
-    </details>
-  );
-}
-function ManualMoveForm({ taskId }: { taskId: string }) {
-  const [state, action, pending] = useActionState<OrderActionState, FormData>(completeMoveGroupAction, {});
-  return (
-    <details className="text-xs text-neutral-500">
-      <summary className="cursor-pointer">Ввести коды вручную (без камеры)</summary>
-      <form action={action} className="mt-2 flex flex-col gap-2">
-        <input type="hidden" name="taskId" value={taskId} />
-        <input name="fromCellCode" required placeholder="Код исходной ячейки (QR/Code 128)" className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm" />
-        <input name="ean" required inputMode="numeric" placeholder="EAN товара (8/13 цифр)" className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm" />
-        <input name="cellCode" required placeholder="Код целевой ячейки (QR/Code 128)" className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm" />
-        {state.error && <p className="text-red-600">{state.error}</p>}
-        <Button type="submit" variant="ghost" disabled={pending}>{pending ? "…" : "Переставить по кодам"}</Button>
-      </form>
-    </details>
-  );
-}
 
 // Пакет 6: фиксация недостачи по своей задаче сборки (данные не подменяются, причина в аудит).
 function ShortageForm({ taskId }: { taskId: string }) {
@@ -300,6 +216,41 @@ function ShortageForm({ taskId }: { taskId: string }) {
         <Button type="submit" variant="ghost" disabled={pending}>{pending ? "…" : "Зафиксировать недостачу"}</Button>
       </form>
     </details>
+  );
+}
+
+// TASK-005: одна строка очереди (заголовок + мета + кнопка старта, если можно брать).
+function QueueItem({ task, urgent, canStart }: { task: TaskDTO; urgent?: boolean; canStart: boolean }) {
+  return (
+    <div className={"rounded-xl border p-3 " + (urgent ? "border-red-100 bg-red-50/40" : "border-[#eee]")}>
+      <div className="text-sm font-semibold">{task.title}</div>
+      <div className="mt-1"><TaskMeta task={task} /></div>
+      {canStart && <StartTaskForm task={task} />}
+    </div>
+  );
+}
+
+// TASK-005: пока идёт текущая задача — ожидающая очередь показывается свёрнутой строкой
+// «Срочные: N · Обычные: N», раскрывается по нажатию; новая срочная выделяется, но не прерывает.
+function QueueSummary({ urgent, normal }: { urgent: TaskDTO[]; normal: TaskDTO[] }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <Card>
+      <button type="button" onClick={() => setOpen((v) => !v)} className="flex w-full items-center justify-between gap-2 text-left">
+        <span className="flex items-center gap-2 text-sm font-semibold">
+          Очередь
+          {urgent.length > 0 && <Badge tone="red">Срочные: {urgent.length}</Badge>}
+          <span className="text-neutral-500">Обычные: {normal.length}</span>
+        </span>
+        <span className="text-xs text-neutral-400">{open ? "Свернуть ▾" : "Показать ▸"}</span>
+      </button>
+      {open && (
+        <div className="mt-3 flex flex-col gap-3">
+          {urgent.map((t) => <QueueItem key={t.id} task={t} urgent canStart={false} />)}
+          {normal.map((t) => <QueueItem key={t.id} task={t} canStart={false} />)}
+        </div>
+      )}
+    </Card>
   );
 }
 
@@ -349,9 +300,10 @@ export function WorkerTasks({
         </Card>
       )}
 
-      <Card>
-        <CardTitle>Текущая задача</CardTitle>
-        {current ? (
+      {/* TASK-005: карточку «Текущая задача» рендерим только когда задача есть */}
+      {current && (
+        <Card>
+          <CardTitle>Текущая задача</CardTitle>
           <div className="rounded-xl border border-[#eee] p-3">
             <div className="text-sm font-semibold">{current.title}</div>
             {current.description && <div className="mt-0.5 text-sm text-neutral-600">{current.description}</div>}
@@ -369,13 +321,11 @@ export function WorkerTasks({
               {moveGroup && current.status === "IN_PROGRESS" && (
                 <>
                   <MoveGroupScanner ctx={moveGroup} />
-                  <ManualMoveForm taskId={current.id} />
                 </>
               )}
               {pickOrder && current.status === "IN_PROGRESS" && (
                 <>
                   <PickOrderScanner ctx={pickOrder} taskId={current.id} />
-                  <ManualPickForm taskId={current.id} />
                   <ShortageForm taskId={current.id} />
                 </>
               )}
@@ -389,50 +339,29 @@ export function WorkerTasks({
               )}
             </div>
           </div>
-        ) : (
-          <p className="text-sm text-neutral-500">Нет задачи в работе. Возьмите задачу из очереди ниже.</p>
-        )}
-      </Card>
+        </Card>
+      )}
 
-      <Card>
-        <CardTitle>Срочные</CardTitle>
-        {urgent.length === 0 ? (
-          <p className="text-sm text-neutral-500">Нет срочных задач.</p>
-        ) : (
-          <div className="flex flex-col gap-3">
-            {urgent.map((t) => (
-              <div key={t.id} className="rounded-xl border border-red-100 bg-red-50/40 p-3">
-                <div className="text-sm font-semibold">{t.title}</div>
-                <div className="mt-1">
-                  <TaskMeta task={t} />
-                </div>
-                {!current && <StartTaskForm task={t} />}
-              </div>
-            ))}
-          </div>
-        )}
-      </Card>
-
-      <Card>
-        <CardTitle>Обычные задачи</CardTitle>
-        {normal.length === 0 ? (
-          <p className="text-sm text-neutral-500">Очередь пуста.</p>
-        ) : (
-          <div className="flex flex-col gap-3">
-            {normal.map((t) => (
-              <div key={t.id} className="rounded-xl border border-[#eee] p-3">
-                <div className="text-sm font-semibold">{t.title}</div>
-                <div className="mt-1">
-                  <TaskMeta task={t} />
-                </div>
-                {!current && <StartTaskForm task={t} />}
-              </div>
-            ))}
-          </div>
-        )}
-      </Card>
-
-      {urgent.length + normal.length + (current ? 1 : 0) === 0 && (
+      {/* TASK-005: очередь. При текущей задаче — свёрнутая сводка; без текущей — только непустые списки
+          (срочные выше обычных); если всё пусто — одно компактное пустое состояние. */}
+      {current ? (
+        (urgent.length + normal.length > 0) && <QueueSummary urgent={urgent} normal={normal} />
+      ) : urgent.length + normal.length > 0 ? (
+        <>
+          {urgent.length > 0 && (
+            <Card>
+              <CardTitle>Срочные</CardTitle>
+              <div className="flex flex-col gap-3">{urgent.map((t) => <QueueItem key={t.id} task={t} urgent canStart />)}</div>
+            </Card>
+          )}
+          {normal.length > 0 && (
+            <Card>
+              <CardTitle>Обычные задачи</CardTitle>
+              <div className="flex flex-col gap-3">{normal.map((t) => <QueueItem key={t.id} task={t} canStart />)}</div>
+            </Card>
+          )}
+        </>
+      ) : (
         <EmptyState>Задач пока нет. Список обновится автоматически.</EmptyState>
       )}
     </div>

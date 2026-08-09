@@ -1,5 +1,6 @@
 "use client";
 
+import { useRef } from "react";
 import { RefreshCw } from "lucide-react";
 import { QrScanner, type ScanFormat } from "@/components/qr-scanner";
 export type { ScanFormat };
@@ -35,6 +36,8 @@ export function WorkflowSheet({
   onErrorRetry,
   onErrorExit,
   modal,
+  manualPlaceholder,
+  manualInputMode,
 }: {
   title: React.ReactNode;
   subtitle?: React.ReactNode;
@@ -44,6 +47,10 @@ export function WorkflowSheet({
   onScan: (raw: string) => void;
   scanFormats?: ScanFormat[]; // Пакет 9B: форматы текущего шага (ячейка/товар/заказ)
   scanPaused?: boolean;
+  // UI-004: ручной ввод текущего шага — та же машина состояний, что и камера (onScan). Один input,
+  // не набор полей; Enter подтверждает. Показывается под камерой как fallback.
+  manualPlaceholder?: string;
+  manualInputMode?: "text" | "numeric" | "decimal";
   onBackToList: () => void;
   onClose: () => void;
   footer?: React.ReactNode; // нижние кнопки (в режиме списка)
@@ -54,6 +61,7 @@ export function WorkflowSheet({
   onErrorExit: () => void;
   modal?: SheetModal | null; // центральное окно поверх шторки
 }) {
+  const manualRef = useRef<HTMLInputElement>(null);
   return (
     <>
       <div data-workflow-sheet className="fixed inset-0 z-50 flex items-end justify-center bg-black/40 p-0 sm:items-center sm:p-4">
@@ -100,6 +108,21 @@ export function WorkflowSheet({
                   {scanHint && <p className="text-sm font-medium text-[#667eea]">{scanHint}</p>}
                   {busy && <p className="mt-1 text-sm text-neutral-400">Обработка…</p>}
                 </div>
+                {/* UI-004: ручной ввод текущего шага — тот же onScan (одно поле, Enter подтверждает) */}
+                {manualPlaceholder && (
+                  <form
+                    className="flex gap-2"
+                    onSubmit={(e) => { e.preventDefault(); const v = manualRef.current?.value?.trim(); if (v) { onScan(v); if (manualRef.current) manualRef.current.value = ""; } }}
+                  >
+                    <input
+                      ref={manualRef}
+                      inputMode={manualInputMode ?? "text"}
+                      placeholder={manualPlaceholder}
+                      className="min-w-0 flex-1 rounded-lg border border-[#e4e4f0] px-3 py-2 text-sm outline-none focus:border-brand"
+                    />
+                    <Button type="submit" variant="ghost" disabled={!!busy}>Ввести</Button>
+                  </form>
+                )}
                 <Button type="button" variant="ghost" onClick={onBackToList} className="w-full">
                   Назад к списку
                 </Button>

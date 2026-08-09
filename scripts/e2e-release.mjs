@@ -202,6 +202,38 @@ async function main() {
     let assigned = false;
     for (let i = 0; i < 50; i++) { if ((await bodyText()).includes("Назначенная ячейка")) { assigned = true; break; } await sleep(200); }
     ok("Размещение: после «Начать размещение» показан назначенный код", assigned);
+
+    // TASK-005: у погрузчика есть текущая задача, пустых секций очереди быть не должно
+    await goto("/warehouse/tasks", `document.body.innerText.includes("Текущая задача") || document.body.innerText.includes("Задач пока нет")`);
+    t = await bodyText();
+    ok("Очередь: показана «Текущая задача»", has(t, "Текущая задача"));
+    ok("Очередь: пустые секции скрыты (нет «Очередь пуста» / «Нет срочных задач»)", !has(t, "Очередь пуста") && !has(t, "Нет срочных задач"));
+  }
+
+  // ── ROLE-003: home/menu по активной смене (desktop). Пункты меню проверяем по ссылкам сайдбара
+  //    (a[href=...]), а не по innerText — «Приёмка» встречается и в описании задачи PLACE_GROUP. ──
+  const homePath = async () => { await goto("/warehouse", `location.pathname !== "/warehouse"`); return await pathname(); };
+  const navHas = async (href) => ev(`!!document.querySelector('aside a[href="${href}"]')`);
+  await setViewport(false);
+  if (ids.loaderToken) {
+    await setAuth(ids.loaderToken); // активная смена LOADER (+ роль RECEIVER — мультироль)
+    ok("ROLE-003: LOADER (мультироль) home → /warehouse/tasks", (await homePath()) === "/warehouse/tasks");
+    ok("ROLE-003: у LOADER-смены в меню есть «Задачи»", await navHas("/warehouse/tasks"));
+    ok("ROLE-003: у LOADER-смены НЕТ «Приёмки» (несмотря на роль RECEIVER)", !(await navHas("/warehouse/receiving")));
+  }
+  if (ids.workToken) {
+    await setAuth(ids.workToken); // активная смена RECEIVER
+    ok("ROLE-003: RECEIVER home → /warehouse/receiving", (await homePath()) === "/warehouse/receiving");
+    await goto("/warehouse/receiving", `!!document.querySelector('input[placeholder="EAN-8 / EAN-13"]') || document.body.innerText.includes("шаг 1")`);
+    t = await bodyText();
+    ok("UI-004: приёмка пошаговая — показан «шаг 1»", has(t, "шаг 1"), t.slice(0, 0));
+    ok("UI-004: на шаге 1 нет будущих полей (нет «Количество, шт»)", !has(t, "Количество, шт"));
+    ok("ROLE-003: у RECEIVER-смены в меню есть «Приёмка»", await navHas("/warehouse/receiving"));
+    ok("ROLE-003: у RECEIVER-смены НЕТ «Задач»", !(await navHas("/warehouse/tasks")));
+  }
+  if (ids.noShiftToken) {
+    await setAuth(ids.noShiftToken); // рабочая роль без активной смены
+    ok("ROLE-003: рабочий без смены home → /warehouse/shift", (await homePath()) === "/warehouse/shift");
   }
 
   console.log(failures === 0 ? "\nE2E RELEASE OK ✓" : `\nПРОВАЛЕНО: ${failures}`);
