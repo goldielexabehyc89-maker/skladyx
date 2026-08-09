@@ -63,7 +63,11 @@ Path: /opt/skladyx
 Staging-домен staging-<org>.skladyx.ru используется как технический контур и не меняет SaaS-схему <org-slug>.skladyx.ru/<module>.
 Деплой — только через скрипты scripts/prod/deploy-staging.sh и deploy-prod.sh, инструкция и запреты в docs/DEPLOY.md.
 Эксплуатационные правила и сверка repo↔сервер: docs/OPERATIONS.md; инвентарь контуров: docs/SERVER_INVENTORY.md.
-Проект перехода к логике РостАгро: docs/ROSTAGRO_WORKFLOW_AUDIT.md и docs/ROSTAGRO_MIGRATION_DESIGN.md (только проект, реализация — по этапам после отдельных решений).
+Утверждённое продуктовое поведение РостАгро и обязательный источник истины:
+`docs/ROSTAGRO_PRODUCT_SPEC.md`. Любое новое бизнес-решение сначала фиксируется там, затем
+реализуется и проверяется по ID правил. `docs/ROSTAGRO_WORKFLOW_AUDIT.md` и
+`docs/ROSTAGRO_MIGRATION_DESIGN.md` — исторические материалы первоначального проектирования;
+они не переопределяют актуальную продуктовую спецификацию.
 
 > Приёмка группами, охлаждение, сборка внешних заказов, контроль и выдача заказов (Пакеты 4–8) технически доставлены на prod, но не активированы: `GROUP_RECEIVING_ENABLED=false`, `COOLING_WORKFLOW_ENABLED=false`, `EXTERNAL_ORDER_PICKING_ENABLED=false`, `ORDER_CONTROL_ENABLED=false`, `ORDER_ISSUE_ENABLED=false`. Полноценные бизнес-сценарии проверены на staging. Не включать до создания реальных справочников РостАгро, утверждения настроек X и warehouse-scoped R (`Warehouse.coolingRate`) и подключения интеграционного адаптера импорта. Активация выполняется отдельной подтверждённой задачей без тестовых движений на prod.
 >
