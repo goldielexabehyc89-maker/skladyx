@@ -195,11 +195,13 @@ export default async function TasksPage({
 
   // TASK-006 (расширение): компактные карточки всех физических задач погрузчика — структурированные
   // контексты (товар/количество/маршрут) грузим ПАКЕТНО, без отдельного запроса на каждую карточку.
-  const loaderCards: Record<string, { taskId: string; command: string; itemName: string; qty: number; from: string; to: string; note?: string }> = {};
+  const loaderCards: Record<string, { taskId: string; command: string; detail: string; from: string; to: string; note?: string }> = {};
   {
     const place = mine.filter((t) => t.type === "PLACE_GROUP" && t.subjectId);
     const cool = mine.filter((t) => t.type === "RETRIEVE_COOLING" && t.subjectId);
     const move = mine.filter((t) => t.type === "MOVE_GROUP" && t.subjectId);
+    const issue = mine.filter((t) => t.type === "ISSUE_ORDER" && t.subjectId);
+    const deliver = mine.filter((t) => t.type === "DELIVER_ORDER" && t.subjectId);
     if (place.length || cool.length || move.length) {
       const directGroupIds = [...place, ...move].map((t) => t.subjectId!);
       const sessions = cool.length
@@ -223,19 +225,55 @@ export default async function TasksPage({
       const cellIds = [...new Set([...sessions.map((x) => x.coolingCellId), ...toCellByGroup.values(), ...fromCellByLot.values()].filter((x): x is string => !!x))];
       const cells = cellIds.length ? await prisma.cell.findMany({ where: { companyId: s.companyId, id: { in: cellIds } }, select: { id: true, code: true } }) : [];
       const cellCode = new Map(cells.map((c) => [c.id, c.code]));
+      const qtyLabel = (g: { itemId: string; qty: Prisma.Decimal }) => `${itemName.get(g.itemId) ?? "Товар"} · ${g.qty.toNumber()} шт`;
       for (const t of place) {
         const g = gById.get(t.subjectId!); if (!g) continue;
-        loaderCards[t.id] = { taskId: t.id, command: "Разместить", itemName: itemName.get(g.itemId) ?? "Товар", qty: g.qty.toNumber(), from: "Приёмка", to: g.status === "AWAITING_COOLING" ? "Охлаждение" : "Хранение" };
+        loaderCards[t.id] = { taskId: t.id, command: "Разместить", detail: qtyLabel(g), from: "Приёмка", to: g.status === "AWAITING_COOLING" ? "Охлаждение" : "Хранение" };
       }
       for (const t of cool) {
         const sess = sessions.find((x) => x.id === t.subjectId); if (!sess) continue;
         const g = gById.get(sess.handlingGroupId); if (!g) continue;
-        loaderCards[t.id] = { taskId: t.id, command: "Забрать из охлаждения", itemName: itemName.get(g.itemId) ?? "Товар", qty: g.qty.toNumber(), from: cellCode.get(sess.coolingCellId) ?? "охлаждение", to: "Хранение", note: "Ячейка будет назначена после замера" };
+        loaderCards[t.id] = { taskId: t.id, command: "Забрать из охлаждения", detail: qtyLabel(g), from: cellCode.get(sess.coolingCellId) ?? "охлаждение", to: "Хранение", note: "Ячейка будет назначена после замера" };
       }
       for (const t of move) {
         const g = gById.get(t.subjectId!); if (!g) continue;
         const toId = toCellByGroup.get(g.id); const fromId = fromCellByLot.get(g.lotId);
-        loaderCards[t.id] = { taskId: t.id, command: "Переместить", itemName: itemName.get(g.itemId) ?? "Товар", qty: g.qty.toNumber(), from: (fromId && cellCode.get(fromId)) || "—", to: (toId && cellCode.get(toId)) || "—" };
+        loaderCards[t.id] = { taskId: t.id, command: "Переместить", detail: qtyLabel(g), from: (fromId && cellCode.get(fromId)) || "—", to: (toId && cellCode.get(toId)) || "—" };
+      }
+    }
+    // ISSUE_ORDER / DELIVER_ORDER (тоже requiredRole=LOADER): пакетно из ExternalOrder, строк и OrderIssueCell.
+    if (issue.length || deliver.length) {
+      const orderIds = [...new Set([...issue, ...deliver].map((t) => t.subjectId!))];
+      const [orders, lines, issueCells] = await Promise.all([
+        prisma.externalOrder.findMany({ where: { companyId: s.companyId, id: { in: orderIds } }, select: { id: true, externalId: true } }),
+        prisma.externalOrderLine.findMany({ where: { orderId: { in: orderIds } }, select: { orderId: true, requiredQty: true } }),
+        prisma.orderIssueCell.findMany({ where: { orderId: { in: orderIds }, status: { not: "RELEASED" } }, orderBy: { reservedAt: "asc" }, select: { orderId: true, cellId: true } }),
+      ]);
+      const orderById = new Map(orders.map((o) => [o.id, o]));
+      const lineAgg = new Map<string, { n: number; qty: number }>();
+      for (const l of lines) { const a = lineAgg.get(l.orderId) ?? { n: 0, qty: 0 }; a.n += 1; a.qty += l.requiredQty.toNumber(); lineAgg.set(l.orderId, a); }
+      const issueCellIds = [...new Set(issueCells.map((c) => c.cellId))];
+      const issueCellRows = issueCellIds.length ? await prisma.cell.findMany({ where: { id: { in: issueCellIds } }, select: { id: true, code: true } }) : [];
+      const issueCellCode = new Map(issueCellRows.map((c) => [c.id, c.code]));
+      const cellsByOrder = new Map<string, string[]>();
+      for (const c of issueCells) { const arr = cellsByOrder.get(c.orderId) ?? []; arr.push(issueCellCode.get(c.cellId) ?? c.cellId); cellsByOrder.set(c.orderId, arr); }
+      const cellsLabel = (orderId: string): string => {
+        const arr = cellsByOrder.get(orderId) ?? [];
+        if (arr.length === 0) return "Выдача";
+        if (arr.length <= 2) return arr.join(", ");
+        return `Ячейки выдачи: ${arr.length}`;
+      };
+      const orderDetail = (orderId: string): string => {
+        const o = orderById.get(orderId); const a = lineAgg.get(orderId) ?? { n: 0, qty: 0 };
+        return `Заказ ${o?.externalId ?? "—"} · ${a.n} поз. · ${a.qty} шт`;
+      };
+      for (const t of issue) {
+        if (!orderById.get(t.subjectId!)) continue;
+        loaderCards[t.id] = { taskId: t.id, command: "Разместить заказ в выдаче", detail: orderDetail(t.subjectId!), from: "Контроль", to: cellsLabel(t.subjectId!) };
+      }
+      for (const t of deliver) {
+        if (!orderById.get(t.subjectId!)) continue;
+        loaderCards[t.id] = { taskId: t.id, command: "Выдать водителю", detail: orderDetail(t.subjectId!), from: cellsLabel(t.subjectId!), to: "Водитель" };
       }
     }
   }
@@ -273,9 +311,13 @@ export default async function TasksPage({
   let cooling: { taskId: string; thresholdX: number; itemName: string; qty: number; coolingCell: string } | null = null;
   if (current && current.type === "RETRIEVE_COOLING" && current.status === "IN_PROGRESS" && coolingWorkflowEnabled()) {
     const session = await prisma.coolingSession.findFirst({ where: { id: current.subjectId ?? "", companyId: s.companyId, status: "ACTIVE" } });
-    const card = loaderCards[current.id];
-    // Структурированные поля (товар/количество/исходная ячейка) — из батча, без парсинга title.
-    if (session && card) cooling = { taskId: current.id, thresholdX: session.thresholdX.toNumber(), itemName: card.itemName, qty: card.qty, coolingCell: card.from };
+    if (session) {
+      // Структурированные поля (товар/количество/исходная ячейка) — из группы/товара/ячейки, без парсинга title.
+      const g = await prisma.handlingGroup.findFirst({ where: { id: session.handlingGroupId, companyId: s.companyId }, select: { itemId: true, qty: true } });
+      const it = g ? await prisma.item.findFirst({ where: { id: g.itemId, companyId: s.companyId }, select: { name: true } }) : null;
+      const cell = await prisma.cell.findFirst({ where: { id: session.coolingCellId }, select: { code: true } });
+      if (g) cooling = { taskId: current.id, thresholdX: session.thresholdX.toNumber(), itemName: it?.name ?? "Товар", qty: g.qty.toNumber(), coolingCell: cell?.code ?? "охлаждение" };
+    }
   }
 
   // Пакет 6: контекст текущей задачи сборки (PICK_ORDER) и перестановки (MOVE_GROUP).

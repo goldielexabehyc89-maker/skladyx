@@ -68,13 +68,15 @@ export interface Cooling {
 // количество + маршрут «откуда → куда»). Строится из структурированных моделей на сервере, пакетно.
 export interface LoaderCard {
   taskId: string;
-  command: string;   // «Разместить» / «Забрать из охлаждения» / «Переместить»
-  itemName: string;
-  qty: number;
+  command: string;   // «Разместить» / «Забрать из охлаждения» / «Переместить» / «Разместить заказ в выдаче» / «Выдать водителю»
+  detail: string;    // «<товар> · <кол-во> шт» или «Заказ <externalId> · <N> поз. · <M> шт»
   from: string;
   to: string;
   note?: string;     // напр. «Ячейка будет назначена после замера»
 }
+// Известные физические типы задач погрузчика — для них компактная карточка обязательна; fallback на
+// техническую карточку не допускается (повреждённый контекст → понятная ошибка, старт заблокирован).
+export const LOADER_PHYSICAL_TYPES = new Set(["PLACE_GROUP", "RETRIEVE_COOLING", "MOVE_GROUP", "ISSUE_ORDER", "DELIVER_ORDER"]);
 export interface PickOrderCtx {
   orderId: string;
   externalId: string;
@@ -124,9 +126,7 @@ function LoaderTaskCard({ card, task, serverNow, canStart, children }: { card: L
         <div className="text-lg font-bold text-[#1a1a1a]">{card.command}</div>
         {urgent && <UrgentChip />}
       </div>
-      <div className="mt-0.5 text-base font-semibold text-[#1a1a1a]">
-        {card.itemName} <span className="whitespace-nowrap font-normal text-neutral-500">· {card.qty} шт</span>
-      </div>
+      <div className="mt-0.5 text-base font-semibold text-[#1a1a1a]">{card.detail}</div>
       <div className="mt-1 flex min-w-0 items-center gap-2">
         <span className="shrink-0 text-base text-neutral-500">{card.from}</span>
         <ArrowRight size={20} className="shrink-0 text-neutral-400" aria-hidden />
@@ -307,9 +307,21 @@ function ShortageForm({ taskId }: { taskId: string }) {
 
 // TASK-005/009: одна строка очереди. Срочная активная задача — светло-красный фон + спокойная рамка,
 // насыщенный бейдж «Срочно» и живой таймер (через TaskMeta). Текст остаётся тёмным.
+// Повреждённый контекст известной физической задачи: понятная ошибка, старт заблокирован (без метаданных).
+function LoaderErrorCard({ task }: { task: TaskDTO }) {
+  return (
+    <div role="alert" className="rounded-xl border border-red-200 bg-red-50 p-3">
+      <div className="text-sm font-semibold text-red-700">Данные задачи недоступны</div>
+      <div className="mt-0.5 text-sm text-neutral-600">Не удалось загрузить товар и маршрут. Обновите список или обратитесь к администратору — задачу нельзя начать.</div>
+    </div>
+  );
+}
+
 function QueueItem({ task, canStart, serverNow, card }: { task: TaskDTO; canStart: boolean; serverNow: string; card?: LoaderCard }) {
-  // TASK-006 (расширение): физическая задача погрузчика — компактная карточка (команда/товар/маршрут).
+  // TASK-006 (расширение): физическая задача погрузчика — компактная карточка (команда/деталь/маршрут).
   if (card) return <LoaderTaskCard card={card} task={task} serverNow={serverNow} canStart={canStart} />;
+  // Известный физический тип без контекста — не откатываемся на техническую карточку.
+  if (LOADER_PHYSICAL_TYPES.has(task.type)) return <LoaderErrorCard task={task} />;
   const urgentCard = isUrgentActive(task);
   return (
     <div className={"rounded-xl border p-3 " + (urgentCard ? "border-red-200 bg-red-50" : "border-[#eee]")}>
@@ -397,6 +409,8 @@ export function WorkerTasks({
       {/* TASK-005: карточку «Текущая задача» рендерим только когда задача есть */}
       {/* TASK-006: PLACE_GROUP «в работе» — компактная карточка (только команда и маршрут), без
           title/description/TaskMeta/типа/статуса/времени. Остальные типы — прежний вид. */}
+      {/* TASK-006 (расширение): все физические задачи погрузчика — компактная карточка (команда/деталь/
+          маршрут) + действия сканирования, без title/description/TaskMeta. */}
       {current && placement && current.status === "IN_PROGRESS" ? (
         <Card>
           <CardTitle>Текущая задача</CardTitle>
@@ -418,6 +432,26 @@ export function WorkerTasks({
             <MoveGroupScanner ctx={moveGroup} />
           </LoaderTaskCard>
         </Card>
+      ) : current && issueOrder && loaderCards[current.id] && current.status === "IN_PROGRESS" ? (
+        <Card>
+          <CardTitle>Текущая задача</CardTitle>
+          <LoaderTaskCard card={loaderCards[current.id]} task={current} serverNow={serverNow}>
+            <IssueOrderPanel ctx={issueOrder} />
+          </LoaderTaskCard>
+        </Card>
+      ) : current && deliverOrder && loaderCards[current.id] && current.status === "IN_PROGRESS" ? (
+        <Card>
+          <CardTitle>Текущая задача</CardTitle>
+          <LoaderTaskCard card={loaderCards[current.id]} task={current} serverNow={serverNow}>
+            <DeliverOrderPanel ctx={deliverOrder} />
+          </LoaderTaskCard>
+        </Card>
+      ) : current && LOADER_PHYSICAL_TYPES.has(current.type) && current.status === "IN_PROGRESS" ? (
+        // Известная физическая задача погрузчика с повреждённым контекстом — ошибка, без метаданных.
+        <Card>
+          <CardTitle>Текущая задача</CardTitle>
+          <LoaderErrorCard task={current} />
+        </Card>
       ) : current && (
         <Card>
           <CardTitle>Текущая задача</CardTitle>
@@ -433,12 +467,6 @@ export function WorkerTasks({
                   <Button className="w-full">Открыть</Button>
                 </Link>
               )}
-              {cooling && current.status === "IN_PROGRESS" && <CoolingBlock cooling={cooling} />}
-              {moveGroup && current.status === "IN_PROGRESS" && (
-                <>
-                  <MoveGroupScanner ctx={moveGroup} />
-                </>
-              )}
               {pickOrder && current.status === "IN_PROGRESS" && (
                 <>
                   <PickOrderScanner ctx={pickOrder} taskId={current.id} />
@@ -447,8 +475,6 @@ export function WorkerTasks({
               )}
               {controlOrder && current.status === "IN_PROGRESS" && <ControlOrderPanel ctx={controlOrder} />}
               {correctOrder && current.status === "IN_PROGRESS" && <CorrectOrderPanel ctx={correctOrder} />}
-              {issueOrder && current.status === "IN_PROGRESS" && <IssueOrderPanel ctx={issueOrder} />}
-              {deliverOrder && current.status === "IN_PROGRESS" && <DeliverOrderPanel ctx={deliverOrder} />}
               {current.status === "IN_PROGRESS" && <HandoffForm taskId={current.id} mates={mates} />}
               {current.status === "HANDOFF_PENDING" && (
                 <p className="text-xs text-orange-600">Ожидает принятия передачи получателем.</p>

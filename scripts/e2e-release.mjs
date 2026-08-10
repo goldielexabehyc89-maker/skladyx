@@ -556,6 +556,109 @@ async function main() {
     ok("TASK-006*: desktop без горизонтального скролла", await ev(`document.documentElement.scrollWidth <= window.innerWidth + 1`));
   }
 
+  // ── Коррекция Задачи G (P1): компактные карточки задач ВЫДАЧИ (ISSUE_ORDER / DELIVER_ORDER) —
+  //    единый формат «команда · заказ · N поз. · M шт · маршрут», без техзаголовка/типа/статуса/времени.
+  const noTechMeta = (txt) =>
+    !has(txt, "Размещение в выдаче") && !has(txt, "Выдача водителю") &&      // ярлыки ТИПА задачи
+    !has(txt, "Разместить в выдаче: заказ") && !has(txt, "Выдать водителю: заказ") && // техЗАГОЛОВКИ
+    !has(txt, "создано") && !has(txt, "Назначена");                          // время создания / статус
+  // При активной текущей задаче очередь свёрнута (TASK-005) — раскрываем, чтобы увидеть карточки «до начала».
+  const expandQueue = async () => { await clickText("/Показать/"); await sleep(500); };
+  if (ids.izLoaderToken) {
+    await setViewport(true); // мобайл
+    await setAuth(ids.izLoaderToken);
+    await goto("/warehouse/tasks", `document.body.innerText.includes("Разместить заказ в выдаче")`);
+    t = await bodyText();
+    // ISSUE_ORDER «в работе»: команда + номер заказа + N поз. + M шт + маршрут «Контроль → ячейки»
+    ok("Выдача*: ISSUE «в работе» — команда «Разместить заказ в выдаче»", has(t, "Разместить заказ в выдаче"));
+    ok("Выдача*: ISSUE — номер заказа/позиции/количество", has(t, `Заказ ${ids.issueWipExt}`) && has(t, "3 поз.") && has(t, "15 шт"), t.slice(0, 0));
+    ok("Выдача*: ISSUE — маршрут «Контроль → ячейки выдачи»", has(t, "Контроль") && has(t, "IZ-01") && has(t, "IZ-02"));
+    // DELIVER_ORDER «до начала» (в свёрнутой очереди — раскрываем)
+    await expandQueue();
+    t = await bodyText();
+    ok("Выдача*: DELIVER «до начала» — команда «Выдать водителю»", has(t, "Выдать водителю"));
+    ok("Выдача*: DELIVER — номер/позиции/количество/маршрут → Водитель", has(t, `Заказ ${ids.deliverWaitExt}`) && has(t, "2 поз.") && has(t, "10 шт") && has(t, "IZ-09") && has(t, "Водитель"));
+    ok("Выдача*: НЕТ техзаголовка/типа/статуса/времени создания", noTechMeta(t), t.slice(0, 0));
+    ok("Выдача*: мобайл без горизонтального скролла", await ev(`document.documentElement.scrollWidth <= window.innerWidth + 1`));
+  }
+  if (ids.dvLoaderToken) {
+    await setViewport(true);
+    await setAuth(ids.dvLoaderToken);
+    await goto("/warehouse/tasks", `document.body.innerText.includes("Выдать водителю")`);
+    t = await bodyText();
+    // DELIVER_ORDER «в работе»
+    ok("Выдача*: DELIVER «в работе» — команда/номер/позиции/количество", has(t, "Выдать водителю") && has(t, `Заказ ${ids.deliverWipExt}`) && has(t, "2 поз.") && has(t, "10 шт"));
+    ok("Выдача*: DELIVER «в работе» — маршрут «ячейка → Водитель»", has(t, "DV-01") && has(t, "Водитель"));
+    // ISSUE_ORDER «до начала» (в свёрнутой очереди — раскрываем)
+    await expandQueue();
+    t = await bodyText();
+    ok("Выдача*: ISSUE «до начала» — команда/номер/позиции/количество/маршрут", has(t, "Разместить заказ в выдаче") && has(t, `Заказ ${ids.issueWaitExt}`) && has(t, "1 поз.") && has(t, "9 шт") && has(t, "Контроль") && has(t, "DV-09"));
+    ok("Выдача*: НЕТ техзаголовка/типа/статуса/времени создания", noTechMeta(t), t.slice(0, 0));
+    ok("Выдача*: мобайл без горизонтального скролла", await ev(`document.documentElement.scrollWidth <= window.innerWidth + 1`));
+  }
+
+  // ── Коррекция Задачи G (P2): браузерный замер охлаждения. ≤X → точная целевая ячейка; >X → новый
+  //    срок без ложного движения. Проходим мастер замера вручную (тот же путь, что ручной ввод скана). ──
+  const sheetUp = async () => { for (let i = 0; i < 40; i++) { if (await ev(`!!document.querySelector('[data-workflow-sheet]')`)) return true; await sleep(150); } return false; };
+  const sheetTxt = () => ev(`document.querySelector('[data-workflow-sheet]')?.innerText || ""`);
+  // На шаге температуры в шторке два поля (ручной ввод ячейки + числовое поле замера) — целимся именно
+  // в числовое поле замера (input[type=number]), иначе температура уходит не в тот input.
+  const setSheetNumber = (val) => ev(`(()=>{const el=[...document.querySelectorAll('[data-workflow-sheet] input[type="number"]')].find(e=>e.offsetParent!==null); if(!el) return 0; const set=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el),'value').set; set.call(el,${JSON.stringify(val)}); el.dispatchEvent(new Event('input',{bubbles:true})); return 1;})()`);
+  const waitSheetField = async () => { for (let i = 0; i < 30; i++) { if (await sheetCount()) return true; await sleep(150); } return false; };
+  const measure = async (cellQr, ean, temp) => {
+    await sleep(600); await clickText("/Забрать из охлаждения/");
+    if (!(await sheetUp())) return false;
+    // ручной ввод доступен только в режиме сканирования — включаем его на шаге ячейки охлаждения
+    await sleep(300); await clickText("/Сканировать ячейку охлаждения/");
+    if (!(await waitSheetField())) return false;
+    await setSheetField(cellQr); await clickText("/Ввести/");                     // шаг ячейки охлаждения
+    for (let i = 0; i < 30 && !(await sheetTxt()).includes("EAN"); i++) await sleep(150);
+    await waitSheetField(); await setSheetField(ean); await clickText("/Ввести/"); // шаг EAN (режим скан сохраняется)
+    for (let i = 0; i < 30 && !(await sheetTxt()).includes("Температ"); i++) await sleep(150);
+    if (!(await setSheetNumber(String(temp)))) return false;                      // шаг температуры (числовое поле)
+    await clickText("/Записать замер/");
+    return true;
+  };
+  if (ids.coolLeqToken && ids.coolLeqCellQr) {
+    await setViewport(true);
+    await setAuth(ids.coolLeqToken);
+    await goto("/warehouse/tasks", `document.body.innerText.includes("Забрать из охлаждения")`);
+    ok("Охлаждение ≤X: карточка забора в работе", has(await bodyText(), "Забрать из охлаждения"));
+    const opened = await measure(ids.coolLeqCellQr, ids.ean, ids.thresholdX - 2);
+    ok("Охлаждение ≤X: мастер замера открыт и пройден", opened);
+    let leqReady = false;
+    for (let i = 0; i < 60; i++) { const s = await sheetTxt(); if (s.includes(ids.coolLeqTargetCode) && (s.includes("Готово к вывозу") || s.includes("Фаза 2"))) { leqReady = true; break; } await sleep(200); }
+    const s = await sheetTxt();
+    ok("Охлаждение ≤X: показана ТОЧНАЯ целевая ячейка после замера", leqReady && has(s, ids.coolLeqTargetCode), s.slice(0, 0));
+    ok("Охлаждение ≤X: нет «Ещё охлаждается» (замер прошёл)", !has(s, "Ещё охлаждается") && !has(await bodyText(), "Ещё охлаждается"));
+    ok("Охлаждение ≤X: мобайл без горизонтального скролла", await ev(`document.documentElement.scrollWidth <= window.innerWidth + 1`));
+  }
+  if (ids.coolGtToken && ids.coolGtCellQr) {
+    await setViewport(true);
+    await setAuth(ids.coolGtToken);
+    await goto("/warehouse/tasks", `document.body.innerText.includes("Забрать из охлаждения")`);
+    const opened = await measure(ids.coolGtCellQr, ids.ean, ids.thresholdX + 5);
+    ok("Охлаждение >X: мастер замера открыт и пройден", opened);
+    // Замер >X завершает текущий забор и планирует ПОВТОРНЫЙ на новый срок (revalidate убирает задачу с
+    // доски исполнителя). «Без ложного движения» — забор не доведён до хранения: нет «Готово к вывозу»/
+    // «Размещено», задача ушла из «в работе».
+    let cycled = false;
+    for (let i = 0; i < 60; i++) { const bt = await bodyText(); if (!bt.includes("Готово к вывозу") && (bt.includes("Задач пока нет") || !bt.includes("Забрать из охлаждения"))) { cycled = true; break; } await sleep(200); }
+    const bt = await bodyText();
+    ok("Охлаждение >X: забор не доведён до хранения (нет ложного движения)",
+      cycled && !has(bt, "Готово к вывозу") && !has(bt, "Размещено") && !has(bt, "Забрано из охлаждения"), bt.slice(0, 0));
+    // Новый срок виден в мониторе (ADMIN): запланированный RETRIEVE_COOLING этого склада + «Доступна с (МСК)».
+    if (ids.adminToken && ids.coolGtWhId) {
+      await setViewport(false);
+      await setAuth(ids.adminToken);
+      await goto(`/warehouse/tasks?view=monitor&warehouse=${encodeURIComponent(ids.coolGtWhId)}`, `document.body.innerText.includes("Забор из охлаждения") || document.body.innerText.includes("Задач нет")`);
+      const mt = await bodyText();
+      ok("Охлаждение >X: назначен НОВЫЙ срок — «Запланирована» повторного забора", has(mt, "Забор из охлаждения") && has(mt, "Запланирована"), mt.slice(0, 0));
+      ok("Охлаждение >X: новый срок показан московским временем «Доступна с … (МСК)»", has(mt, "Доступна с") && has(mt, "(МСК)"));
+      ok("Охлаждение >X: в мониторе склада нет ложного движения (нет «Размещено»)", !has(mt, "Размещено"));
+    }
+  }
+
   console.log(failures === 0 ? "\nE2E RELEASE OK ✓" : `\nПРОВАЛЕНО: ${failures}`);
   process.exit(failures === 0 ? 0 : 1);
 }

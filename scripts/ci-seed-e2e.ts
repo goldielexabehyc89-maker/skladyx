@@ -296,6 +296,98 @@ async function main() {
   const coolSession = await prisma.coolingSession.create({ data: { companyId, warehouseId: cardsWh.id, handlingGroupId: coolGroup.id, coolingCellId: ohCell.id, startTemp: 20, thresholdX: X, coolingRate: 2, estimatedReadyAt: new Date(Date.now() + 3_600_000), status: "ACTIVE" } });
   await createWorkflowTask({ companyId, warehouseId: cardsWh.id, type: "RETRIEVE_COOLING", requiredRole: "LOADER", priority: "URGENT", title: "Забор из охлаждения", dedupeKey: "ci-cards-cool-task", subjectId: coolSession.id, availableAt: new Date(Date.now() - 1_000) });
 
+  // Подписанный session-токен по userId (nav-роль = активная рабочая роль). Определён здесь, т.к. нужен
+  // фикстурам выдачи/охлаждения ниже; используется и в основной секции токенов.
+  const mkToken = async (userId: string, navRole: Role) => {
+    const u = await prisma.user.findFirstOrThrow({ where: { companyId, id: userId }, include: { userRoles: { select: { role: true } } } });
+    return createSessionToken({ userId: u.id, login: u.phone ?? u.email ?? "", name: u.name, role: navRole, roles: u.userRoles.map((r) => r.role), companyId });
+  };
+
+  // ── Коррекция Задачи G: компактные карточки задач ВЫДАЧИ погрузчика (ISSUE_ORDER / DELIVER_ORDER,
+  //    тоже requiredRole=LOADER). Отдельные склады/погрузчики, чтобы состояния «до начала» (ASSIGNED)
+  //    и «в работе» (IN_PROGRESS) были детерминированы. Заказ/строки/ячейки выдачи создаём напрямую
+  //    (рендер карточки + панели читают ExternalOrder + ExternalOrderLine + OrderIssueCell пакетно).
+  const mkIssueWh = async (name: string, phone: string, userName: string) => {
+    const w = await prisma.warehouse.create({ data: { companyId, name: `${name}-${Date.now()}`, isActive: true, coolingRate: 2 } });
+    await ensureStandardZones(companyId, w.id);
+    const zIssue = await prisma.warehouseZone.findFirstOrThrow({ where: { companyId, warehouseId: w.id, kind: "ISSUE" } });
+    const ldr = await mkUser(companyId, phone, userName, "LOADER", `${phone.slice(-4)}-pass`, w.id);
+    await prisma.workShift.create({ data: { companyId, userId: ldr, warehouseId: w.id, role: "LOADER" } });
+    return { whId: w.id, issueZoneId: zIssue.id, loaderId: ldr };
+  };
+  // Создать заказ + строки + занятые ячейки выдачи + задачу (тип/статус задаём явно).
+  const mkOrderTask = async (opts: {
+    whId: string; issueZoneId: string; loaderId: string; externalId: string; qtys: number[];
+    cellCodes: string[]; type: "ISSUE_ORDER" | "DELIVER_ORDER"; status: "ASSIGNED" | "IN_PROGRESS"; cellStatus: "RESERVED" | "PLACED";
+  }) => {
+    const order = await prisma.externalOrder.create({ data: { companyId, warehouseId: opts.whId, externalId: opts.externalId, status: opts.type === "ISSUE_ORDER" ? "MOVING_TO_ISSUE" : "READY_FOR_DRIVER", payloadHash: `ci-${opts.externalId}` } });
+    for (let i = 0; i < opts.qtys.length; i++)
+      await prisma.externalOrderLine.create({ data: { companyId, orderId: order.id, externalLineId: String(i + 1), itemId: item.id, requiredQty: opts.qtys[i] } });
+    await createCellsInZone({ companyId, warehouseId: opts.whId, zoneId: opts.issueZoneId, codes: opts.cellCodes, level: null });
+    for (const code of opts.cellCodes) {
+      const c = await prisma.cell.findFirstOrThrow({ where: { companyId, warehouseId: opts.whId, code } });
+      await prisma.orderIssueCell.create({ data: { companyId, orderId: order.id, warehouseId: opts.whId, cellId: c.id, status: opts.cellStatus, placedAt: opts.cellStatus === "PLACED" ? new Date() : null } });
+    }
+    const shift = await prisma.workShift.findFirstOrThrow({ where: { companyId, userId: opts.loaderId, endedAt: null } });
+    await prisma.workflowTask.create({ data: {
+      companyId, warehouseId: opts.whId, type: opts.type, requiredRole: "LOADER",
+      priority: opts.type === "ISSUE_ORDER" ? "URGENT" : "NORMAL",
+      status: opts.status, title: `${opts.type === "ISSUE_ORDER" ? "Разместить в выдаче" : "Выдать водителю"}: заказ ${opts.externalId}`,
+      subjectType: "externalOrder", subjectId: order.id, dedupeKey: `ci-${opts.type}-${order.id}`,
+      assignedUserId: opts.loaderId, assignedShiftId: shift.id, assignedAt: new Date(),
+      startedAt: opts.status === "IN_PROGRESS" ? new Date() : null, availableAt: new Date(Date.now() - 1_000),
+    } });
+    return order.id;
+  };
+  // Склад IZ: ISSUE_ORDER «в работе» (2 ячейки) + DELIVER_ORDER «до начала» (1 ячейка).
+  const izWh = await mkIssueWh("CI-ISSUE", "+79000009921", "CI Погрузчик-выдача-IZ");
+  const ISSUE_WIP_EXT = "EO-ISS-701", DELIVER_WAIT_EXT = "EO-DEL-702";
+  await mkOrderTask({ ...izWh, externalId: ISSUE_WIP_EXT, qtys: [4, 6, 5], cellCodes: ["IZ-01", "IZ-02"], type: "ISSUE_ORDER", status: "IN_PROGRESS", cellStatus: "PLACED" });
+  await mkOrderTask({ ...izWh, externalId: DELIVER_WAIT_EXT, qtys: [3, 7], cellCodes: ["IZ-09"], type: "DELIVER_ORDER", status: "ASSIGNED", cellStatus: "PLACED" });
+  const izLoaderToken = await mkToken(izWh.loaderId, "LOADER");
+  // Склад DV: DELIVER_ORDER «в работе» (1 ячейка) + ISSUE_ORDER «до начала» (1 ячейка).
+  const dvWh = await mkIssueWh("CI-DELIVER", "+79000009922", "CI Погрузчик-выдача-DV");
+  const DELIVER_WIP_EXT = "EO-DEL-801", ISSUE_WAIT_EXT = "EO-ISS-802";
+  await mkOrderTask({ ...dvWh, externalId: DELIVER_WIP_EXT, qtys: [8, 2], cellCodes: ["DV-01"], type: "DELIVER_ORDER", status: "IN_PROGRESS", cellStatus: "PLACED" });
+  await mkOrderTask({ ...dvWh, externalId: ISSUE_WAIT_EXT, qtys: [9], cellCodes: ["DV-09"], type: "ISSUE_ORDER", status: "ASSIGNED", cellStatus: "RESERVED" });
+  const dvLoaderToken = await mkToken(dvWh.loaderId, "LOADER");
+
+  // ── Коррекция Задачи G (P2): engine-совместимые сессии охлаждения для браузерного замера. Замер
+  //    (prepareCoolingRetrieval) требует ACTIVE-сессию + ACTIVE-резерв с sessionId. Флаг охлаждения при
+  //    seed не включён, поэтому воспроизводим состояние startCoolingInTx напрямую: COOLING-ячейка (скан),
+  //    STORAGE l1 (цель ≤X), STORAGE l3 (верхний резерв под sessionId), RETRIEVE_COOLING «в работе».
+  let coolRecSeq = 9970000; // высокая база номеров приёмок для фикстур охлаждения (без коллизий с другими)
+  const seedCoolingSession = async (name: string, phone: string, userName: string, coolCode: string, targetCode: string) => {
+    const w = await prisma.warehouse.create({ data: { companyId, name: `${name}-${Date.now()}`, isActive: true, coolingRate: 2 } });
+    await ensureStandardZones(companyId, w.id);
+    const zStorage = await prisma.warehouseZone.findFirstOrThrow({ where: { companyId, warehouseId: w.id, kind: "STORAGE" } });
+    const zCool = await prisma.warehouseZone.findFirstOrThrow({ where: { companyId, warehouseId: w.id, kind: "COOLING" } });
+    await createCellsInZone({ companyId, warehouseId: w.id, zoneId: zCool.id, codes: [coolCode], level: null });
+    await createCellsInZone({ companyId, warehouseId: w.id, zoneId: zStorage.id, codes: [targetCode], level: 1 });        // цель забора ≤X
+    await createCellsInZone({ companyId, warehouseId: w.id, zoneId: zStorage.id, codes: [`${targetCode}-R3`], level: 3 }); // верхний резерв
+    const ldr = await mkUser(companyId, phone, userName, "LOADER", `${phone.slice(-4)}-pass`, w.id);
+    await prisma.workShift.create({ data: { companyId, userId: ldr, warehouseId: w.id, role: "LOADER" } });
+    const coolCell = await prisma.cell.findFirstOrThrow({ where: { companyId, warehouseId: w.id, code: coolCode } });
+    const reserveCell = await prisma.cell.findFirstOrThrow({ where: { companyId, warehouseId: w.id, code: `${targetCode}-R3` } });
+    const rec = await prisma.receipt.create({ data: { companyId, number: ++coolRecSeq, warehouseId: w.id, status: "POSTED", postedAt: new Date(), createdById: ldr } });
+    const line = await prisma.receiptLine.create({ data: { companyId, receiptId: rec.id, itemId: item.id, qty: 5 } });
+    const lot = await prisma.lot.create({ data: { companyId, itemId: item.id, receiptLineId: line.id, qtyReceived: 5 } });
+    const group = await prisma.handlingGroup.create({ data: { companyId, warehouseId: w.id, itemId: item.id, lotId: lot.id, qty: 5, temperature: 20, thresholdX: X, status: "IN_COOLING", dedupeKey: `ci-cool-${name}`, acceptedById: ldr } });
+    const session = await prisma.coolingSession.create({ data: { companyId, warehouseId: w.id, handlingGroupId: group.id, coolingCellId: coolCell.id, startTemp: 20, thresholdX: X, coolingRate: 2, estimatedReadyAt: new Date(Date.now() + 3_600_000), status: "ACTIVE" } });
+    const shift = await prisma.workShift.findFirstOrThrow({ where: { companyId, userId: ldr, endedAt: null } });
+    const task = await prisma.workflowTask.create({ data: {
+      companyId, warehouseId: w.id, type: "RETRIEVE_COOLING", requiredRole: "LOADER", priority: "URGENT", status: "IN_PROGRESS",
+      title: "Забор из охлаждения", subjectType: "CoolingSession", subjectId: session.id, dedupeKey: `ci-cool-task-${session.id}`,
+      assignedUserId: ldr, assignedShiftId: shift.id, assignedAt: new Date(), startedAt: new Date(), availableAt: new Date(Date.now() - 1_000),
+    } });
+    // Верхний резерв под sessionId (как в startCoolingInTx) — обязателен для замера.
+    await prisma.cellReservation.create({ data: { companyId, warehouseId: w.id, cellId: reserveCell.id, handlingGroupId: group.id, sessionId: session.id, taskId: task.id, status: "ACTIVE" } });
+    const coolQr = (await prisma.qrCode.findFirstOrThrow({ where: { type: "CELL", refId: coolCell.id } })).code;
+    return { token: await mkToken(ldr, "LOADER"), coolQr, whId: w.id };
+  };
+  const coolLeq = await seedCoolingSession("CI-COOL-LEQ", "+79000009931", "CI Охлаждение ≤X", "OHL-01", "SL-01");
+  const coolGt = await seedCoolingSession("CI-COOL-GT", "+79000009932", "CI Охлаждение >X", "OHG-01", "SG-01");
+
   // Подписанные session-токены для e2e (аутентификация инъекцией cookie skx_session — без
   // зависимости от гидрации формы логина; при TENANT_AUTH=true сессия ре-валидируется из БД по host).
   const admin = await prisma.user.findFirstOrThrow({
@@ -313,10 +405,6 @@ async function main() {
   const loaderToken = await createSessionToken({ userId: loaderU.id, login: loaderU.phone ?? loaderU.email ?? "", name: loaderU.name, role: "LOADER", roles: loaderU.userRoles.map((r) => r.role), companyId });
   const noShiftToken = await createSessionToken({ userId: noShiftU.id, login: noShiftU.phone ?? noShiftU.email ?? "", name: noShiftU.name, role: "PICKER", roles: noShiftU.userRoles.map((r) => r.role), companyId });
 
-  const mkToken = async (userId: string, navRole: Role) => {
-    const u = await prisma.user.findFirstOrThrow({ where: { companyId, id: userId }, include: { userRoles: { select: { role: true } } } });
-    return createSessionToken({ userId: u.id, login: u.phone ?? u.email ?? "", name: u.name, role: navRole, roles: u.userRoles.map((r) => r.role), companyId });
-  };
   const startToken = await mkToken(startRecv, "RECEIVER");      // приёмщик без смены — реальный старт смены
   const adminRecvToken = await mkToken(adminRecv, "ADMIN");     // ADMIN + активная смена RECEIVER
   const adminLoadToken = await mkToken(adminLoad, "ADMIN");     // ADMIN + активная смена LOADER
@@ -354,6 +442,20 @@ async function main() {
     schedFarTitle: schedFar.title,    // QUEUED в будущем (>суток): формат «N д …»
     asgUrgentTitle: asgUrgent.title,  // ASSIGNED срочная: «Ожидает начала»
     cardsLoaderToken,                 // TASK-006 расширение: компактные карточки PLACE/COOLING/MOVE
+    // Коррекция Задачи G: полный охват LOADER — карточки выдачи + браузерный замер охлаждения
+    izLoaderToken,                    // ISSUE_ORDER «в работе» + DELIVER_ORDER «до начала»
+    dvLoaderToken,                    // DELIVER_ORDER «в работе» + ISSUE_ORDER «до начала»
+    issueWipExt: ISSUE_WIP_EXT,       // номер заказа ISSUE «в работе» (3 поз., 15 шт, ячейки IZ-01/IZ-02)
+    deliverWaitExt: DELIVER_WAIT_EXT, // номер заказа DELIVER «до начала» (2 поз., 10 шт, ячейка IZ-09)
+    deliverWipExt: DELIVER_WIP_EXT,   // номер заказа DELIVER «в работе» (2 поз., 10 шт, ячейка DV-01)
+    issueWaitExt: ISSUE_WAIT_EXT,     // номер заказа ISSUE «до начала» (1 поз., 9 шт, ячейка DV-09)
+    thresholdX: X,                    // порог X — температуры замера ≤X (X-2) и >X (X+5)
+    coolLeqToken: coolLeq.token,      // охлаждение: замер ≤X → точная целевая ячейка SL-01
+    coolLeqCellQr: coolLeq.coolQr,
+    coolLeqTargetCode: "SL-01",
+    coolGtToken: coolGt.token,        // охлаждение: замер >X → новый срок, без ложного движения
+    coolGtCellQr: coolGt.coolQr,
+    coolGtWhId: coolGt.whId,          // фильтр монитора: новый запланированный забор (новый срок)
   }));
   process.exit(0);
 }

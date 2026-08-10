@@ -38,12 +38,6 @@ export interface DeliverOrderCtx {
   cells: { cell: string }[];
 }
 
-const fmtArrival = (iso: string | null) => {
-  if (!iso) return "—";
-  const d = new Date(iso);
-  return `${String(d.getDate()).padStart(2, "0")}.${String(d.getMonth() + 1).padStart(2, "0")} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
-};
-
 // ── Размещение: скан QR заказа → ячейки → группы камерой ──
 function PlaceScanner({ taskId }: { taskId: string }) {
   const router = useRouter();
@@ -140,7 +134,7 @@ function FinishPlacementForm({ ctx }: { ctx: IssueOrderCtx }) {
 export function IssueOrderPanel({ ctx }: { ctx: IssueOrderCtx }) {
   return (
     <div className="flex flex-col gap-2">
-      <div className="text-xs font-medium text-neutral-500">Размещение заказа {ctx.externalId} · приезд {fmtArrival(ctx.arrivalAt)} · в контроле ещё {ctx.remainingInControl}</div>
+      {/* TASK-006 (расширение): технический заголовок (заказ/приезд) убран — он в компактной карточке. */}
       <div className="text-xs font-medium text-neutral-500">Ячейки выдачи</div>
       {ctx.cells.length === 0 ? (
         <p className="text-xs text-neutral-400">Ячейка ещё не зарезервирована.</p>
@@ -236,7 +230,7 @@ function DeliverScanner({ ctx }: { ctx: DeliverOrderCtx }) {
 export function DeliverOrderPanel({ ctx }: { ctx: DeliverOrderCtx }) {
   return (
     <div className="flex flex-col gap-2">
-      <div className="text-xs font-medium text-neutral-500">Выдача заказа {ctx.externalId} водителю · приезд {fmtArrival(ctx.arrivalAt)}</div>
+      {/* TASK-006 (расширение): технический заголовок убран — заказ/маршрут в компактной карточке. */}
       <div className="text-xs font-medium text-neutral-500">Ячейки выдачи заказа ({ctx.cells.length}):</div>
       {ctx.cells.map((c, i) => (
         <div key={i} className="rounded-xl bg-[#f7f8fc] px-3 py-2 text-sm">{c.cell}</div>
