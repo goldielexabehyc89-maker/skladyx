@@ -6,6 +6,7 @@
 /* eslint-disable no-console */
 import { PrismaClient } from "@prisma/client";
 import http from "node:http";
+import { applyLotMovement } from "@/lib/stock";
 
 const prisma = new PrismaClient();
 const BASE = process.env.VERIFY_BASE || "http://localhost:3000";
@@ -62,6 +63,11 @@ const EAN_C = ean13("460000100003");
 const EAN_UNKNOWN = ean13("460000100099");
 const EAN_BAD = "4600001000015"; // неверная контрольная цифра
 const EAN_CONC = ean13("460000100077"); // для конкурентного upsert
+// ORDER-002: автопланирование заказа после импорта — товары с реальным остатком.
+const EAN_STK1 = ean13("460000100111"); // полное покрытие
+const EAN_STK2 = ean13("460000100112"); // частичное → дозаполнение
+const EAN_STK3 = ean13("460000100113"); // без остатка
+const EAN_STK4 = ean13("460000100114"); // параллельные запросы
 // Вторая реальная тестовая организация (для проверки привязки токена к slug).
 const SLUG2 = process.env.INTEGRATION_TEST_SLUG2 || "acme10test";
 const FOREIGN_HOST = HOST.replace(SLUG, SLUG2); // тот же контур (префикс сохраняется), другой slug
@@ -118,6 +124,27 @@ async function cleanup() {
   // товары теста (source API, externalId с префиксом)
   const items = await prisma.item.findMany({ where: { companyId, externalId: { startsWith: P } }, select: { id: true } });
   const itemIds = items.map((i) => i.id);
+  // ORDER-002: посеянный остаток в WT (эфемерная CI-БД). Чистим в FK-порядке (дети → родители),
+  // best-effort — остаточная FK-ошибка не должна ронять прогон на выбрасываемой БД.
+  if (!SAFE && WT) {
+    try {
+      const cells = await prisma.cell.findMany({ where: { warehouseId: WT }, select: { id: true } });
+      const cellIds = cells.map((c) => c.id);
+      if (cellIds.length) {
+        await prisma.stockMovement.deleteMany({ where: { OR: [{ fromCellId: { in: cellIds } }, { toCellId: { in: cellIds } }] } });
+        await prisma.stockBalance.deleteMany({ where: { cellId: { in: cellIds } } });
+      }
+      await prisma.cellReservation.deleteMany({ where: { warehouseId: WT } });
+      await prisma.workflowTask.deleteMany({ where: { warehouseId: WT } }); // каскадит deps/handoffs
+      await prisma.handlingGroup.deleteMany({ where: { warehouseId: WT } });
+      if (itemIds.length) await prisma.lot.deleteMany({ where: { itemId: { in: itemIds } } });
+      const receipts = await prisma.receipt.findMany({ where: { warehouseId: WT }, select: { id: true } });
+      const rids = receipts.map((r) => r.id);
+      if (rids.length) { await prisma.receiptLine.deleteMany({ where: { receiptId: { in: rids } } }); await prisma.receipt.deleteMany({ where: { id: { in: rids } } }); }
+      await prisma.cell.deleteMany({ where: { warehouseId: WT } });
+      await prisma.warehouseZone.deleteMany({ where: { warehouseId: WT } });
+    } catch (e) { console.warn("  (очистка остатка WT best-effort):", (e as Error).message); }
+  }
   if (itemIds.length) {
     await prisma.itemBarcode.deleteMany({ where: { itemId: { in: itemIds } } });
     await prisma.item.deleteMany({ where: { id: { in: itemIds } } });
@@ -271,6 +298,98 @@ async function main() {
     ok("нет 409/500", ![r1.status, r2.status].some((s) => s === 409 || s >= 500));
     ok("ровно один Item", (await prisma.item.count({ where: { companyId, externalId: `${P}CONC` } })) === 1);
     ok("ровно один ItemBarcode", (await prisma.itemBarcode.count({ where: { companyId, code: EAN_CONC } })) === 1);
+  }
+
+  // ── ORDER-002: заказ из API автоматически резервируется/планируется (без ручного администратора) ──
+  // Требует посева остатка в единственный активный склад WT (эфемерная CI-БД). В SAFE (staging) — пропуск,
+  // чтобы не трогать данные владельца; логика планирования дополнительно покрыта verify-external-orders.
+  if (SAFE) {
+    console.log("17) автопланирование заказа после импорта — ПРОПУСК в SAFE (не сеем остаток на staging)");
+  } else {
+    console.log("17) автопланирование заказа после импорта (ORDER-002)");
+    const anyUser = await prisma.user.findFirstOrThrow({ where: { companyId } });
+    let zone = await prisma.warehouseZone.findFirst({ where: { companyId, warehouseId: WT, kind: "STORAGE" } });
+    if (!zone) zone = await prisma.warehouseZone.create({ data: { companyId, warehouseId: WT, kind: "STORAGE", code: "STORAGE", name: "Хранение", sortOrder: 20 } });
+    let recSeq = 770000;
+    // Реальный остаток: партия + движение приёмки в STORAGE-ячейку ур.1 + группа IN_STORAGE.
+    const seedStock = async (itemId: string, qty: number, cellCode: string) => {
+      let cell = await prisma.cell.findFirst({ where: { companyId, warehouseId: WT, code: cellCode } });
+      if (!cell) cell = await prisma.cell.create({ data: { companyId, warehouseId: WT, zoneId: zone!.id, code: cellCode, level: 1, isActive: true } });
+      const receipt = await prisma.receipt.create({ data: { companyId, number: ++recSeq, warehouseId: WT, status: "POSTED", postedAt: new Date(), createdById: anyUser.id } });
+      const line = await prisma.receiptLine.create({ data: { companyId, receiptId: receipt.id, itemId, qty } });
+      const lot = await prisma.lot.create({ data: { companyId, itemId, receiptLineId: line.id, qtyReceived: qty } });
+      await prisma.$transaction((tx) => applyLotMovement(tx, { companyId, docType: "RECEIPT", docId: receipt.id, itemId, lotId: lot.id, qty, from: null, to: { kind: "cell", warehouseId: WT, cellId: cell!.id }, createdById: anyUser.id }));
+      await prisma.handlingGroup.create({ data: { companyId, warehouseId: WT, itemId, lotId: lot.id, qty, temperature: 0, thresholdX: 8, status: "IN_STORAGE", dedupeKey: `it10-grp-${lot.id}`, acceptedById: anyUser.id } });
+    };
+    const mkItem = async (ext: string, ean: string) =>
+      (await post("/api/integration/v1/items", { items: [{ externalId: ext, name: `Товар ${ext}`, ean }] })).status;
+    const orderState = async (ext: string) => {
+      const o = await prisma.externalOrder.findFirstOrThrow({ where: { companyId, externalId: ext }, include: { lines: true } });
+      const resv = await prisma.stockReservation.findMany({ where: { orderId: o.id, status: "ACTIVE" } });
+      const picks = await prisma.workflowTask.count({ where: { companyId, type: "PICK_ORDER", subjectId: o.id } });
+      const resvQty = resv.reduce((s, r) => s + r.qty.toNumber(), 0);
+      return { id: o.id, status: o.status, resvCount: resv.length, resvQty, picks, reserved: o.lines.reduce((s, l) => s + l.reservedQty.toNumber(), 0) };
+    };
+    const movCount = () => prisma.stockMovement.count({ where: { companyId } });
+
+    // 17a) полное покрытие (ур.1) → READY_TO_PICK + одна PICK_ORDER, точные резервы, без StockMovement от импорта
+    await mkItem(`${P}STK1`, EAN_STK1);
+    const it1 = await prisma.item.findFirstOrThrow({ where: { companyId, externalId: `${P}STK1` } });
+    await seedStock(it1.id, 2, `${P}C1`);
+    const mov0 = await movCount();
+    {
+      const r = await post("/api/integration/v1/orders", { externalId: `${P}OS1`, lines: [{ externalLineId: "L1", ean: EAN_STK1, quantity: 2 }] });
+      ok("17a полное покрытие: 201 + status READY_TO_PICK в ответе", r.status === 201 && (r.json as { status?: string })?.status === "READY_TO_PICK", JSON.stringify(r.json));
+      const st = await orderState(`${P}OS1`);
+      ok("17a: заказ READY_TO_PICK, покрытие 2, ровно одна PICK_ORDER", st.status === "READY_TO_PICK" && st.reserved === 2 && st.picks === 1, JSON.stringify(st));
+      ok("17a: активный резерв ровно на 2 шт (FIFO из посеянной партии)", st.resvQty === 2, JSON.stringify(st));
+      ok("17a: импорт+планирование НЕ создали StockMovement", (await movCount()) === mov0, `${mov0}->${await movCount()}`);
+    }
+    // 17a') точный повтор → created:false, без дублей резервов/задач
+    {
+      const r = await post("/api/integration/v1/orders", { externalId: `${P}OS1`, lines: [{ externalLineId: "L1", ean: EAN_STK1, quantity: 2 }] });
+      ok("17a' повтор: 200 created:false, status READY_TO_PICK", r.status === 200 && (r.json as { created?: boolean; status?: string })?.created === false && (r.json as { status?: string })?.status === "READY_TO_PICK", JSON.stringify(r.json));
+      const st = await orderState(`${P}OS1`);
+      ok("17a' идемпотентно: один резерв-комплект (2 шт), одна PICK_ORDER", st.resvQty === 2 && st.picks === 1, JSON.stringify(st));
+      ok("17a' один заказ", (await prisma.externalOrder.count({ where: { companyId, externalId: `${P}OS1` } })) === 1);
+    }
+    // 17b) частичное покрытие → PARTIALLY_RESERVED без PICK; появился остаток → повтор дозаполняет и создаёт задачу один раз
+    await mkItem(`${P}STK2`, EAN_STK2);
+    const it2 = await prisma.item.findFirstOrThrow({ where: { companyId, externalId: `${P}STK2` } });
+    await seedStock(it2.id, 1, `${P}C2`);
+    {
+      const r = await post("/api/integration/v1/orders", { externalId: `${P}OS2`, lines: [{ externalLineId: "L1", ean: EAN_STK2, quantity: 3 }] });
+      ok("17b частичное: status PARTIALLY_RESERVED", r.status === 201 && (r.json as { status?: string })?.status === "PARTIALLY_RESERVED", JSON.stringify(r.json));
+      const st = await orderState(`${P}OS2`);
+      ok("17b: покрытие 1 из 3, PICK_ORDER не создан", st.reserved === 1 && st.picks === 0, JSON.stringify(st));
+    }
+    await seedStock(it2.id, 2, `${P}C2b`); // остаток появился
+    {
+      const r = await post("/api/integration/v1/orders", { externalId: `${P}OS2`, lines: [{ externalLineId: "L1", ean: EAN_STK2, quantity: 3 }] });
+      ok("17b' повтор после появления остатка: created:false, READY_TO_PICK", r.status === 200 && (r.json as { created?: boolean; status?: string })?.created === false && (r.json as { status?: string })?.status === "READY_TO_PICK", JSON.stringify(r.json));
+      const st = await orderState(`${P}OS2`);
+      ok("17b' дозаполнено до 3, ровно одна PICK_ORDER", st.reserved === 3 && st.resvQty === 3 && st.picks === 1, JSON.stringify(st));
+    }
+    // 17c) без остатка → IMPORTED, без резервов и задач
+    await mkItem(`${P}STK3`, EAN_STK3);
+    {
+      const r = await post("/api/integration/v1/orders", { externalId: `${P}OS3`, lines: [{ externalLineId: "L1", ean: EAN_STK3, quantity: 1 }] });
+      ok("17c без остатка: 201 + status IMPORTED", r.status === 201 && (r.json as { status?: string })?.status === "IMPORTED", JSON.stringify(r.json));
+      const st = await orderState(`${P}OS3`);
+      ok("17c: нет резервов и PICK_ORDER", st.resvCount === 0 && st.picks === 0, JSON.stringify(st));
+    }
+    // 17d) два параллельных одинаковых запроса → один заказ/резервы/задача, без 409/500
+    await mkItem(`${P}STK4`, EAN_STK4);
+    const it4 = await prisma.item.findFirstOrThrow({ where: { companyId, externalId: `${P}STK4` } });
+    await seedStock(it4.id, 1, `${P}C4`);
+    {
+      const body = { externalId: `${P}OS4`, lines: [{ externalLineId: "L1", ean: EAN_STK4, quantity: 1 }] };
+      const [r1, r2] = await Promise.all([post("/api/integration/v1/orders", body), post("/api/integration/v1/orders", body)]);
+      ok("17d параллельно: без 409/500", ![r1.status, r2.status].some((s) => s === 409 || s >= 500), `r1=${r1.status} r2=${r2.status}`);
+      ok("17d: ровно один ExternalOrder", (await prisma.externalOrder.count({ where: { companyId, externalId: `${P}OS4` } })) === 1);
+      const st = await orderState(`${P}OS4`);
+      ok("17d: один комплект резервов (1 шт) и одна PICK_ORDER, READY_TO_PICK", st.status === "READY_TO_PICK" && st.resvQty === 1 && st.picks === 1, JSON.stringify(st));
+    }
   }
 }
 

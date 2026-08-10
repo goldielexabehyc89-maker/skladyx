@@ -241,7 +241,9 @@ async function planMoves(tx: Tx, companyId: string, warehouseId: string, groupId
 }
 
 // ── FIFO-резерв заказа + планирование сборки/перестановки (идемпотентно, под lockCompany) ──
-export async function reserveAndPlanOrder(input: { companyId: string; orderId: string; userId: string }): Promise<{ status: string }> {
+// Системная операция без автора-пользователя: userId не требуется (задачи назначает планировщик,
+// резерв/бронь автора не хранят). Вызывается и ручным импортом, и Integration API (ORDER-002).
+export async function reserveAndPlanOrder(input: { companyId: string; orderId: string }): Promise<{ status: string }> {
   const created: TaskCreateResult[] = [];
   const res = await prisma.$transaction(async (tx) => {
     await lockCompany(tx, input.companyId);

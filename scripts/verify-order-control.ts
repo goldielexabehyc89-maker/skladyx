@@ -65,7 +65,7 @@ async function seedGroup(itemId: string, cid: string, qty: number): Promise<{ lo
 async function pickToControl(externalId: string, lines: { externalLineId: string; itemId: string; qty: number; cell: string }[]): Promise<string> {
   for (const l of lines) await seedGroup(l.itemId, await cellId(l.cell), l.qty);
   const imp = await importExternalOrder({ companyId, warehouseId: W, externalId, createdById: pk, arrivalAt: null, lines: lines.map((l) => ({ externalLineId: l.externalLineId, itemId: l.itemId, requiredQty: l.qty })) });
-  await reserveAndPlanOrder({ companyId, orderId: imp.orderId, userId: pk });
+  await reserveAndPlanOrder({ companyId, orderId: imp.orderId });
   let t = await prisma.workflowTask.findFirst({ where: { type: "PICK_ORDER", subjectId: imp.orderId } });
   if (t && t.status === "QUEUED") { await rebalanceQueuedTasks(companyId, { warehouseId: W }); t = await prisma.workflowTask.findUniqueOrThrow({ where: { id: t.id } }); }
   const picker = t?.assignedUserId; // сборку ведёт ФАКТИЧЕСКИ назначенный сборщик (может быть pk или pk2)

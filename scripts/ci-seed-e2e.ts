@@ -125,7 +125,7 @@ async function main() {
 
   // 3) заказ с пользовательским номером + активный резерв (движок)
   const imp = await importExternalOrder({ companyId, warehouseId: wh.id, externalId: ORDER_EXT, createdById: loader, arrivalAt: null, lines: [{ externalLineId: "1", itemId: item.id, requiredQty: QTY }] });
-  await reserveAndPlanOrder({ companyId, orderId: imp.orderId, userId: loader });
+  await reserveAndPlanOrder({ companyId, orderId: imp.orderId });
 
   // 4) вторая группа для UI-проверки НОВОГО сценария размещения: остаётся AWAITING_STORAGE с задачей
   // PLACE_GROUP «в работе» у погрузчика → экран задач должен показать «Назначенная ячейка: <код>».
@@ -204,7 +204,7 @@ async function main() {
   const pickToControl = async (externalId: string, lines: { itemId: string; cell: string }[]) => {
     for (const l of lines) await seedCtrlGroup(l.itemId, l.cell, 1);
     const impO = await importExternalOrder({ companyId, warehouseId: wh.id, externalId, createdById: pkA, arrivalAt: null, lines: lines.map((l, i) => ({ externalLineId: String(i + 1), itemId: l.itemId, requiredQty: 1 })) });
-    await reserveAndPlanOrder({ companyId, orderId: impO.orderId, userId: pkA });
+    await reserveAndPlanOrder({ companyId, orderId: impO.orderId });
     let pt = await prisma.workflowTask.findFirst({ where: { type: "PICK_ORDER", subjectId: impO.orderId } });
     if (pt && pt.status === "QUEUED") { await rebalanceQueuedTasks(companyId, { warehouseId: wh.id }); pt = await prisma.workflowTask.findUniqueOrThrow({ where: { id: pt.id } }); }
     const picker = pt?.assignedUserId;

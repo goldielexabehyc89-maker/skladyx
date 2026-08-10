@@ -59,7 +59,7 @@ export async function importOrderAction(_prev: OrderActionState, formData: FormD
       arrivalAt: arrivalAtRaw || null,
       lines,
     });
-    const { status } = await reserveAndPlanOrder({ companyId: s.companyId, orderId, userId: session.userId });
+    const { status } = await reserveAndPlanOrder({ companyId: s.companyId, orderId });
     revalidatePath("/warehouse/tasks");
     return { ok: true, orderId, status };
   } catch (e) {

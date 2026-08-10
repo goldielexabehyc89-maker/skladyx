@@ -25,8 +25,8 @@ export async function POST(req: Request) {
   }
 
   try {
-    const { orderId, created } = await importApiOrder(company.id, body);
-    return NextResponse.json({ ok: true, orderId, created }, { status: created ? 201 : 200 });
+    const { orderId, created, status } = await importApiOrder(company.id, body);
+    return NextResponse.json({ ok: true, orderId, created, status }, { status: created ? 201 : 200 });
   } catch (e) {
     if (e instanceof IntegrationError) return NextResponse.json({ error: e.message }, { status: e.status });
     throw e;

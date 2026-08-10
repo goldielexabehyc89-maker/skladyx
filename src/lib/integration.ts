@@ -3,7 +3,7 @@ import crypto from "node:crypto";
 import { prisma } from "@/lib/db";
 import { parseEan } from "@/lib/ean";
 import { findItemByEan } from "@/lib/barcodes";
-import { importExternalOrder, ExternalOrderError } from "@/lib/external-orders";
+import { importExternalOrder, reserveAndPlanOrder, ExternalOrderError } from "@/lib/external-orders";
 import { lockCompany } from "@/lib/workflow-tasks";
 
 // Этап 5/Пакет 10: нейтральный API интеграции. Формат конкретной 1С НЕ зашивается — это общий
@@ -114,7 +114,7 @@ export async function upsertApiItems(
 // ── Заказы: импорт через существующий importExternalOrder ──
 // единственный активный склад организации; товар только по активному EAN; точный повтор идемпотентен;
 // изменённый payload существующего заказа → 409 без частичной записи; createdById = null.
-export async function importApiOrder(companyId: string, raw: unknown): Promise<{ orderId: string; created: boolean }> {
+export async function importApiOrder(companyId: string, raw: unknown): Promise<{ orderId: string; created: boolean; status: string }> {
   const o = (raw ?? {}) as Record<string, unknown>;
   const externalId = typeof o.externalId === "string" ? o.externalId.trim() : "";
   if (!externalId) throw new IntegrationError("externalId обязателен", 400);
@@ -150,7 +150,11 @@ export async function importApiOrder(companyId: string, raw: unknown): Promise<{
 
   try {
     const res = await importExternalOrder({ companyId, warehouseId, externalId, createdById: null, arrivalAt, lines });
-    return { orderId: res.orderId, created: res.created };
+    // ORDER-002: заказ из API сразу передаётся в резерв/планирование — идемпотентно, без администратора.
+    // Изменённый payload сюда не доходит (importExternalOrder бросает 409 выше). Повтор того же payload
+    // безопасен: reserveAndPlanOrder не создаёт дублей и может дозарезервировать появившийся остаток.
+    const plan = await reserveAndPlanOrder({ companyId, orderId: res.orderId });
+    return { orderId: res.orderId, created: res.created, status: plan.status };
   } catch (e) {
     if (e instanceof ExternalOrderError) {
       const conflict = /уже импортирован|изменение импортированного/.test(e.message);
