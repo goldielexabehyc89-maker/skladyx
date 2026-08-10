@@ -179,13 +179,20 @@ export default async function TasksPage({
   // (prepareGroupPlacement) НЕ вызывается на сервер-рендере/GET/prefetch/refresh — иначе обычное
   // открытие страницы создавало бы бронь. Бронь создаёт клиент только по явному «Начать размещение»
   // (PLACE-001). Здесь лишь передаём контекст задачи; назначенный код появляется после действия.
-  // TASK-006: маршрут из СТРУКТУРИРОВАННЫХ данных группы (статус/зона), без парсинга title/description.
-  // source — фактическая зона ожидающей группы (приёмка); targetZone — целевая зона маршрута.
-  let placement: { taskId: string; source: string; targetZone: string } | null = null;
+  // TASK-006: операционные поля из СТРУКТУРИРОВАННЫХ данных (HandlingGroup + Item), без парсинга
+  // title/description. source — фактическая зона ожидающей группы (приёмка); targetZone — целевая зона.
+  let placement: { taskId: string; itemName: string; qty: number; source: string; targetZone: string } | null = null;
   if (current && current.type === "PLACE_GROUP" && current.status === "IN_PROGRESS" && groupReceivingEnabled()) {
     const group = await prisma.handlingGroup.findFirst({ where: { id: current.subjectId ?? "", companyId: s.companyId } });
     if (group && (group.status === "AWAITING_STORAGE" || group.status === "AWAITING_COOLING")) {
-      placement = { taskId: current.id, source: "Приёмка", targetZone: group.status === "AWAITING_COOLING" ? "Охлаждение" : "Хранение" };
+      const item = await prisma.item.findFirst({ where: { id: group.itemId, companyId: s.companyId }, select: { name: true } });
+      placement = {
+        taskId: current.id,
+        itemName: item?.name ?? "Товар",
+        qty: group.qty.toNumber(),
+        source: "Приёмка",
+        targetZone: group.status === "AWAITING_COOLING" ? "Охлаждение" : "Хранение",
+      };
     }
   }
 

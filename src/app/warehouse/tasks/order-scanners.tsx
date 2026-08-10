@@ -131,7 +131,6 @@ export function PlaceGroupScanner({ placement, assignedCellCode }: { placement: 
   const [eanRaw, setEanRaw] = useState("");          // подтверждённый сервером EAN (сохраняется при ошибке ячейки)
   const [phase, setPhase] = useState<"idle" | "checking" | "confirmed" | "placed">("idle");
   const [checkLabel, setCheckLabel] = useState("");  // «Проверяем товар…» / «Проверяем ячейку…»
-  const [okItem, setOkItem] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, startTransition] = useTransition();
   const submitting = useRef(false);                  // защита от второго события камеры → второго движения
@@ -155,7 +154,7 @@ export function PlaceGroupScanner({ placement, assignedCellCode }: { placement: 
         const fd = new FormData(); fd.set("taskId", placement.taskId); fd.set("ean", value);
         const res = await verifyPlacementEanAction({}, fd);
         if (res.error) { setPhase("idle"); setError(res.error); return; }        // ошибка — красное блокирующее, остаёмся на EAN
-        setEanRaw(value); setOkItem(res.itemName ?? ""); setPhase("confirmed"); vibrate(60);
+        setEanRaw(value); setPhase("confirmed"); vibrate(60);
         // после короткой паузы — авто-переход к скану назначенной ячейки
         advanceTimer.current = setTimeout(() => { setStep("cell"); setPhase("idle"); setScanning(true); }, 900);
       });
@@ -177,11 +176,12 @@ export function PlaceGroupScanner({ placement, assignedCellCode }: { placement: 
     });
   }
 
+  const itemQty = `${placement.itemName} · ${placement.qty} шт`;
   const cellHint = (<span>Ячейка <b className="font-mono text-lg">{assignedCellCode}</b> (QR/Code 128)</span>);
   const modal =
     phase === "checking" ? { tone: "neutral" as const, title: checkLabel }
-    : phase === "confirmed" ? { title: "Товар подтверждён", body: okItem || "EAN совпал с товаром группы" }
-    : phase === "placed" ? { title: "Размещено", body: `Ячейка ${assignedCellCode}`, actions: (<Button type="button" variant="primary" onClick={closeAll} className="w-full">Готово</Button>) }
+    : phase === "confirmed" ? { title: "Товар подтверждён", body: `${itemQty} подтверждён` }
+    : phase === "placed" ? { title: "Размещено", body: `${itemQty} · ячейка ${assignedCellCode}`, actions: (<Button type="button" variant="primary" onClick={closeAll} className="w-full">Готово</Button>) }
     : null;
 
   if (!open)
@@ -209,6 +209,19 @@ export function PlaceGroupScanner({ placement, assignedCellCode }: { placement: 
       onErrorRetry={() => { setError(null); setScanning(true); }}       // повтор скана текущего шага (EAN сохранён)
       onErrorExit={() => { setError(null); setScanning(false); }}
       modal={modal}
+      context={
+        // Постоянно: товар · количество (слева) и назначенная ячейка (справа, код — самый заметный).
+        <div className="flex items-center justify-between gap-3">
+          <div className="min-w-0">
+            <div className="truncate text-sm font-semibold text-[#1a1a1a]">{placement.itemName}</div>
+            <div className="text-xs text-neutral-500">{placement.qty} шт</div>
+          </div>
+          <div className="shrink-0 text-right">
+            <div className="text-[10px] font-medium uppercase tracking-wide text-green-700">Ячейка</div>
+            <div className="font-mono text-lg font-extrabold leading-tight text-green-900">{assignedCellCode}</div>
+          </div>
+        </div>
+      }
       footer={
         step === "product" ? (
           <Button type="button" variant="primary" onClick={openScan} className="w-full">
@@ -221,7 +234,7 @@ export function PlaceGroupScanner({ placement, assignedCellCode }: { placement: 
         )
       }
     >
-      {/* Назначенная ячейка — постоянно крупно и заметно; код самый выделенный элемент. */}
+      {/* Крупная назначенная ячейка (в режиме списка/итога); товар·кол-во·код всегда есть в context выше. */}
       <div className="rounded-xl bg-[#eef7ee] px-3 py-3 text-center">
         <div className="text-xs font-medium text-green-700">Назначенная ячейка</div>
         <div className="font-mono text-2xl font-extrabold tracking-tight text-green-900">{assignedCellCode}</div>

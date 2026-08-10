@@ -39,10 +39,14 @@ export function WorkflowSheet({
   modal,
   manualPlaceholder,
   manualInputMode,
+  context,
 }: {
   title: React.ReactNode;
   subtitle?: React.ReactNode;
   progressPct?: number; // прогресс-бар, если задан
+  // Постоянный компактный контекст под заголовком — виден и при сканировании, и в режиме списка
+  // (напр. товар · количество · назначенная ячейка при размещении).
+  context?: React.ReactNode;
   scanning: boolean; // true — камера вместо списка
   scanHint?: React.ReactNode; // подсказка под камерой
   onScan: (raw: string) => void;
@@ -84,6 +88,9 @@ export function WorkflowSheet({
               ✕
             </button>
           </div>
+
+          {/* Постоянный контекст (виден и при сканировании) */}
+          {context && <div className="border-b border-neutral-100 px-5 py-2.5">{context}</div>}
 
           {/* Прогресс */}
           {progressPct !== undefined && (

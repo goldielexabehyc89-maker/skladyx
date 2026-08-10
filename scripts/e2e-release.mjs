@@ -202,10 +202,14 @@ async function main() {
     t = await bodyText();
     // TASK-006: компактная карточка — команда + маршрут, без типа/статуса/времени/описания
     ok("TASK-006: карточка показывает «Разместить»", has(t, "Разместить"));
+    ok("TASK-006: карточка показывает точное наименование товара", has(t, ids.itemName), ids.itemName);
+    ok("TASK-006: карточка показывает точное количество", has(t, `${ids.qty} шт`), `${ids.qty} шт`);
     ok("TASK-006: карточка показывает источник маршрута «Приёмка» (стрелка — иконка ArrowRight)", has(t, "Приёмка"));
     ok("TASK-006: до назначения цель — зона «Хранение»", has(t, "Хранение"));
     ok("TASK-006: НЕТ типа задачи «Размещение группы»", !has(t, "Размещение группы"));
     ok("TASK-006: НЕТ статуса «В работе» и времени «создано»", !has(t, "В работе") && !has(t, "создано"));
+    ok("TASK-006: НЕТ температуры и EAN текстом до сканирования", !has(t, "°C") && !has(t, ids.ean));
+    ok("TASK-006: нет горизонтального скролла (мобайл 390px)", await ev(`document.documentElement.scrollWidth <= window.innerWidth + 1`));
     // P1: рендер не назначил ячейку — показана кнопка «Начать размещение», без списка рекомендаций
     ok("Размещение (P1): рендер НЕ назначил ячейку (кнопка «Начать размещение»)", has(t, "Начать размещение"));
     ok("Размещение: НЕТ списка «Рекомендуемые»", !has(t, "Рекомендуемые"));
@@ -218,7 +222,9 @@ async function main() {
     await clickText("/Начать размещение/");
     let assigned = false;
     for (let i = 0; i < 50; i++) { if ((await bodyText()).includes(ids.placeCellCode)) { assigned = true; break; } await sleep(200); }
-    ok("Размещение: после «Начать размещение» в карточке маршрут «Приёмка → <ячейка>»", assigned && has(await bodyText(), "Приёмка"), ids.placeCellCode);
+    t = await bodyText();
+    ok("Размещение: после «Начать размещение» в карточке маршрут «Приёмка → <ячейка>»", assigned && has(t, "Приёмка"), ids.placeCellCode);
+    ok("TASK-006: после назначения товар и количество сохранены в карточке", has(t, ids.itemName) && has(t, `${ids.qty} шт`));
 
     if (ids.ean && ids.placeCellQr && ids.placeWrongCellQr) {
       // открыть скан-мастер
@@ -227,6 +233,10 @@ async function main() {
       ok("Размещение: скан-мастер открыт (шаг EAN)", await sheetUp());
       await shot("place-1-wait-ean"); // (1) ожидание EAN
       ok("UI-005: на шаге EAN не более одного поля", (await sheetCount()) <= 1, String(await sheetCount()));
+      // F1: шторка компактно показывает товар, количество и назначенную ячейку
+      const sheetTxt = await ev(`document.querySelector('[data-workflow-sheet]')?.innerText || ""`);
+      ok("F1: шторка показывает товар, количество и назначенную ячейку",
+        has(sheetTxt, ids.itemName) && has(sheetTxt, `${ids.qty} шт`) && has(sheetTxt, ids.placeCellCode), sheetTxt.slice(0, 0));
 
       // (a) неправильный EAN → красная блокирующая ошибка (role=alert), без перехода к ячейке
       await setSheetField("0000000000000"); await clickText("/Ввести/");
@@ -242,6 +252,10 @@ async function main() {
       for (let i = 0; i < 40; i++) { if ((await bodyText()).includes("Товар подтверждён")) { eanOk = true; break; } await sleep(120); }
       ok("UI-005: правильный EAN → заметный зелёный успех «Товар подтверждён»", eanOk);
       ok("UI-005: успех EAN озвучен (role=status)", await ev(`!!document.querySelector('[role=status]')`));
+      // F1: успех содержит «<товар> · <количество> подтверждён»
+      const okTxt = await ev(`document.querySelector('[role=status]')?.innerText || document.body.innerText`);
+      ok("F1: успех EAN содержит товар, количество и «подтверждён»",
+        has(okTxt, `${ids.itemName} · ${ids.qty} шт`) && has(okTxt, "подтверждён"), okTxt.slice(0, 0));
       await shot("place-2-ean-ok"); // (2) успешный EAN
       // авто-переход к шагу ячейки (появляется числовой/текстовый ввод ячейки или подсказка ячейки)
       let atCell = false;

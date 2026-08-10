@@ -42,9 +42,12 @@ export interface IncomingHandoff {
 }
 export interface Placement {
   taskId: string;
-  // TASK-006: маршрут из структурированных полей (не парсинг title/description). source — фактическая
-  // зона группы (приёмка), targetZone — целевая зона маршрута («Хранение»/«Охлаждение»). Конкретная
-  // ячейка приходит после «Начать размещение» (prepareGroupPlacementAction); рендер брони не создаёт.
+  // TASK-006: операционные поля из структурированных данных (не парсинг title/description).
+  // itemName/qty — напрямую из HandlingGroup и связанного Item; source — фактическая зона группы
+  // (приёмка); targetZone — целевая зона маршрута («Хранение»/«Охлаждение»). Конкретная ячейка приходит
+  // после «Начать размещение» (prepareGroupPlacementAction); рендер брони не создаёт.
+  itemName: string;
+  qty: number;
   source: string;
   targetZone: string;
 }
@@ -174,9 +177,13 @@ function PlacementBlock({ placement }: { placement: Placement }) {
   const target = prep.cellCode ?? placement.targetZone;
   return (
     <div className="flex flex-col gap-3">
-      {/* Команда + маршрут (крупнее, но не hero). Цель — самый заметный элемент. */}
+      {/* Команда + товар·количество + маршрут (компактно). Код целевой ячейки — самый заметный элемент. */}
       <div>
         <div className="text-lg font-bold text-[#1a1a1a]">Разместить</div>
+        {/* Товар и количество: название переносится, количество не отрывается от товара. */}
+        <div className="mt-0.5 text-base font-semibold text-[#1a1a1a]">
+          {placement.itemName} <span className="whitespace-nowrap font-normal text-neutral-500">· {placement.qty} шт</span>
+        </div>
         <div className="mt-1 flex min-w-0 items-center gap-2">
           <span className="shrink-0 text-base text-neutral-500">{placement.source}</span>
           <ArrowRight size={20} className="shrink-0 text-neutral-400" aria-hidden />
