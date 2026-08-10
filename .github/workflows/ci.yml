@@ -115,6 +115,10 @@ jobs:
           # TASK-007: серверная активация БЕЗ открытого браузера (планировщик работает в next start)
           WORKFLOW_TASKS_ENABLED=true npx tsx --tsconfig scripts/tsconfig.verify.json scripts/verify-scheduler-live.ts \
             || { echo '--- srvRel.log ---'; tail -80 /tmp/srvRel.log; kill $SRV 2>/dev/null; false; }
+          # TASK-008: живой переход таймера «До активации» → «Ожидает назначения» без reload и без ошибок
+          VERIFY_HOST=rostagro.skladyx.ru APP_PORT=3000 WORKFLOW_TASKS_ENABLED=true \
+            npx tsx --tsconfig scripts/tsconfig.verify.json scripts/verify-timer-transition.ts \
+            || { echo '--- srvRel.log ---'; tail -80 /tmp/srvRel.log; kill $SRV 2>/dev/null; false; }
           VERIFY_HOST=rostagro.skladyx.ru APP_PORT=3000 node scripts/e2e-release.mjs \
             || { echo '--- srvRel.log ---'; tail -80 /tmp/srvRel.log; false; }
           kill $SRV 2>/dev/null || true

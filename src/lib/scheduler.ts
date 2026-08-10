@@ -9,10 +9,14 @@ import { workflowTasksEnabled } from "@/lib/roles";
 // экземплярах и параллельных тиках (одно назначение, одно событие task_assigned). От открытых страниц
 // не зависит. Ошибка одной организации/тика не останавливает последующие.
 
-const DEFAULT_INTERVAL_MS = 15_000; // не реже раза в 30 секунд — берём 15с
-function intervalMs(): number {
+const DEFAULT_INTERVAL_MS = 15_000; // безопасный default
+const MIN_INTERVAL_MS = 1_000;
+const MAX_INTERVAL_MS = 30_000; // зафиксированная гарантия «не реже раза в 30 секунд»
+// Разрешён только диапазон 1000–30000; любое некорректное/выходящее за диапазон значение → 15000.
+export function schedulerIntervalMs(): number {
   const raw = Number(process.env.SCHEDULER_INTERVAL_MS ?? "");
-  return Number.isFinite(raw) && raw >= 1000 ? raw : DEFAULT_INTERVAL_MS;
+  if (!Number.isFinite(raw) || raw < MIN_INTERVAL_MS || raw > MAX_INTERVAL_MS) return DEFAULT_INTERVAL_MS;
+  return raw;
 }
 
 // Один проход планировщика: назначает наступившие задачи по всем организациям. Возвращает число
@@ -43,7 +47,7 @@ let timer: ReturnType<typeof setInterval> | null = null;
 export function startCoolingScheduler(): void {
   if (started) return; // один цикл на процесс
   started = true;
-  const period = intervalMs();
+  const period = schedulerIntervalMs();
   const tick = () => {
     void runSchedulerOnce().catch((e) => console.error("[scheduler] tick error:", e instanceof Error ? e.message : "unknown"));
   };

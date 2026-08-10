@@ -7,7 +7,7 @@ process.env.WORKFLOW_TASKS_ENABLED = "true";
 import { PrismaClient, type Role } from "@prisma/client";
 import bcrypt from "bcryptjs";
 import { createWorkflowTask } from "@/lib/workflow-tasks";
-import { runSchedulerOnce } from "@/lib/scheduler";
+import { runSchedulerOnce, schedulerIntervalMs } from "@/lib/scheduler";
 
 const prisma = new PrismaClient();
 let failures = 0;
@@ -89,6 +89,17 @@ async function main() {
   await runSchedulerOnce();
   const rB = await prisma.workflowTask.findUniqueOrThrow({ where: { id: tB.id } });
   ok("организация B: назначена своему LOADER", rB.assignedUserId === lB, `${rB.assignedUserId}`);
+
+  console.log("6) диапазон SCHEDULER_INTERVAL_MS (1000–30000, иначе default 15000)");
+  const withEnv = (v: string | undefined) => { if (v === undefined) delete process.env.SCHEDULER_INTERVAL_MS; else process.env.SCHEDULER_INTERVAL_MS = v; return schedulerIntervalMs(); };
+  ok("валидное 3000 → 3000", withEnv("3000") === 3000);
+  ok("нижняя граница 1000 → 1000", withEnv("1000") === 1000);
+  ok("верхняя граница 30000 → 30000", withEnv("30000") === 30000);
+  ok("слишком большое 60000 → default 15000", withEnv("60000") === 15000);
+  ok("слишком малое 500 → default 15000", withEnv("500") === 15000);
+  ok("нечисловое → default 15000", withEnv("abc") === 15000);
+  ok("не задано → default 15000", withEnv(undefined) === 15000);
+  process.env.WORKFLOW_TASKS_ENABLED = "true";
 
   // cleanup
   for (const c of [A.id, B.id]) {

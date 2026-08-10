@@ -29,12 +29,15 @@ function connect(wsUrl) {
   const ws = new WebSocket(wsUrl);
   let id = 0;
   const p = new Map();
+  const consoleErrors = [];
   ws.onmessage = (e) => {
     const m = JSON.parse(e.data);
     if (m.id && p.has(m.id)) { const { res, rej } = p.get(m.id); p.delete(m.id); m.error ? rej(new Error(m.error.message)) : res(m.result); }
+    if (m.method === "Runtime.consoleAPICalled" && m.params?.type === "error") consoleErrors.push((m.params.args || []).map((a) => a.description ?? a.value ?? "").join(" "));
+    if (m.method === "Runtime.exceptionThrown") consoleErrors.push(m.params?.exceptionDetails?.exception?.description ?? m.params?.exceptionDetails?.text ?? "exception");
   };
   const send = (me, pa = {}) => new Promise((res, rej) => { const i = ++id; p.set(i, { res, rej }); ws.send(JSON.stringify({ id: i, method: me, params: pa })); });
-  return { send, opened: new Promise((r) => (ws.onopen = r)) };
+  return { send, opened: new Promise((r) => (ws.onopen = r)), consoleErrors };
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -488,12 +491,15 @@ async function main() {
   // ── TASK-007/008/009: монитор — «Запланирована» + МСК + живой таймер; выделение срочных (мобайл) ──
   const timers = async () => JSON.parse(await ev(`JSON.stringify([...document.querySelectorAll('[role=timer]')].map(e=>e.innerText.replace(/\\s+/g,' ').trim()))`));
   const redUrgentCard = () => ev(`[...document.querySelectorAll('div')].some(d=>getComputedStyle(d).backgroundColor==="rgb(254, 242, 242)" && d.textContent.includes("Срочно"))`);
+  const errBefore = page.consoleErrors.length; // TASK-008: контроль React/console-ошибок на экранах таймера
   if (ids.adminToken && ids.schedNearTitle) {
     await setViewport(true); // мобайл: скриншот + проверка переполнения
     await setAuth(ids.adminToken);
     await goto("/warehouse/tasks?view=monitor", `document.body.innerText.includes("${ids.schedNearTitle}")`);
     t = await bodyText();
     ok("TASK-007: запланированная задача — статус «Запланирована»", has(t, "Запланирована"));
+    ok("TASK-008: у завершённых задач таймера нет", (await ev(`[...document.querySelectorAll('div')].filter(d=>d.className&&String(d.className).includes("rounded-xl")&&(d.textContent.includes("Выполнена")||d.textContent.includes("Отменена"))).some(d=>d.querySelector('[role=timer]'))`)) === false);
+    ok("TASK-008: у таймера стабильная ширина (min-width задан)", await ev(`[...document.querySelectorAll('[role=timer] b')].some(b=>parseFloat(getComputedStyle(b).minWidth)>0)`));
     ok("TASK-008: показано московское время «Доступна с … (МСК)»", has(t, "Доступна с") && has(t, "(МСК)"));
     ok("TASK-008: «Ожидает начала» у назначенной срочной", has(t, "Ожидает начала"));
     ok("TASK-009: бейдж «Срочно» в мониторе (не только цвет)", has(t, "Срочно"));
@@ -528,6 +534,8 @@ async function main() {
     ok("TASK-008: прямой отсчёт увеличивается без refresh", !!working2 && working2 !== working, `${working} -> ${working2}`);
     ok("TASK-009: карточка исполнителя без горизонтального скролла (мобайл)", await ev(`document.documentElement.scrollWidth <= window.innerWidth + 1`));
   }
+  const timerErrs = page.consoleErrors.slice(errBefore).filter((s) => !/favicon/i.test(s));
+  ok("TASK-008: нет React/console ошибок на экранах таймера/срочных", timerErrs.length === 0, timerErrs.slice(0, 2).join(" | "));
 
   console.log(failures === 0 ? "\nE2E RELEASE OK ✓" : `\nПРОВАЛЕНО: ${failures}`);
   process.exit(failures === 0 ? 0 : 1);
