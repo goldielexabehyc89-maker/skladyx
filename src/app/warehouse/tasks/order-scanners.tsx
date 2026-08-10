@@ -318,7 +318,21 @@ export function CoolingRetrievalScanner({ cooling }: { cooling: Cooling }) {
   return (
     <WorkflowSheet
       title="Забор из охлаждения"
-      subtitle={cooling.label}
+      subtitle={phase === "measure" ? "Замер температуры" : "Размещение в хранение"}
+      context={
+        // TASK-006 (расширение): шторка всегда хранит товар · количество и актуальный маршрут.
+        <div className="flex items-center justify-between gap-3">
+          <div className="min-w-0">
+            <div className="truncate text-sm font-semibold text-[#1a1a1a]">{cooling.itemName}</div>
+            <div className="text-xs text-neutral-500">{cooling.qty} шт</div>
+          </div>
+          <div className="flex shrink-0 items-center gap-1.5 text-sm">
+            <span className="font-mono font-semibold text-[#1a1a1a]">{cooling.coolingCell}</span>
+            <span className="text-neutral-400">→</span>
+            <span className="font-mono font-semibold text-green-800">{targetCode ?? "Хранение"}</span>
+          </div>
+        </div>
+      }
       scanning={scanning}
       scanHint={step === "product" ? "Сканируйте EAN товара" : step === "target" ? "Сканируйте назначенную ячейку" : "Сканируйте ячейку охлаждения"}
       scanFormats={step === "product" ? PRODUCT : CELL}

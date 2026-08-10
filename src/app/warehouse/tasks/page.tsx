@@ -192,6 +192,53 @@ export default async function TasksPage({
   });
   const current = mine.find((t) => t.status === "IN_PROGRESS" || t.status === "HANDOFF_PENDING") ?? null;
   const assigned = mine.filter((t) => t.status === "ASSIGNED");
+
+  // TASK-006 (расширение): компактные карточки всех физических задач погрузчика — структурированные
+  // контексты (товар/количество/маршрут) грузим ПАКЕТНО, без отдельного запроса на каждую карточку.
+  const loaderCards: Record<string, { taskId: string; command: string; itemName: string; qty: number; from: string; to: string; note?: string }> = {};
+  {
+    const place = mine.filter((t) => t.type === "PLACE_GROUP" && t.subjectId);
+    const cool = mine.filter((t) => t.type === "RETRIEVE_COOLING" && t.subjectId);
+    const move = mine.filter((t) => t.type === "MOVE_GROUP" && t.subjectId);
+    if (place.length || cool.length || move.length) {
+      const directGroupIds = [...place, ...move].map((t) => t.subjectId!);
+      const sessions = cool.length
+        ? await prisma.coolingSession.findMany({ where: { companyId: s.companyId, id: { in: cool.map((t) => t.subjectId!) } }, select: { id: true, handlingGroupId: true, coolingCellId: true } })
+        : [];
+      const groupIds = [...new Set([...directGroupIds, ...sessions.map((x) => x.handlingGroupId)])];
+      const groups = groupIds.length ? await prisma.handlingGroup.findMany({ where: { companyId: s.companyId, id: { in: groupIds } }, select: { id: true, itemId: true, lotId: true, qty: true, status: true } }) : [];
+      const gById = new Map(groups.map((g) => [g.id, g]));
+      const items = groups.length ? await prisma.item.findMany({ where: { companyId: s.companyId, id: { in: [...new Set(groups.map((g) => g.itemId))] } }, select: { id: true, name: true } }) : [];
+      const itemName = new Map(items.map((i) => [i.id, i.name]));
+      // MOVE_GROUP: исходная ячейка — по остатку партии; целевая — по активной броне задачи.
+      const moveGroupIds = move.map((t) => t.subjectId!);
+      const moveLotIds = moveGroupIds.map((id) => gById.get(id)?.lotId).filter((x): x is string => !!x);
+      const [reservations, balances] = await Promise.all([
+        moveGroupIds.length ? prisma.cellReservation.findMany({ where: { handlingGroupId: { in: moveGroupIds }, status: "ACTIVE" }, select: { handlingGroupId: true, cellId: true } }) : Promise.resolve([]),
+        moveLotIds.length ? prisma.stockBalance.findMany({ where: { companyId: s.companyId, lotId: { in: moveLotIds }, cellId: { not: null }, qty: { gt: 0 } }, select: { lotId: true, cellId: true } }) : Promise.resolve([]),
+      ]);
+      const toCellByGroup = new Map(reservations.map((r) => [r.handlingGroupId!, r.cellId]));
+      const fromCellByLot = new Map<string, string>();
+      for (const b of balances) if (b.cellId && !fromCellByLot.has(b.lotId)) fromCellByLot.set(b.lotId, b.cellId);
+      const cellIds = [...new Set([...sessions.map((x) => x.coolingCellId), ...toCellByGroup.values(), ...fromCellByLot.values()].filter((x): x is string => !!x))];
+      const cells = cellIds.length ? await prisma.cell.findMany({ where: { companyId: s.companyId, id: { in: cellIds } }, select: { id: true, code: true } }) : [];
+      const cellCode = new Map(cells.map((c) => [c.id, c.code]));
+      for (const t of place) {
+        const g = gById.get(t.subjectId!); if (!g) continue;
+        loaderCards[t.id] = { taskId: t.id, command: "Разместить", itemName: itemName.get(g.itemId) ?? "Товар", qty: g.qty.toNumber(), from: "Приёмка", to: g.status === "AWAITING_COOLING" ? "Охлаждение" : "Хранение" };
+      }
+      for (const t of cool) {
+        const sess = sessions.find((x) => x.id === t.subjectId); if (!sess) continue;
+        const g = gById.get(sess.handlingGroupId); if (!g) continue;
+        loaderCards[t.id] = { taskId: t.id, command: "Забрать из охлаждения", itemName: itemName.get(g.itemId) ?? "Товар", qty: g.qty.toNumber(), from: cellCode.get(sess.coolingCellId) ?? "охлаждение", to: "Хранение", note: "Ячейка будет назначена после замера" };
+      }
+      for (const t of move) {
+        const g = gById.get(t.subjectId!); if (!g) continue;
+        const toId = toCellByGroup.get(g.id); const fromId = fromCellByLot.get(g.lotId);
+        loaderCards[t.id] = { taskId: t.id, command: "Переместить", itemName: itemName.get(g.itemId) ?? "Товар", qty: g.qty.toNumber(), from: (fromId && cellCode.get(fromId)) || "—", to: (toId && cellCode.get(toId)) || "—" };
+      }
+    }
+  }
   const incoming = await prisma.taskHandoff.findMany({
     where: { status: "PENDING", toShift: { userId: session.userId, companyId: s.companyId, endedAt: null } },
     include: { task: { select: { title: true, type: true } } },
@@ -223,10 +270,12 @@ export default async function TasksPage({
   }
 
   // Пакет 5: для текущей RETRIEVE_COOLING-задачи в работе — контекст сессии для ввода температуры.
-  let cooling: { taskId: string; label: string; thresholdX: number } | null = null;
+  let cooling: { taskId: string; thresholdX: number; itemName: string; qty: number; coolingCell: string } | null = null;
   if (current && current.type === "RETRIEVE_COOLING" && current.status === "IN_PROGRESS" && coolingWorkflowEnabled()) {
     const session = await prisma.coolingSession.findFirst({ where: { id: current.subjectId ?? "", companyId: s.companyId, status: "ACTIVE" } });
-    if (session) cooling = { taskId: current.id, label: current.title, thresholdX: session.thresholdX.toNumber() };
+    const card = loaderCards[current.id];
+    // Структурированные поля (товар/количество/исходная ячейка) — из батча, без парсинга title.
+    if (session && card) cooling = { taskId: current.id, thresholdX: session.thresholdX.toNumber(), itemName: card.itemName, qty: card.qty, coolingCell: card.from };
   }
 
   // Пакет 6: контекст текущей задачи сборки (PICK_ORDER) и перестановки (MOVE_GROUP).
@@ -259,6 +308,7 @@ export default async function TasksPage({
       <PageTitle action={<Badge tone="green">{ROLE_LABEL[shift.role]} · {shift.warehouseName}</Badge>}>Задачи</PageTitle>
       <WorkerTasks
         serverNow={new Date().toISOString()}
+        loaderCards={loaderCards}
         current={current ? toDTO(current) : null}
         urgent={assigned.filter((t) => t.priority === "URGENT").map(toDTO)}
         normal={assigned.filter((t) => t.priority === "NORMAL").map(toDTO)}

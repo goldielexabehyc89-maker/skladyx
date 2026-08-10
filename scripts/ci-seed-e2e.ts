@@ -258,6 +258,44 @@ async function main() {
   const schedFar = (await mkUrg("CI Срочный забор far", "ci-urg-far", new Date(Date.now() + 26 * 3_600_000))).task;    // > суток
   const asgUrgent = (await mkUrg("CI Срочный забор now", "ci-urg-now", new Date(Date.now() - 1_000))).task;            // назначится сразу
 
+  // ── Фикстуры компактных карточек всех физических задач погрузчика (TASK-006 расширение): отдельный
+  //    склад CI-CARDS + погрузчик с токеном; три ASSIGNED задачи (PLACE_GROUP / RETRIEVE_COOLING /
+  //    MOVE_GROUP) для проверки единого формата (команда · товар · количество · маршрут).
+  const cardsWh = await prisma.warehouse.create({ data: { companyId, name: `CI-CARDS-${Date.now()}`, isActive: true, coolingRate: 2 } });
+  await ensureStandardZones(companyId, cardsWh.id);
+  const cardsStorage = await prisma.warehouseZone.findFirstOrThrow({ where: { companyId, warehouseId: cardsWh.id, kind: "STORAGE" } });
+  const cardsCooling = await prisma.warehouseZone.findFirstOrThrow({ where: { companyId, warehouseId: cardsWh.id, kind: "COOLING" } });
+  await createCellsInZone({ companyId, warehouseId: cardsWh.id, zoneId: cardsStorage.id, codes: ["CD-01", "CD-02"], level: 1 });
+  await createCellsInZone({ companyId, warehouseId: cardsWh.id, zoneId: cardsCooling.id, codes: ["OH-01"], level: null });
+  const cardsLoader = await mkUser(companyId, "+79000009911", "CI Погрузчик-карточки", "LOADER", "CiCards-pass-9911", cardsWh.id);
+  await prisma.workShift.create({ data: { companyId, userId: cardsLoader, warehouseId: cardsWh.id, role: "LOADER" } });
+  // 1) PLACE_GROUP (ASSIGNED, не начата): группа AWAITING_STORAGE + задача, авто-назначенная cardsLoader.
+  await createHandlingGroup({ companyId, warehouseId: cardsWh.id, itemId: item.id, qty: 2, temperature: 4, acceptedById: cardsLoader, dedupeKey: "ci-cards-place" });
+  // seed-хелпер: партия в конкретной ячейке (для источника перестановки), группа IN_STORAGE.
+  let cardsSeq = 0;
+  const seedInCell = async (cellId: string, qty: number) => {
+    const number = 993000 + ++cardsSeq;
+    const receipt = await prisma.receipt.create({ data: { companyId, number, warehouseId: cardsWh.id, status: "POSTED", postedAt: new Date(), createdById: cardsLoader } });
+    const line = await prisma.receiptLine.create({ data: { companyId, receiptId: receipt.id, itemId: item.id, qty } });
+    const lot = await prisma.lot.create({ data: { companyId, itemId: item.id, receiptLineId: line.id, qtyReceived: qty } });
+    await prisma.$transaction((tx) => applyLotMovement(tx, { companyId, docType: "RECEIPT", docId: receipt.id, itemId: item.id, lotId: lot.id, qty, from: null, to: { kind: "cell", warehouseId: cardsWh.id, cellId }, createdById: cardsLoader }));
+    return prisma.handlingGroup.create({ data: { companyId, warehouseId: cardsWh.id, itemId: item.id, lotId: lot.id, qty, temperature: 0, thresholdX: X, status: "IN_STORAGE", dedupeKey: `ci-cards-g-${number}`, acceptedById: cardsLoader } });
+  };
+  // 2) MOVE_GROUP (ASSIGNED): группа в CD-01, бронь на CD-02 → маршрут «CD-01 → CD-02».
+  const cd01 = await prisma.cell.findFirstOrThrow({ where: { companyId, warehouseId: cardsWh.id, code: "CD-01" } });
+  const cd02 = await prisma.cell.findFirstOrThrow({ where: { companyId, warehouseId: cardsWh.id, code: "CD-02" } });
+  const moveGroup = await seedInCell(cd01.id, 3);
+  const mvTask = (await createWorkflowTask({ companyId, warehouseId: cardsWh.id, type: "MOVE_GROUP", requiredRole: "LOADER", priority: "NORMAL", title: "Перестановка группы", dedupeKey: "ci-cards-move", subjectId: moveGroup.id, availableAt: new Date(Date.now() - 1_000) })).task;
+  await prisma.cellReservation.create({ data: { companyId, warehouseId: cardsWh.id, cellId: cd02.id, handlingGroupId: moveGroup.id, taskId: mvTask.id, status: "ACTIVE" } });
+  // 3) RETRIEVE_COOLING (ASSIGNED): группа IN_COOLING в OH-01 + CoolingSession + задача забора.
+  const ohCell = await prisma.cell.findFirstOrThrow({ where: { companyId, warehouseId: cardsWh.id, code: "OH-01" } });
+  const coolRec = await prisma.receipt.create({ data: { companyId, number: 993900, warehouseId: cardsWh.id, status: "POSTED", postedAt: new Date(), createdById: cardsLoader } });
+  const coolLine = await prisma.receiptLine.create({ data: { companyId, receiptId: coolRec.id, itemId: item.id, qty: 5 } });
+  const coolLot = await prisma.lot.create({ data: { companyId, itemId: item.id, receiptLineId: coolLine.id, qtyReceived: 5 } });
+  const coolGroup = await prisma.handlingGroup.create({ data: { companyId, warehouseId: cardsWh.id, itemId: item.id, lotId: coolLot.id, qty: 5, temperature: 20, thresholdX: X, status: "IN_COOLING", dedupeKey: "ci-cards-cool", acceptedById: cardsLoader } });
+  const coolSession = await prisma.coolingSession.create({ data: { companyId, warehouseId: cardsWh.id, handlingGroupId: coolGroup.id, coolingCellId: ohCell.id, startTemp: 20, thresholdX: X, coolingRate: 2, estimatedReadyAt: new Date(Date.now() + 3_600_000), status: "ACTIVE" } });
+  await createWorkflowTask({ companyId, warehouseId: cardsWh.id, type: "RETRIEVE_COOLING", requiredRole: "LOADER", priority: "URGENT", title: "Забор из охлаждения", dedupeKey: "ci-cards-cool-task", subjectId: coolSession.id, availableAt: new Date(Date.now() - 1_000) });
+
   // Подписанные session-токены для e2e (аутентификация инъекцией cookie skx_session — без
   // зависимости от гидрации формы логина; при TENANT_AUTH=true сессия ре-валидируется из БД по host).
   const admin = await prisma.user.findFirstOrThrow({
@@ -284,6 +322,7 @@ async function main() {
   const adminLoadToken = await mkToken(adminLoad, "ADMIN");     // ADMIN + активная смена LOADER
   const controllerToken = await mkToken(ctlU, "CONTROLLER");    // CONTROL_ORDER «в работе»
   const correctToken = await mkToken(correctPickerId, "PICKER"); // CORRECT_ORDER «в работе»
+  const cardsLoaderToken = await mkToken(cardsLoader, "LOADER"); // компактные карточки PLACE/COOLING/MOVE
 
   console.log("CI E2E fixtures ready (through engines)");
   console.log("E2E_IDS=" + JSON.stringify({
@@ -314,6 +353,7 @@ async function main() {
     schedNearTitle: schedNear.title,  // QUEUED в будущем (<суток): «Запланирована» + «До активации»
     schedFarTitle: schedFar.title,    // QUEUED в будущем (>суток): формат «N д …»
     asgUrgentTitle: asgUrgent.title,  // ASSIGNED срочная: «Ожидает начала»
+    cardsLoaderToken,                 // TASK-006 расширение: компактные карточки PLACE/COOLING/MOVE
   }));
   process.exit(0);
 }

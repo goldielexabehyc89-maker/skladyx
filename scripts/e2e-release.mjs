@@ -537,6 +537,25 @@ async function main() {
   const timerErrs = page.consoleErrors.slice(errBefore).filter((s) => !/favicon/i.test(s));
   ok("TASK-008: нет React/console ошибок на экранах таймера/срочных", timerErrs.length === 0, timerErrs.slice(0, 2).join(" | "));
 
+  // ── TASK-006 (расширение): компактные карточки всех физических задач погрузчика ──
+  if (ids.cardsLoaderToken) {
+    await setViewport(true); // мобайл
+    await setAuth(ids.cardsLoaderToken);
+    await goto("/warehouse/tasks", `document.body.innerText.includes("Разместить") && document.body.innerText.includes("Переместить")`);
+    t = await bodyText();
+    ok("TASK-006*: PLACE_GROUP — команда/товар/количество/маршрут", has(t, "Разместить") && has(t, ids.itemName) && has(t, "2 шт") && has(t, "Приёмка") && has(t, "Хранение"));
+    ok("TASK-006*: RETRIEVE_COOLING — команда/товар/количество/исходная/направление", has(t, "Забрать из охлаждения") && has(t, "5 шт") && has(t, "OH-01") && has(t, "Хранение"));
+    ok("TASK-006*: до замера точная целевая ячейка не заявляется", has(t, "Ячейка будет назначена после замера"));
+    ok("TASK-006*: MOVE_GROUP — точный маршрут CD-01 → CD-02", has(t, "Переместить") && has(t, "3 шт") && has(t, "CD-01") && has(t, "CD-02"));
+    ok("TASK-006*: нет типа/статуса/времени создания", !has(t, "Размещение группы") && !has(t, "Перестановка группы вниз") && !has(t, "создано") && !has(t, "Назначена"));
+    ok("TASK-006*: срочная карточка (RETRIEVE_COOLING) выделена красным + бейдж «Срочно»", has(t, "Срочно") && (await redUrgentCard()));
+    ok("TASK-006*: мобайл без горизонтального скролла", await ev(`document.documentElement.scrollWidth <= window.innerWidth + 1`));
+    await shot("cards-mobile-loader");
+    await setViewport(false); // desktop
+    await goto("/warehouse/tasks", `document.body.innerText.includes("Разместить")`);
+    ok("TASK-006*: desktop без горизонтального скролла", await ev(`document.documentElement.scrollWidth <= window.innerWidth + 1`));
+  }
+
   console.log(failures === 0 ? "\nE2E RELEASE OK ✓" : `\nПРОВАЛЕНО: ${failures}`);
   process.exit(failures === 0 ? 0 : 1);
 }

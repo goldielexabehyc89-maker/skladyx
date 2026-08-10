@@ -58,8 +58,22 @@ export interface Placement {
 }
 export interface Cooling {
   taskId: string;
-  label: string;
   thresholdX: number;
+  // TASK-006 (расширение): структурированные поля для компактной карточки/шторки (не парсинг title).
+  itemName: string;
+  qty: number;
+  coolingCell: string; // код исходной COOLING-ячейки (ОХ-01)
+}
+// TASK-006 (расширение): единый компактный контекст физической задачи погрузчика (команда + товар +
+// количество + маршрут «откуда → куда»). Строится из структурированных моделей на сервере, пакетно.
+export interface LoaderCard {
+  taskId: string;
+  command: string;   // «Разместить» / «Забрать из охлаждения» / «Переместить»
+  itemName: string;
+  qty: number;
+  from: string;
+  to: string;
+  note?: string;     // напр. «Ячейка будет назначена после замера»
 }
 export interface PickOrderCtx {
   orderId: string;
@@ -97,6 +111,37 @@ export function UrgentChip() {
 // TASK-009: активная (не терминальная) срочная задача → очень светлый красный фон + спокойная рамка.
 export function isUrgentActive(task: TaskDTO): boolean {
   return task.priority === "URGENT" && task.status !== "COMPLETED" && task.status !== "CANCELLED";
+}
+
+// TASK-006 (расширение): компактная карточка физической задачи погрузчика — только команда, товар,
+// количество, маршрут; срочная — красное выделение, бейдж «Срочно» и живой таймер; кнопка «Начать»,
+// если задача ещё не начата. Без типа/статуса/времени/ID/EAN/description. Код цели — самый заметный.
+function LoaderTaskCard({ card, task, serverNow, canStart, children }: { card: LoaderCard; task: TaskDTO; serverNow: string; canStart?: boolean; children?: React.ReactNode }) {
+  const urgent = isUrgentActive(task);
+  return (
+    <div className={"rounded-xl border p-3 " + (urgent ? "border-red-200 bg-red-50" : "border-[#eee]")}>
+      <div className="flex items-start justify-between gap-2">
+        <div className="text-lg font-bold text-[#1a1a1a]">{card.command}</div>
+        {urgent && <UrgentChip />}
+      </div>
+      <div className="mt-0.5 text-base font-semibold text-[#1a1a1a]">
+        {card.itemName} <span className="whitespace-nowrap font-normal text-neutral-500">· {card.qty} шт</span>
+      </div>
+      <div className="mt-1 flex min-w-0 items-center gap-2">
+        <span className="shrink-0 text-base text-neutral-500">{card.from}</span>
+        <ArrowRight size={20} className="shrink-0 text-neutral-400" aria-hidden />
+        <span className="min-w-0 truncate text-lg font-semibold text-[#1a1a1a]">{card.to}</span>
+      </div>
+      {card.note && <div className="mt-0.5 text-xs text-neutral-500">{card.note}</div>}
+      {urgent && (
+        <div className="mt-1">
+          <TaskTimer serverNowIso={serverNow} status={task.status} availableAtIso={task.availableAt} assignedAtIso={task.assignedAt} startedAtIso={task.startedAt} createdAtIso={task.createdAt} />
+        </div>
+      )}
+      {canStart && <StartTaskForm task={task} />}
+      {children && <div className="mt-2 flex flex-col gap-2">{children}</div>}
+    </div>
+  );
 }
 
 function TaskMeta({ task, serverNow }: { task: TaskDTO; serverNow?: string }) {
@@ -262,7 +307,9 @@ function ShortageForm({ taskId }: { taskId: string }) {
 
 // TASK-005/009: одна строка очереди. Срочная активная задача — светло-красный фон + спокойная рамка,
 // насыщенный бейдж «Срочно» и живой таймер (через TaskMeta). Текст остаётся тёмным.
-function QueueItem({ task, canStart, serverNow }: { task: TaskDTO; canStart: boolean; serverNow: string }) {
+function QueueItem({ task, canStart, serverNow, card }: { task: TaskDTO; canStart: boolean; serverNow: string; card?: LoaderCard }) {
+  // TASK-006 (расширение): физическая задача погрузчика — компактная карточка (команда/товар/маршрут).
+  if (card) return <LoaderTaskCard card={card} task={task} serverNow={serverNow} canStart={canStart} />;
   const urgentCard = isUrgentActive(task);
   return (
     <div className={"rounded-xl border p-3 " + (urgentCard ? "border-red-200 bg-red-50" : "border-[#eee]")}>
@@ -275,7 +322,7 @@ function QueueItem({ task, canStart, serverNow }: { task: TaskDTO; canStart: boo
 
 // TASK-005: пока идёт текущая задача — ожидающая очередь показывается свёрнутой строкой
 // «Срочные: N · Обычные: N», раскрывается по нажатию; новая срочная выделяется, но не прерывает.
-function QueueSummary({ urgent, normal, serverNow }: { urgent: TaskDTO[]; normal: TaskDTO[]; serverNow: string }) {
+function QueueSummary({ urgent, normal, serverNow, loaderCards }: { urgent: TaskDTO[]; normal: TaskDTO[]; serverNow: string; loaderCards: Record<string, LoaderCard> }) {
   const [open, setOpen] = useState(false);
   return (
     <Card>
@@ -289,8 +336,8 @@ function QueueSummary({ urgent, normal, serverNow }: { urgent: TaskDTO[]; normal
       </button>
       {open && (
         <div className="mt-3 flex flex-col gap-3">
-          {urgent.map((t) => <QueueItem key={t.id} task={t} canStart={false} serverNow={serverNow} />)}
-          {normal.map((t) => <QueueItem key={t.id} task={t} canStart={false} serverNow={serverNow} />)}
+          {urgent.map((t) => <QueueItem key={t.id} task={t} canStart={false} serverNow={serverNow} card={loaderCards[t.id]} />)}
+          {normal.map((t) => <QueueItem key={t.id} task={t} canStart={false} serverNow={serverNow} card={loaderCards[t.id]} />)}
         </div>
       )}
     </Card>
@@ -312,6 +359,7 @@ export function WorkerTasks({
   issueOrder,
   deliverOrder,
   serverNow,
+  loaderCards,
 }: {
   current: TaskDTO | null;
   urgent: TaskDTO[];
@@ -319,6 +367,7 @@ export function WorkerTasks({
   incoming: IncomingHandoff[];
   mates: Mate[];
   serverNow: string;
+  loaderCards: Record<string, LoaderCard>;
   placement?: Placement | null;
   cooling?: Cooling | null;
   pickOrder?: PickOrderCtx | null;
@@ -354,6 +403,20 @@ export function WorkerTasks({
           <div className="rounded-xl border border-[#eee] p-3">
             <PlacementBlock placement={placement} />
           </div>
+        </Card>
+      ) : current && cooling && loaderCards[current.id] && current.status === "IN_PROGRESS" ? (
+        <Card>
+          <CardTitle>Текущая задача</CardTitle>
+          <LoaderTaskCard card={loaderCards[current.id]} task={current} serverNow={serverNow}>
+            <CoolingBlock cooling={cooling} />
+          </LoaderTaskCard>
+        </Card>
+      ) : current && moveGroup && loaderCards[current.id] && current.status === "IN_PROGRESS" ? (
+        <Card>
+          <CardTitle>Текущая задача</CardTitle>
+          <LoaderTaskCard card={loaderCards[current.id]} task={current} serverNow={serverNow}>
+            <MoveGroupScanner ctx={moveGroup} />
+          </LoaderTaskCard>
         </Card>
       ) : current && (
         <Card>
@@ -398,19 +461,19 @@ export function WorkerTasks({
       {/* TASK-005: очередь. При текущей задаче — свёрнутая сводка; без текущей — только непустые списки
           (срочные выше обычных); если всё пусто — одно компактное пустое состояние. */}
       {current ? (
-        (urgent.length + normal.length > 0) && <QueueSummary urgent={urgent} normal={normal} serverNow={serverNow} />
+        (urgent.length + normal.length > 0) && <QueueSummary urgent={urgent} normal={normal} serverNow={serverNow} loaderCards={loaderCards} />
       ) : urgent.length + normal.length > 0 ? (
         <>
           {urgent.length > 0 && (
             <Card>
               <CardTitle>Срочные</CardTitle>
-              <div className="flex flex-col gap-3">{urgent.map((t) => <QueueItem key={t.id} task={t} canStart serverNow={serverNow} />)}</div>
+              <div className="flex flex-col gap-3">{urgent.map((t) => <QueueItem key={t.id} task={t} canStart serverNow={serverNow} card={loaderCards[t.id]} />)}</div>
             </Card>
           )}
           {normal.length > 0 && (
             <Card>
               <CardTitle>Обычные задачи</CardTitle>
-              <div className="flex flex-col gap-3">{normal.map((t) => <QueueItem key={t.id} task={t} canStart serverNow={serverNow} />)}</div>
+              <div className="flex flex-col gap-3">{normal.map((t) => <QueueItem key={t.id} task={t} canStart serverNow={serverNow} card={loaderCards[t.id]} />)}</div>
             </Card>
           )}
         </>
