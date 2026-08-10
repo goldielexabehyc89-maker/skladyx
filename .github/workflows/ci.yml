@@ -81,6 +81,7 @@ jobs:
           WORKFLOW_TASKS_ENABLED=true EXTERNAL_ORDER_PICKING_ENABLED=true $V scripts/verify-external-orders.ts
           WORKFLOW_TASKS_ENABLED=true EXTERNAL_ORDER_PICKING_ENABLED=true $V scripts/verify-order-control.ts
           WORKFLOW_TASKS_ENABLED=true EXTERNAL_ORDER_PICKING_ENABLED=true $V scripts/verify-order-issue.ts
+          WORKFLOW_TASKS_ENABLED=true $V scripts/verify-scheduler.ts
           $V scripts/verify-launch-readiness.ts
 
       - name: Build
@@ -104,12 +105,16 @@ jobs:
           TENANT_AUTH=true LEGACY_WAREHOUSE_UI_ENABLED=false WAREHOUSE_ZONES_ENABLED=true \
             WORKFLOW_TASKS_ENABLED=true GROUP_RECEIVING_ENABLED=true COOLING_WORKFLOW_ENABLED=true \
             EXTERNAL_ORDER_PICKING_ENABLED=true ORDER_CONTROL_ENABLED=true ORDER_ISSUE_ENABLED=true \
+            SCHEDULER_INTERVAL_MS=3000 \
             node_modules/.bin/next start -p 3000 >/tmp/srvRel.log 2>&1 &
           SRV=$!
           for i in $(seq 1 40); do
             code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: rostagro.skladyx.ru' http://localhost:3000/login || echo 000)
             [ "$code" = "200" ] && break; sleep 2
           done
+          # TASK-007: серверная активация БЕЗ открытого браузера (планировщик работает в next start)
+          WORKFLOW_TASKS_ENABLED=true npx tsx --tsconfig scripts/tsconfig.verify.json scripts/verify-scheduler-live.ts \
+            || { echo '--- srvRel.log ---'; tail -80 /tmp/srvRel.log; kill $SRV 2>/dev/null; false; }
           VERIFY_HOST=rostagro.skladyx.ru APP_PORT=3000 node scripts/e2e-release.mjs \
             || { echo '--- srvRel.log ---'; tail -80 /tmp/srvRel.log; false; }
           kill $SRV 2>/dev/null || true

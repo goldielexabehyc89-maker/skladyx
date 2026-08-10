@@ -485,6 +485,50 @@ async function main() {
     ok("home ADMIN+LOADER → mine подсвечен (mobile)", await anyAria(`nav a[href="${MINE}"]`));
   }
 
+  // ── TASK-007/008/009: монитор — «Запланирована» + МСК + живой таймер; выделение срочных (мобайл) ──
+  const timers = async () => JSON.parse(await ev(`JSON.stringify([...document.querySelectorAll('[role=timer]')].map(e=>e.innerText.replace(/\\s+/g,' ').trim()))`));
+  const redUrgentCard = () => ev(`[...document.querySelectorAll('div')].some(d=>getComputedStyle(d).backgroundColor==="rgb(254, 242, 242)" && d.textContent.includes("Срочно"))`);
+  if (ids.adminToken && ids.schedNearTitle) {
+    await setViewport(true); // мобайл: скриншот + проверка переполнения
+    await setAuth(ids.adminToken);
+    await goto("/warehouse/tasks?view=monitor", `document.body.innerText.includes("${ids.schedNearTitle}")`);
+    t = await bodyText();
+    ok("TASK-007: запланированная задача — статус «Запланирована»", has(t, "Запланирована"));
+    ok("TASK-008: показано московское время «Доступна с … (МСК)»", has(t, "Доступна с") && has(t, "(МСК)"));
+    ok("TASK-008: «Ожидает начала» у назначенной срочной", has(t, "Ожидает начала"));
+    ok("TASK-009: бейдж «Срочно» в мониторе (не только цвет)", has(t, "Срочно"));
+    let arr = await timers();
+    const near = arr.find((s) => /^До активации \d{2}:\d{2}:\d{2}$/.test(s));
+    const far = arr.find((s) => /^До активации \d+ д \d{2}:\d{2}:\d{2}$/.test(s));
+    ok("TASK-008: обратный отсчёт «До активации» (формат < суток)", !!near, arr.join(" | "));
+    ok("TASK-008: формат > суток «N д ЧЧ:ММ:СС»", !!far, arr.join(" | "));
+    ok("TASK-008: нет отрицательных значений", !arr.some((s) => s.includes("-")));
+    await shot("urgent-1-monitor-scheduled"); // будущая срочная (запланированная)
+    // отсчёт действительно идёт (near уменьшается) без перезагрузки
+    await sleep(1500);
+    const near2 = (await timers()).find((s) => /^До активации \d{2}:\d{2}:\d{2}$/.test(s));
+    ok("TASK-008: таймер обновляется каждую секунду (значение изменилось)", !!near2 && near2 !== near, `${near} -> ${near2}`);
+    ok("TASK-009: есть светло-красная карточка срочной задачи", await redUrgentCard());
+    ok("TASK-009: монитор без горизонтального скролла (мобайл)", await ev(`document.documentElement.scrollWidth <= window.innerWidth + 1`));
+  }
+  // Активная срочная у исполнителя: красная карточка + прямой отсчёт «В работе», растёт без refresh.
+  if (ids.correctToken) {
+    await setViewport(true);
+    await setAuth(ids.correctToken);
+    await goto("/warehouse/tasks", `document.body.innerText.includes("Текущая задача")`);
+    t = await bodyText();
+    ok("TASK-009: у исполнителя срочная задача — бейдж «Срочно»", has(t, "Срочно"));
+    let arr = await timers();
+    const working = arr.find((s) => s.startsWith("В работе"));
+    ok("TASK-008: таймер «В работе» на активной срочной", !!working, arr.join(" | "));
+    ok("TASK-009: красная карточка у исполнителя", await redUrgentCard());
+    await shot("urgent-2-active"); // активная срочная задача
+    await sleep(1500);
+    const working2 = (await timers()).find((s) => s.startsWith("В работе"));
+    ok("TASK-008: прямой отсчёт увеличивается без refresh", !!working2 && working2 !== working, `${working} -> ${working2}`);
+    ok("TASK-009: карточка исполнителя без горизонтального скролла (мобайл)", await ev(`document.documentElement.scrollWidth <= window.innerWidth + 1`));
+  }
+
   console.log(failures === 0 ? "\nE2E RELEASE OK ✓" : `\nПРОВАЛЕНО: ${failures}`);
   process.exit(failures === 0 ? 0 : 1);
 }

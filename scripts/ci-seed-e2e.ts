@@ -18,7 +18,7 @@ import bcrypt from "bcryptjs";
 import { ensureStandardZones, createCellsInZone } from "@/lib/cells";
 import { updateSettings } from "@/lib/settings";
 import { createHandlingGroup, completeGroupPlacement, prepareGroupPlacement } from "@/lib/group-receiving";
-import { startWorkflowTask, rebalanceQueuedTasks } from "@/lib/workflow-tasks";
+import { startWorkflowTask, rebalanceQueuedTasks, createWorkflowTask } from "@/lib/workflow-tasks";
 import { importExternalOrder, reserveAndPlanOrder, pickOrderScan } from "@/lib/external-orders";
 import { scanOrderForControl, markOrderControlByScan, finishOrderControl } from "@/lib/order-control";
 import { applyLotMovement } from "@/lib/stock";
@@ -245,6 +245,19 @@ async function main() {
   // Запускаем исправление сборщику → CORRECT_ORDER IN_PROGRESS (панель исправления отрисуется).
   if (corr1.status === "ASSIGNED") await startWorkflowTask(correctPickerId, companyId, corr1.id);
 
+  // ── Фикстуры таймера/выделения срочных (TASK-007/008/009): изолированный склад CI-URG + погрузчик,
+  //    чтобы не влиять на доску основного погрузчика. schedNear/schedFar — QUEUED в будущем (монитор:
+  //    «Запланирована» + обратный отсчёт, форматы <суток и >суток). asgUrgent — ASSIGNED (прямой отсчёт
+  //    «Ожидает начала»). CORRECT_ORDER выше даёт активную срочную «В работе».
+  const urgWh = await prisma.warehouse.create({ data: { companyId, name: `CI-URG-${Date.now()}`, isActive: true } });
+  const urgLoader = await mkUser(companyId, "+79000009910", "CI Срочный погрузчик", "LOADER", "CiUrg-pass-9910", urgWh.id);
+  await prisma.workShift.create({ data: { companyId, userId: urgLoader, warehouseId: urgWh.id, role: "LOADER" } });
+  const mkUrg = (title: string, dedupe: string, availableAt: Date) =>
+    createWorkflowTask({ companyId, warehouseId: urgWh.id, type: "RETRIEVE_COOLING", requiredRole: "LOADER", priority: "URGENT", title, dedupeKey: dedupe, subjectId: `urg-${dedupe}`, availableAt });
+  const schedNear = (await mkUrg("CI Срочный забор near", "ci-urg-near", new Date(Date.now() + 90 * 60_000))).task;   // < суток
+  const schedFar = (await mkUrg("CI Срочный забор far", "ci-urg-far", new Date(Date.now() + 26 * 3_600_000))).task;    // > суток
+  const asgUrgent = (await mkUrg("CI Срочный забор now", "ci-urg-now", new Date(Date.now() - 1_000))).task;            // назначится сразу
+
   // Подписанные session-токены для e2e (аутентификация инъекцией cookie skx_session — без
   // зависимости от гидрации формы логина; при TENANT_AUTH=true сессия ре-валидируется из БД по host).
   const admin = await prisma.user.findFirstOrThrow({
@@ -298,6 +311,9 @@ async function main() {
     placeCellCode,   // cell.code назначенной ячейки grp2 (для проверки карточки «Приёмка → <код>»)
     placeCellQr,     // QR назначенной ячейки (скан правильной ячейки)
     placeWrongCellQr, // QR валидной, но НЕ назначенной ячейки (скан неверной ячейки)
+    schedNearTitle: schedNear.title,  // QUEUED в будущем (<суток): «Запланирована» + «До активации»
+    schedFarTitle: schedFar.title,    // QUEUED в будущем (>суток): формат «N д …»
+    asgUrgentTitle: asgUrgent.title,  // ASSIGNED срочная: «Ожидает начала»
   }));
   process.exit(0);
 }

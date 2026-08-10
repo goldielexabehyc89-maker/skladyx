@@ -2,7 +2,8 @@
 
 import Link from "next/link";
 import { useActionState, useState } from "react";
-import { ArrowRight } from "lucide-react";
+import { ArrowRight, AlertTriangle } from "lucide-react";
+import { TaskTimer } from "./task-timer";
 import {
   startTaskAction,
   requestHandoffAction,
@@ -30,6 +31,10 @@ export interface TaskDTO {
   createdAt: string;
   actionUrl: string | null;
   dueAt: string | null; // Пакет 6: срок (arrivalAt заказа) — показываем для сборки
+  // TASK-008: серверные timestamps жизненного цикла для живого таймера срочной/отложенной задачи.
+  availableAt: string | null;
+  assignedAt: string | null;
+  startedAt: string | null;
 }
 export interface Mate {
   userId: string;
@@ -81,14 +86,30 @@ const fmtDue = (iso: string) => {
   return `${String(d.getDate()).padStart(2, "0")}.${String(d.getMonth() + 1).padStart(2, "0")} ${fmtTime(iso)}`;
 };
 
-function TaskMeta({ task }: { task: TaskDTO }) {
+// TASK-009: насыщенный бейдж «Срочно» (иконка + текст) — смысл не только цветом.
+export function UrgentChip() {
+  return (
+    <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-red-600 px-2 py-0.5 text-[11px] font-bold text-white">
+      <AlertTriangle size={11} aria-hidden /> Срочно
+    </span>
+  );
+}
+// TASK-009: активная (не терминальная) срочная задача → очень светлый красный фон + спокойная рамка.
+export function isUrgentActive(task: TaskDTO): boolean {
+  return task.priority === "URGENT" && task.status !== "COMPLETED" && task.status !== "CANCELLED";
+}
+
+function TaskMeta({ task, serverNow }: { task: TaskDTO; serverNow?: string }) {
   return (
     <div className="flex flex-wrap items-center gap-1.5 text-xs text-neutral-500">
       <Badge tone={TASK_STATUS_TONE[task.status] ?? "neutral"}>{taskStatusLabel(task.status)}</Badge>
-      {task.priority === "URGENT" && <Badge tone="red">срочно</Badge>}
+      {task.priority === "URGENT" && <UrgentChip />}
       <span>{taskTypeLabel(task.type)}</span>
       {task.type === "PICK_ORDER" && task.dueAt && <span className="text-[#4c5fd7]">· к {fmtDue(task.dueAt)}</span>}
       <span>· создано {fmtTime(task.createdAt)}</span>
+      {serverNow && isUrgentActive(task) && (
+        <TaskTimer serverNowIso={serverNow} status={task.status} availableAtIso={task.availableAt} assignedAtIso={task.assignedAt} startedAtIso={task.startedAt} createdAtIso={task.createdAt} />
+      )}
     </div>
   );
 }
@@ -239,12 +260,14 @@ function ShortageForm({ taskId }: { taskId: string }) {
   );
 }
 
-// TASK-005: одна строка очереди (заголовок + мета + кнопка старта, если можно брать).
-function QueueItem({ task, urgent, canStart }: { task: TaskDTO; urgent?: boolean; canStart: boolean }) {
+// TASK-005/009: одна строка очереди. Срочная активная задача — светло-красный фон + спокойная рамка,
+// насыщенный бейдж «Срочно» и живой таймер (через TaskMeta). Текст остаётся тёмным.
+function QueueItem({ task, canStart, serverNow }: { task: TaskDTO; canStart: boolean; serverNow: string }) {
+  const urgentCard = isUrgentActive(task);
   return (
-    <div className={"rounded-xl border p-3 " + (urgent ? "border-red-100 bg-red-50/40" : "border-[#eee]")}>
-      <div className="text-sm font-semibold">{task.title}</div>
-      <div className="mt-1"><TaskMeta task={task} /></div>
+    <div className={"rounded-xl border p-3 " + (urgentCard ? "border-red-200 bg-red-50" : "border-[#eee]")}>
+      <div className="text-sm font-semibold text-[#1a1a1a]">{task.title}</div>
+      <div className="mt-1"><TaskMeta task={task} serverNow={serverNow} /></div>
       {canStart && <StartTaskForm task={task} />}
     </div>
   );
@@ -252,7 +275,7 @@ function QueueItem({ task, urgent, canStart }: { task: TaskDTO; urgent?: boolean
 
 // TASK-005: пока идёт текущая задача — ожидающая очередь показывается свёрнутой строкой
 // «Срочные: N · Обычные: N», раскрывается по нажатию; новая срочная выделяется, но не прерывает.
-function QueueSummary({ urgent, normal }: { urgent: TaskDTO[]; normal: TaskDTO[] }) {
+function QueueSummary({ urgent, normal, serverNow }: { urgent: TaskDTO[]; normal: TaskDTO[]; serverNow: string }) {
   const [open, setOpen] = useState(false);
   return (
     <Card>
@@ -266,8 +289,8 @@ function QueueSummary({ urgent, normal }: { urgent: TaskDTO[]; normal: TaskDTO[]
       </button>
       {open && (
         <div className="mt-3 flex flex-col gap-3">
-          {urgent.map((t) => <QueueItem key={t.id} task={t} urgent canStart={false} />)}
-          {normal.map((t) => <QueueItem key={t.id} task={t} canStart={false} />)}
+          {urgent.map((t) => <QueueItem key={t.id} task={t} canStart={false} serverNow={serverNow} />)}
+          {normal.map((t) => <QueueItem key={t.id} task={t} canStart={false} serverNow={serverNow} />)}
         </div>
       )}
     </Card>
@@ -288,12 +311,14 @@ export function WorkerTasks({
   correctOrder,
   issueOrder,
   deliverOrder,
+  serverNow,
 }: {
   current: TaskDTO | null;
   urgent: TaskDTO[];
   normal: TaskDTO[];
   incoming: IncomingHandoff[];
   mates: Mate[];
+  serverNow: string;
   placement?: Placement | null;
   cooling?: Cooling | null;
   pickOrder?: PickOrderCtx | null;
@@ -333,11 +358,11 @@ export function WorkerTasks({
       ) : current && (
         <Card>
           <CardTitle>Текущая задача</CardTitle>
-          <div className="rounded-xl border border-[#eee] p-3">
-            <div className="text-sm font-semibold">{current.title}</div>
+          <div className={"rounded-xl border p-3 " + (isUrgentActive(current) ? "border-red-200 bg-red-50" : "border-[#eee]")}>
+            <div className="text-sm font-semibold text-[#1a1a1a]">{current.title}</div>
             {current.description && <div className="mt-0.5 text-sm text-neutral-600">{current.description}</div>}
             <div className="mt-1">
-              <TaskMeta task={current} />
+              <TaskMeta task={current} serverNow={serverNow} />
             </div>
             <div className="mt-2 flex flex-col gap-2">
               {current.actionUrl && (
@@ -373,19 +398,19 @@ export function WorkerTasks({
       {/* TASK-005: очередь. При текущей задаче — свёрнутая сводка; без текущей — только непустые списки
           (срочные выше обычных); если всё пусто — одно компактное пустое состояние. */}
       {current ? (
-        (urgent.length + normal.length > 0) && <QueueSummary urgent={urgent} normal={normal} />
+        (urgent.length + normal.length > 0) && <QueueSummary urgent={urgent} normal={normal} serverNow={serverNow} />
       ) : urgent.length + normal.length > 0 ? (
         <>
           {urgent.length > 0 && (
             <Card>
               <CardTitle>Срочные</CardTitle>
-              <div className="flex flex-col gap-3">{urgent.map((t) => <QueueItem key={t.id} task={t} urgent canStart />)}</div>
+              <div className="flex flex-col gap-3">{urgent.map((t) => <QueueItem key={t.id} task={t} canStart serverNow={serverNow} />)}</div>
             </Card>
           )}
           {normal.length > 0 && (
             <Card>
               <CardTitle>Обычные задачи</CardTitle>
-              <div className="flex flex-col gap-3">{normal.map((t) => <QueueItem key={t.id} task={t} canStart />)}</div>
+              <div className="flex flex-col gap-3">{normal.map((t) => <QueueItem key={t.id} task={t} canStart serverNow={serverNow} />)}</div>
             </Card>
           )}
         </>

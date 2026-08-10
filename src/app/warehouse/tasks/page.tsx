@@ -7,15 +7,23 @@ import { hasRole, isWorkRole, workflowTasksEnabled, groupReceivingEnabled, cooli
 import { getPickOrderContext, getMoveGroupContext } from "@/lib/external-orders";
 import { getControlOrderContext, getCorrectOrderContext } from "@/lib/order-control";
 import { getIssueOrderContext, getDeliverOrderContext } from "@/lib/order-issue";
-import { DueActivator } from "./due-activator";
 import { allowedWarehouses } from "@/lib/warehouse-access";
 import { getActiveShift } from "@/lib/work-shift";
 import { ROLE_LABEL } from "@/lib/role-labels";
 import { TASK_STATUS_LABEL, TASK_STATUS_TONE, taskStatusLabel, taskTypeLabel } from "@/lib/task-labels";
 import { PageShell } from "@/components/page-shell";
 import { PageTitle, Card, Badge, EmptyState, FilterBar, FilterSubmit, SelectField, LinkButton } from "@/components/ui";
-import { WorkerTasks, type TaskDTO } from "./tasks-screen";
+import { WorkerTasks, UrgentChip, type TaskDTO } from "./tasks-screen";
+import { TaskTimer } from "./task-timer";
 import type { Prisma, Role, TaskStatus } from "@prisma/client";
+
+const iso = (d: Date | null | undefined): string | null => (d ? d.toISOString() : null);
+// «Доступна с ДД.ММ в ЧЧ:ММ» по московскому времени (сервер форматирует, часы устройства не участвуют).
+function fmtMsk(d: Date): string {
+  const parts = new Intl.DateTimeFormat("ru-RU", { timeZone: "Europe/Moscow", day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" }).formatToParts(d);
+  const g = (t: string) => parts.find((x) => x.type === t)?.value ?? "";
+  return `${g("day")}.${g("month")} в ${g("hour")}:${g("minute")}`;
+}
 
 const WORK_ROLES: Role[] = ["RECEIVER", "LOADER", "PICKER", "CONTROLLER"];
 const STATUSES: TaskStatus[] = ["BLOCKED", "QUEUED", "ASSIGNED", "IN_PROGRESS", "HANDOFF_PENDING", "NEEDS_ATTENTION", "COMPLETED", "CANCELLED"];
@@ -23,10 +31,14 @@ const STATUSES: TaskStatus[] = ["BLOCKED", "QUEUED", "ASSIGNED", "IN_PROGRESS", 
 const toDTO = (t: {
   id: string; type: string; title: string; description: string | null;
   priority: "NORMAL" | "URGENT"; status: string; createdAt: Date; actionUrl: string | null; dueAt: Date | null;
+  availableAt?: Date | null; assignedAt?: Date | null; startedAt?: Date | null;
 }): TaskDTO => ({
   id: t.id, type: t.type, title: t.title, description: t.description,
   priority: t.priority, status: t.status, createdAt: t.createdAt.toISOString(), actionUrl: t.actionUrl,
   dueAt: t.dueAt ? t.dueAt.toISOString() : null,
+  availableAt: t.availableAt ? t.availableAt.toISOString() : null,
+  assignedAt: t.assignedAt ? t.assignedAt.toISOString() : null,
+  startedAt: t.startedAt ? t.startedAt.toISOString() : null,
 });
 
 // Переключатель «Мои задачи / Монитор» — только для ADMIN (монитор доступен лишь ему).
@@ -89,9 +101,10 @@ export default async function TasksPage({
       prisma.user.findMany({ where: { companyId: s.companyId, assignedTasks: { some: {} } }, select: { id: true, name: true } }),
     ]);
 
+    const serverNowIso = new Date().toISOString();
+    const nowMs = Date.now();
     return (
       <PageShell title="Задачи — монитор" action={<ViewToggle active="monitor" />}>
-        <DueActivator />
         <FilterBar>
           <SelectField name="warehouse" defaultValue={sp.warehouse ?? ""} className="text-sm">
             <option value="">Все склады</option>
@@ -121,23 +134,36 @@ export default async function TasksPage({
           <EmptyState>Задач нет.</EmptyState>
         ) : (
           <div className="flex flex-col gap-2">
-            {tasks.map((t) => (
-              <div key={t.id} className="flex items-start justify-between gap-3 rounded-xl border border-[#eee] bg-white p-3">
-                <div className="min-w-0">
-                  <div className="truncate text-sm font-semibold">{t.title}</div>
-                  <div className="mt-0.5 flex flex-wrap items-center gap-1.5 text-xs text-neutral-500">
-                    <span>{t.warehouse.name}</span>
-                    <span>· {ROLE_LABEL[t.requiredRole]}</span>
-                    <span>· {taskTypeLabel(t.type)}</span>
-                    {t.assignedUser && <span>· {t.assignedUser.name}</span>}
+            {tasks.map((t) => {
+              // TASK-007/008: QUEUED с будущим availableAt — «Запланирована» + МСК-время + таймер.
+              const scheduled = t.status === "QUEUED" && !!t.availableAt && t.availableAt.getTime() > nowMs;
+              // TASK-009: активная срочная — светло-красная карточка (терминальные не выделяем).
+              const urgentActive = t.priority === "URGENT" && t.status !== "COMPLETED" && t.status !== "CANCELLED";
+              const showTimer = scheduled || urgentActive;
+              return (
+                <div key={t.id} className={"flex items-start justify-between gap-3 rounded-xl border p-3 " + (urgentActive ? "border-red-200 bg-red-50" : "border-[#eee] bg-white")}>
+                  <div className="min-w-0">
+                    <div className="truncate text-sm font-semibold text-[#1a1a1a]">{t.title}</div>
+                    <div className="mt-0.5 flex flex-wrap items-center gap-1.5 text-xs text-neutral-500">
+                      <span>{t.warehouse.name}</span>
+                      <span>· {ROLE_LABEL[t.requiredRole]}</span>
+                      <span>· {taskTypeLabel(t.type)}</span>
+                      {t.assignedUser && <span>· {t.assignedUser.name}</span>}
+                    </div>
+                    {scheduled && t.availableAt && <div className="mt-0.5 text-xs text-neutral-500">Доступна с {fmtMsk(t.availableAt)} (МСК)</div>}
+                    {showTimer && (
+                      <div className="mt-1">
+                        <TaskTimer serverNowIso={serverNowIso} status={t.status} availableAtIso={iso(t.availableAt)} assignedAtIso={iso(t.assignedAt)} startedAtIso={iso(t.startedAt)} createdAtIso={t.createdAt.toISOString()} />
+                      </div>
+                    )}
+                  </div>
+                  <div className="flex shrink-0 flex-col items-end gap-1">
+                    <Badge tone={scheduled ? "blue" : (TASK_STATUS_TONE[t.status] ?? "neutral")}>{scheduled ? "Запланирована" : taskStatusLabel(t.status)}</Badge>
+                    {t.priority === "URGENT" && <UrgentChip />}
                   </div>
                 </div>
-                <div className="flex shrink-0 flex-col items-end gap-1">
-                  <Badge tone={TASK_STATUS_TONE[t.status] ?? "neutral"}>{taskStatusLabel(t.status)}</Badge>
-                  {t.priority === "URGENT" && <Badge tone="red">срочно</Badge>}
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </PageShell>
@@ -229,10 +255,10 @@ export default async function TasksPage({
 
   return (
     <div className="mx-auto flex w-full max-w-lg flex-col gap-4">
-      <DueActivator />
       {isAdmin && <ViewToggle active="mine" />}
       <PageTitle action={<Badge tone="green">{ROLE_LABEL[shift.role]} · {shift.warehouseName}</Badge>}>Задачи</PageTitle>
       <WorkerTasks
+        serverNow={new Date().toISOString()}
         current={current ? toDTO(current) : null}
         urgent={assigned.filter((t) => t.priority === "URGENT").map(toDTO)}
         normal={assigned.filter((t) => t.priority === "NORMAL").map(toDTO)}
