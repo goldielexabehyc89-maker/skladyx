@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useTransition, useRef } from "react";
+import { useState, useTransition, useRef, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { ScanLine } from "lucide-react";
 import { pickScanAction, completeMoveGroupAction } from "@/app/actions/external-orders";
@@ -131,10 +131,20 @@ export function PlaceGroupScanner({ placement, assignedCellCode }: { placement: 
   const [eanRaw, setEanRaw] = useState("");          // подтверждённый сервером EAN (сохраняется при ошибке ячейки)
   const [phase, setPhase] = useState<"idle" | "checking" | "confirmed" | "placed">("idle");
   const [checkLabel, setCheckLabel] = useState("");  // «Проверяем товар…» / «Проверяем ячейку…»
+  const [slow, setSlow] = useState(false);           // >10с в проверке — только сообщение (запрос не трогаем)
   const [error, setError] = useState<string | null>(null);
   const [busy, startTransition] = useTransition();
   const submitting = useRef(false);                  // защита от второго события камеры → второго движения
   const advanceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Медленная связь: если проверка идёт дольше 10с, меняем ТОЛЬКО текст — запрос не отменяем, повторную
+  // мутацию не запускаем, ошибку не показываем, пока исходный запрос выполняется.
+  useEffect(() => {
+    if (phase !== "checking") { setSlow(false); return; }
+    setSlow(false);
+    const id = setTimeout(() => setSlow(true), 10_000);
+    return () => clearTimeout(id);
+  }, [phase]);
 
   function vibrate(ms: number) { try { navigator.vibrate?.(ms); } catch { /* not supported */ } }
   function openScan() { setStep("product"); setEanRaw(""); setPhase("idle"); setError(null); setScanning(true); }
@@ -179,7 +189,9 @@ export function PlaceGroupScanner({ placement, assignedCellCode }: { placement: 
   const itemQty = `${placement.itemName} · ${placement.qty} шт`;
   const cellHint = (<span>Ячейка <b className="font-mono text-lg">{assignedCellCode}</b> (QR/Code 128)</span>);
   const modal =
-    phase === "checking" ? { tone: "neutral" as const, title: checkLabel }
+    phase === "checking" ? (slow
+        ? { tone: "neutral" as const, title: "Связь работает медленно", body: "Не закрывайте окно, проверка продолжается" }
+        : { tone: "neutral" as const, title: checkLabel })
     : phase === "confirmed" ? { title: "Товар подтверждён", body: `${itemQty} подтверждён` }
     : phase === "placed" ? { title: "Размещено", body: `${itemQty} · ячейка ${assignedCellCode}`, actions: (<Button type="button" variant="primary" onClick={closeAll} className="w-full">Готово</Button>) }
     : null;

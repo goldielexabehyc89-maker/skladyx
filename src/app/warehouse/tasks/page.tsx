@@ -57,7 +57,7 @@ function ViewToggle({ active }: { active: "mine" | "monitor" }) {
 export default async function TasksPage({
   searchParams,
 }: {
-  searchParams: Promise<{ warehouse?: string; role?: string; status?: string; priority?: string; assignee?: string; view?: string }>;
+  searchParams: Promise<{ warehouse?: string; role?: string; status?: string; priority?: string; assignee?: string; view?: string; page?: string }>;
 }) {
   if (!workflowTasksEnabled()) redirect("/warehouse");
   const session = await requireUser();
@@ -90,16 +90,34 @@ export default async function TasksPage({
       ...(sp.priority ? { priority: sp.priority as "NORMAL" | "URGENT" } : {}),
       ...(sp.assignee ? { assignedUserId: sp.assignee } : {}),
     };
-    const [tasks, warehouses, workers] = await Promise.all([
+    // Монитор: новые задачи сверху — createdAt DESC, затем id DESC (стабильный тай-брейк при равном
+    // createdAt). Порядок применяется в БД, поэтому держится при любых фильтрах и серверной пагинации.
+    const PAGE_SIZE = 50;
+    const page = Math.max(1, Number(sp.page ?? "1") || 1);
+    const [tasks, totalCount, warehouses, workers] = await Promise.all([
       prisma.workflowTask.findMany({
         where,
         include: { assignedUser: { select: { name: true } }, warehouse: { select: { name: true } } },
-        orderBy: [{ priority: "desc" }, { dueAt: { sort: "asc", nulls: "last" } }, { createdAt: "asc" }],
-        take: 200,
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        skip: (page - 1) * PAGE_SIZE,
+        take: PAGE_SIZE,
       }),
+      prisma.workflowTask.count({ where }),
       allowedWarehouses(session, s.companyId),
       prisma.user.findMany({ where: { companyId: s.companyId, assignedTasks: { some: {} } }, select: { id: true, name: true } }),
     ]);
+    const totalPages = Math.max(1, Math.ceil(totalCount / PAGE_SIZE));
+    // Ссылка на страницу N с сохранением активных фильтров.
+    const pageHref = (p: number) => {
+      const u = new URLSearchParams({ view: "monitor" });
+      if (sp.warehouse) u.set("warehouse", sp.warehouse);
+      if (sp.role) u.set("role", sp.role);
+      if (sp.status) u.set("status", sp.status);
+      if (sp.priority) u.set("priority", sp.priority);
+      if (sp.assignee) u.set("assignee", sp.assignee);
+      u.set("page", String(p));
+      return `/warehouse/tasks?${u.toString()}`;
+    };
 
     const serverNowIso = new Date().toISOString();
     const nowMs = Date.now();
@@ -164,6 +182,22 @@ export default async function TasksPage({
                 </div>
               );
             })}
+          </div>
+        )}
+
+        {totalCount > 0 && (
+          <div className="mt-3 flex items-center justify-between gap-3 text-sm">
+            {page > 1 ? (
+              <LinkButton href={pageHref(page - 1)} variant="ghost">← Новее</LinkButton>
+            ) : (
+              <span className="text-neutral-300">← Новее</span>
+            )}
+            <span className="text-neutral-500">Стр. {page} из {totalPages} · всего {totalCount}</span>
+            {page < totalPages ? (
+              <LinkButton href={pageHref(page + 1)} variant="ghost">Старее →</LinkButton>
+            ) : (
+              <span className="text-neutral-300">Старее →</span>
+            )}
           </div>
         )}
       </PageShell>

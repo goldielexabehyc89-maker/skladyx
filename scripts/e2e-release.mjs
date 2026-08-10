@@ -659,6 +659,28 @@ async function main() {
     }
   }
 
+  // ── Задача H: монитор ADMIN — новые задачи сверху (createdAt DESC, id DESC) + серверная пагинация;
+  //    порядок держится и под фильтром. ──
+  if (ids.adminToken && ids.monitorNewestTitle) {
+    await setViewport(false);
+    await setAuth(ids.adminToken);
+    await goto("/warehouse/tasks?view=monitor", `document.body.innerText.includes("${ids.monitorNewestTitle}")`);
+    t = await bodyText();
+    ok("Монитор (H): серверная пагинация — показан счётчик «Стр. N из M»", /Стр\.\s*1\s*из\s*\d+/.test(t), t.slice(0, 0));
+    // Новейшая (создана последней) должна идти ВЫШЕ более старой срочной.
+    const iNew = t.indexOf(ids.monitorNewestTitle);
+    const iOld = ids.asgUrgentTitleForSort ? t.indexOf(ids.asgUrgentTitleForSort) : -1;
+    ok("Монитор (H): новая задача присутствует на первой странице", iNew >= 0);
+    ok("Монитор (H): новые сверху — новейшая выше более старой", iNew >= 0 && iOld >= 0 && iNew < iOld, `new@${iNew} old@${iOld}`);
+    // Порядок сохраняется под фильтром по роли (сентинел — LOADER).
+    await goto("/warehouse/tasks?view=monitor&role=LOADER", `document.body.innerText.includes("${ids.monitorNewestTitle}")`);
+    const tf = await bodyText();
+    const iNewF = tf.indexOf(ids.monitorNewestTitle);
+    const iOldF = ids.asgUrgentTitleForSort ? tf.indexOf(ids.asgUrgentTitleForSort) : -1;
+    ok("Монитор (H): под фильтром роль=LOADER новые тоже сверху", iNewF >= 0 && iOldF >= 0 && iNewF < iOldF, `new@${iNewF} old@${iOldF}`);
+    ok("Монитор (H): под фильтром пагинация сохраняется («Стр. N из M»)", /Стр\.\s*1\s*из\s*\d+/.test(tf));
+  }
+
   console.log(failures === 0 ? "\nE2E RELEASE OK ✓" : `\nПРОВАЛЕНО: ${failures}`);
   process.exit(failures === 0 ? 0 : 1);
 }

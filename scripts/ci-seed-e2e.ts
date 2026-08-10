@@ -388,6 +388,14 @@ async function main() {
   const coolLeq = await seedCoolingSession("CI-COOL-LEQ", "+79000009931", "CI Охлаждение ≤X", "OHL-01", "SL-01");
   const coolGt = await seedCoolingSession("CI-COOL-GT", "+79000009932", "CI Охлаждение >X", "OHG-01", "SG-01");
 
+  // ── Задача H: монитор ADMIN — новые задачи сверху (createdAt DESC, id DESC). Сентинел создаётся
+  //    ПОСЛЕДНИМ → на мониторе он должен идти выше всех ранее созданных задач. QUEUED (не назначается).
+  const MONITOR_NEWEST_TITLE = "CI Монитор сентинел (новейшая)";
+  await prisma.workflowTask.create({ data: {
+    companyId, warehouseId: cardsWh.id, type: "PLACE_GROUP", requiredRole: "LOADER", priority: "NORMAL", status: "QUEUED",
+    title: MONITOR_NEWEST_TITLE, dedupeKey: "ci-monitor-newest", availableAt: new Date(Date.now() + 48 * 3_600_000),
+  } });
+
   // Подписанные session-токены для e2e (аутентификация инъекцией cookie skx_session — без
   // зависимости от гидрации формы логина; при TENANT_AUTH=true сессия ре-валидируется из БД по host).
   const admin = await prisma.user.findFirstOrThrow({
@@ -456,6 +464,8 @@ async function main() {
     coolGtToken: coolGt.token,        // охлаждение: замер >X → новый срок, без ложного движения
     coolGtCellQr: coolGt.coolQr,
     coolGtWhId: coolGt.whId,          // фильтр монитора: новый запланированный забор (новый срок)
+    monitorNewestTitle: MONITOR_NEWEST_TITLE, // Задача H: сентинел «новые сверху» в мониторе ADMIN
+    asgUrgentTitleForSort: asgUrgent.title,   // более старая задача — для проверки порядка (новее выше)
   }));
   process.exit(0);
 }
