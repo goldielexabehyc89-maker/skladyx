@@ -459,6 +459,23 @@ async function main() {
   const controlWrongQr = await orderQr(oCtl2B);   // валидный, но ЧУЖОЙ QR (заказ B)
   const controlE2EToken = await mkToken(controlE2E, "CONTROLLER");
 
+  // ── Задача M (Этап 2, P2): fail-closed CONTROL_ORDER без структурированного контекста.
+  //    Отдельный контролёр controlBad с двумя «повреждёнными» задачами (subjectId=null): одна в работе
+  //    (текущая, без controlOrder), одна в очереди (без controlCard). Проверяем, что UI не откатывается
+  //    к техкарточке и не даёт начать. Заказов/остатков не создаём. ──
+  const controlBad = await mkUser(companyId, "+79000009936", "CI Контролёр bad", "CONTROLLER", "CiCtlBad-9936", ctl2Wh.id);
+  const ctlBadShift = await prisma.workShift.create({ data: { companyId, userId: controlBad, warehouseId: ctl2Wh.id, role: "CONTROLLER" } });
+  const mkBadControl = async (status: "IN_PROGRESS" | "ASSIGNED", key: string) =>
+    prisma.workflowTask.create({ data: {
+      companyId, warehouseId: ctl2Wh.id, type: "CONTROL_ORDER", requiredRole: "CONTROLLER", priority: "NORMAL",
+      status, title: "Контроль заказа BROKEN-ORD-INTERNAL", subjectType: "externalOrder", subjectId: null,
+      dedupeKey: key, assignedUserId: controlBad, assignedShiftId: ctlBadShift.id, assignedAt: new Date(),
+      startedAt: status === "IN_PROGRESS" ? new Date() : null, availableAt: new Date(Date.now() - 1000),
+    } });
+  await mkBadControl("IN_PROGRESS", `ci-ctl-bad-cur:${ctl2Wh.id}`); // текущая повреждённая
+  await mkBadControl("ASSIGNED", `ci-ctl-bad-que:${ctl2Wh.id}`);    // очередь повреждённая
+  const controlBadToken = await mkToken(controlBad, "CONTROLLER");
+
   // ── Задача H: монитор ADMIN — новые задачи сверху (createdAt DESC, id DESC). Сентинел создаётся
   //    ПОСЛЕДНИМ → на мониторе он должен идти выше всех ранее созданных задач. QUEUED (не назначается).
   const MONITOR_NEWEST_TITLE = "CI Монитор сентинел (новейшая)";
@@ -566,6 +583,7 @@ async function main() {
     controlOrderAId: oCtl2A,         // id заказа A (проверка неизменности БД при неверном QR)
     controlOrderAQr,                 // верный QR заказа A → зелёное подтверждение + шаг EAN
     controlWrongQr,                  // валидный QR заказа B → «не тот заказ», шаг не меняется
+    controlBadToken,                 // P2 fail-closed: повреждённые CONTROL_ORDER (текущая + очередь)
   }));
   process.exit(0);
 }

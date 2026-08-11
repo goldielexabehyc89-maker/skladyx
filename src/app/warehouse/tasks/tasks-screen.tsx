@@ -327,6 +327,18 @@ function LoaderErrorCard({ task }: { task: TaskDTO }) {
   );
 }
 
+// CONTROL-001 (Задача M Этап2): fail-closed для CONTROL_ORDER без структурированного контекста
+// (нет subjectId / заказ не найден / контекст не загрузился). Никаких внутренних данных
+// (title/description/статус/время/ID) и никаких операционных действий — задачу нельзя начать.
+function ControlErrorCard() {
+  return (
+    <div role="alert" className="rounded-xl border border-red-200 bg-red-50 p-3">
+      <div className="text-sm font-semibold text-red-700">Данные задачи недоступны</div>
+      <div className="mt-0.5 text-sm text-neutral-600">Не удалось загрузить заказ для проверки. Обновите страницу или обратитесь к администратору — задачу нельзя начать.</div>
+    </div>
+  );
+}
+
 function QueueItem({ task, canStart, serverNow, card, controlCard }: { task: TaskDTO; canStart: boolean; serverNow: string; card?: LoaderCard; controlCard?: ControlCard }) {
   // TASK-006 (расширение): физическая задача погрузчика — компактная карточка (команда/деталь/маршрут).
   if (card) return <LoaderTaskCard card={card} task={task} serverNow={serverNow} canStart={canStart} />;
@@ -339,6 +351,8 @@ function QueueItem({ task, canStart, serverNow, card, controlCard }: { task: Tas
       {canStart && <div className="mt-2"><StartTaskForm task={task} /></div>}
     </div>
   );
+  // CONTROL_ORDER без controlCard — fail-closed, без технической карточки и без «Начать».
+  if (task.type === "CONTROL_ORDER") return <ControlErrorCard />;
   // Известный физический тип без контекста — не откатываемся на техническую карточку.
   if (LOADER_PHYSICAL_TYPES.has(task.type)) return <LoaderErrorCard task={task} />;
   const urgentCard = isUrgentActive(task);
@@ -507,6 +521,13 @@ export function WorkerTasks({
               <ControlOrderPanel ctx={controlOrder} />
             </div>
           </div>
+        </Card>
+      ) : current && current.type === "CONTROL_ORDER" && current.status === "IN_PROGRESS" ? (
+        // CONTROL_ORDER без структурированного controlOrder (нет subjectId / заказ не найден / контекст
+        // не загрузился) — fail-closed: без title/description/статуса/времени/ID и без операционных действий.
+        <Card>
+          <CardTitle>Текущая задача</CardTitle>
+          <ControlErrorCard />
         </Card>
       ) : current && LOADER_PHYSICAL_TYPES.has(current.type) && current.status === "IN_PROGRESS" ? (
         // Известная физическая задача погрузчика с повреждённым контекстом — ошибка, без метаданных.

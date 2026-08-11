@@ -966,6 +966,27 @@ async function main() {
     if (cr) await cr.$disconnect();
   }
 
+  // ── Задача M (Этап 2, P2): fail-closed CONTROL_ORDER без структурированного контекста — ни техкарточки
+  //    (title/status/time/ID), ни кнопки «Начать». Повреждённая текущая (IN_PROGRESS) и в очереди (ASSIGNED). ──
+  if (ids.controlBadToken) {
+    const startCount = () => ev(`[...document.querySelectorAll('button')].filter(b=>/^Начать$/.test(b.textContent.trim())).length`);
+    await setViewport(true);
+    await setAuth(ids.controlBadToken);
+    await goto("/warehouse/tasks", `document.body.innerText.includes("Данные задачи недоступны")`);
+    t = await bodyText();
+    ok("M/ctl-bad: текущая повреждённая → fail-closed «Данные задачи недоступны»", has(t, "Данные задачи недоступны"));
+    ok("M/ctl-bad: нет техданных (title/тип/статус/время/ID)", !has(t, "BROKEN-ORD-INTERNAL") && !has(t, "CONTROL_ORDER") && !has(t, "Проверить заказ") && !has(t, "создано") && !has(t, "Назначена"));
+    ok("M/ctl-bad: текущую повреждённую нельзя начать (нет «Начать»)", (await startCount()) === 0, String(await startCount()));
+    // очередь: раскрыть → повреждённая ASSIGNED тоже fail-closed, тоже без «Начать»
+    await clickText(/Показать/); await sleep(400);
+    t = await bodyText();
+    const cnt = (t.match(/Данные задачи недоступны/g) || []).length;
+    ok("M/ctl-bad: повреждённая в очереди → тоже fail-closed (≥2 карточки)", cnt >= 2, String(cnt));
+    ok("M/ctl-bad: повреждённую в очереди начать нельзя (нет «Начать»)", (await startCount()) === 0, String(await startCount()));
+    ok("M/ctl-bad: без техданных в очереди (нет внутреннего номера)", !(await bodyText()).includes("BROKEN-ORD-INTERNAL"));
+    ok("M/ctl-bad: мобайл без переполнения", await ev(`document.documentElement.scrollWidth <= window.innerWidth + 1`));
+  }
+
   // ── Задача H: монитор ADMIN — новые задачи сверху (createdAt DESC, id DESC) + серверная пагинация;
   //    порядок держится и под фильтром. ──
   if (ids.adminToken && ids.monitorNewestTitle) {
