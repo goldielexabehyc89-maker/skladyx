@@ -312,7 +312,7 @@ export function CoolingRetrievalScanner({ cooling }: { cooling: Cooling }) {
       // целевой шаг не открывается. Сервер вернул код цели — сверяем/обновляем targetCode перед переходом.
       if (res.error || !res.targetCellCode) { setCheck("idle"); setError(res.error ?? "Назначенная целевая ячейка недоступна — размещение отменено"); return; }
       setFromRaw(raw); setTargetCode(res.targetCellCode); setCheck("confirmed"); vibrate(60);
-      advanceTimer.current = setTimeout(() => { setCheck("idle"); setStep("target"); setScanning(true); setNotice("Ячейка охлаждения подтверждена — сканируйте назначенную ячейку"); }, 900);
+      advanceTimer.current = setTimeout(() => { setCheck("idle"); setStep("target"); setScanning(true); }, 900);
     });
   }
 
@@ -325,8 +325,8 @@ export function CoolingRetrievalScanner({ cooling }: { cooling: Cooling }) {
       const res = await prepareCoolingRetrievalAction({}, fd);
       if (res.error) { setError(res.error); return; }
       if (res.ready && res.targetCellCode) {
+        // Задача K: компактная фаза вывоза — маршрут/инструкция показываются в шторке, длинный notice убран.
         setTargetCode(res.targetCellCode); setPhase("place"); resetPlace();
-        setNotice(`Готово к вывозу → ячейка ${res.targetCellCode}. Отсканируйте исходную ячейку охлаждения, затем назначенную.`);
       } else {
         setScanning(false); setRecycled(true); // выше X — назначен повторный замер позже, ячейки не сканируем
       }
@@ -356,8 +356,11 @@ export function CoolingRetrievalScanner({ cooling }: { cooling: Cooling }) {
     if (step === "target") { submitPlace(value); return; }
   }
 
-  // Подпись основной scan-кнопки/подсказки/формата строго по текущему шагу (UI-004).
-  const scanLabel = step === "product" ? "Сканировать товар" : step === "from" ? "Сканировать ячейку охлаждения" : "Сканировать назначенную ячейку";
+  // Подпись основной scan-кнопки строго по текущему шагу (UI-004). Задача K: в фазе вывоза код текущей
+  // сканируемой ячейки — самый заметный элемент, поэтому кнопка содержит именно код (COOL-004).
+  const scanLabel = step === "product" ? "Сканировать товар"
+    : step === "from" ? `Сканировать ${cooling.coolingCell}`
+    : `Сканировать ${targetCode ?? "ячейку"}`;
   const isProduct = step === "product";
 
   if (!open)
@@ -372,18 +375,32 @@ export function CoolingRetrievalScanner({ cooling }: { cooling: Cooling }) {
       title="Забор из охлаждения"
       subtitle={phase === "measure" ? "Замер температуры" : "Размещение в хранение"}
       context={
-        // TASK-006 (расширение): шторка всегда хранит товар · количество и актуальный маршрут.
-        <div className="flex items-center justify-between gap-3">
+        phase === "place" ? (
+          // Задача K (TASK-006, COOL-004): компактная фаза вывоза — команда + товар·количество + КРУПНЫЙ
+          // маршрут COOLING→STORAGE ровно один раз. Без «Фазы 2», температуры/X и техстатусов.
           <div className="min-w-0">
-            <div className="truncate text-sm font-semibold text-[#1a1a1a]">{cooling.itemName}</div>
-            <div className="text-xs text-neutral-500">{cooling.qty} шт</div>
+            <div className="text-xs font-semibold uppercase tracking-wide text-[#667eea]">Переместить</div>
+            <div className="mt-0.5 truncate text-sm font-semibold text-[#1a1a1a]">{cooling.itemName} · {cooling.qty} шт</div>
+            <div className="mt-1 flex items-center gap-2 font-mono text-lg font-bold">
+              <span className="text-[#1a1a1a]">{cooling.coolingCell}</span>
+              <span className="text-neutral-400">→</span>
+              <span className="text-green-800">{targetCode}</span>
+            </div>
           </div>
-          <div className="flex shrink-0 items-center gap-1.5 text-sm">
-            <span className="font-mono font-semibold text-[#1a1a1a]">{cooling.coolingCell}</span>
-            <span className="text-neutral-400">→</span>
-            <span className="font-mono font-semibold text-green-800">{targetCode ?? "Хранение"}</span>
+        ) : (
+          // TASK-006 (расширение): фаза замера — товар · количество и маршрут в хранение.
+          <div className="flex items-center justify-between gap-3">
+            <div className="min-w-0">
+              <div className="truncate text-sm font-semibold text-[#1a1a1a]">{cooling.itemName}</div>
+              <div className="text-xs text-neutral-500">{cooling.qty} шт</div>
+            </div>
+            <div className="flex shrink-0 items-center gap-1.5 text-sm">
+              <span className="font-mono font-semibold text-[#1a1a1a]">{cooling.coolingCell}</span>
+              <span className="text-neutral-400">→</span>
+              <span className="font-mono font-semibold text-green-800">{targetCode ?? "Хранение"}</span>
+            </div>
           </div>
-        </div>
+        )
       }
       scanning={scanning}
       scanHint={isProduct ? "Сканируйте EAN товара" : step === "from" ? "Сканируйте исходную ячейку охлаждения" : "Сканируйте назначенную ячейку"}
@@ -406,7 +423,7 @@ export function CoolingRetrievalScanner({ cooling }: { cooling: Cooling }) {
             : check === "checking"
               ? { tone: "neutral" as const, title: checkLabel }
               : check === "confirmed"
-                ? { title: "Подтверждено", body: step === "product" ? `${cooling.itemName} · ${cooling.qty} шт подтверждён` : "Ячейка охлаждения подтверждена" }
+                ? { title: "Подтверждено", body: step === "product" ? `${cooling.itemName} · ${cooling.qty} шт подтверждён` : `Ячейка ${cooling.coolingCell} подтверждена` }
                 : null
       }
       footer={
@@ -431,11 +448,14 @@ export function CoolingRetrievalScanner({ cooling }: { cooling: Cooling }) {
         )
       }
     >
-      {notice && <p className="pb-1 text-sm font-medium text-green-600">{notice}</p>}
       {phase === "measure" ? (
-        <p className="text-sm text-neutral-500">Фаза 1 · замер (порог X = {cooling.thresholdX}°C). Отсканируйте EAN товара, затем введите фактическую температуру.</p>
+        <>
+          {notice && <p className="pb-1 text-sm font-medium text-green-600">{notice}</p>}
+          <p className="text-sm text-neutral-500">Фаза 1 · замер (порог X = {cooling.thresholdX}°C). Отсканируйте EAN товара, затем введите фактическую температуру.</p>
+        </>
       ) : (
-        <p className="text-sm font-medium text-green-700">Фаза 2 · размещение. Готово к вывозу → ячейка <b>{targetCode}</b>. Отсканируйте исходную ячейку охлаждения, затем назначенную.</p>
+        // Задача K: одна короткая инструкция текущего шага (без «Фазы 2», повтора маршрута и статусов).
+        <p className="text-sm text-neutral-600">{step === "from" ? `Заберите товар из ${cooling.coolingCell}` : `Разместите товар в ${targetCode ?? ""}`}</p>
       )}
     </WorkflowSheet>
   );

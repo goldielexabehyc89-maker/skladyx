@@ -475,6 +475,7 @@ async function main() {
     coolUiToken: coolUi.token,        // Задача I: UI-тест шага/кнопки RETRIEVE_COOLING (полный проход)
     coolUiCellQr: coolUi.coolQr,
     coolUiWhId: coolUi.whId,          // подсчёт StockMovement (ровно одно движение при финальном размещении)
+    coolUiCoolCode: "OHU-01",         // Задача K: код исходной COOLING-ячейки (на кнопке фазы вывоза)
     coolUiTargetCode: "SU-01",
     coolUiTargetQr: coolUi.targetQr,  // QR назначенной STORAGE-ячейки для финального скана размещения
     monitorNewestTitle: MONITOR_NEWEST_TITLE, // Задача H: сентинел «новые сверху» в мониторе ADMIN

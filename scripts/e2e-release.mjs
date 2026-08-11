@@ -626,7 +626,8 @@ async function main() {
     const opened = await measure(ids.ean, ids.thresholdX - 2);
     ok("Охлаждение ≤X: мастер замера открыт и пройден", opened);
     let leqReady = false;
-    for (let i = 0; i < 60; i++) { const s = await sheetTxt(); if (s.includes(ids.coolLeqTargetCode) && (s.includes("Готово к вывозу") || s.includes("Фаза 2"))) { leqReady = true; break; } await sleep(200); }
+    // Задача K: фаза вывоза компактна — «Готово к вывозу»/«Фаза 2» убраны; цель видна в маршруте шторки.
+    for (let i = 0; i < 60; i++) { const s = await sheetTxt(); if (s.includes(ids.coolLeqTargetCode) && /переместить/i.test(s)) { leqReady = true; break; } await sleep(200); }
     const s = await sheetTxt();
     ok("Охлаждение ≤X: показана ТОЧНАЯ целевая ячейка после замера", leqReady && has(s, ids.coolLeqTargetCode), s.slice(0, 0));
     ok("Охлаждение ≤X: нет «Ещё охлаждается» (замер прошёл)", !has(s, "Ещё охлаждается") && !has(await bodyText(), "Ещё охлаждается"));
@@ -705,24 +706,40 @@ async function main() {
     ok("J/2: успех EAN озвучен (role=status)", await ev(`!!document.querySelector('[role=status]')`) || eanOk);
     ok("J/2: подтверждение EAN не создало движения", (await movCount()) === m0);
 
+    // код исходной/целевой ячейки — на кнопках фазы вывоза (Задача K)
+    const fromScan = `/Сканировать ${ids.coolUiCoolCode}/`, targetScan = `/Сканировать ${ids.coolUiTargetCode}/`;
+    const sheetTxtI = () => ev(`document.querySelector('[data-workflow-sheet]')?.innerText || ""`);
+    const countOcc = (s, sub) => s.split(sub).length - 1;
+
     // тест 4: температура <=X назначает ровно одну целевую ячейку.
     await setSheetNumber(String(ids.thresholdX - 2)); await clickText("/Записать замер/"); await sleep(1200);
     let leqTarget = false; for (let i = 0; i < 50; i++) { if ((await bodyText()).includes(ids.coolUiTargetCode)) { leqTarget = true; break; } await sleep(200); }
     ok("J/4: температура ≤X → назначена целевая ячейка (фаза вывоза)", leqTarget, ids.coolUiTargetCode);
     ok("J/4: назначение цели не создало движения", (await movCount()) === m0);
+
+    // ── Задача K: компактная фаза вывоза ──
+    let st = await sheetTxtI();
+    ok("K/1: товар в фазе вывоза показан ровно один раз", countOcc(st, ids.itemName) === 1, `${countOcc(st, ids.itemName)}×`);
+    ok("K/1: количество показано (одна метрика · маршрут)", /\d+\s*шт/.test(st), st.replace(/\n/g, " ").slice(0, 0));
+    // innerText отражает text-transform:uppercase → «ПЕРЕМЕСТИТЬ»; сверяем без учёта регистра.
+    ok("K/1: команда «Переместить» показана", /переместить/i.test(st));
+    ok("K/2: нет «Фаза 2» и нет «Готово к вывозу»", !has(st, "Фаза 2") && !has(st, "Готово к вывозу"), st.replace(/\n/g, " ").slice(0, 0));
+    ok("K/2: нет температуры/порога X в фазе вывоза", !has(st, "°C") && !has(st, "порог"));
     btns = await scanBtns();
-    ok("J: старт фазы вывоза — кнопка «Сканировать ячейку охлаждения»", btns[0] === "Сканировать ячейку охлаждения", JSON.stringify(btns));
+    ok("K/3: исходный шаг — кнопка с точным кодом COOLING-ячейки", btns.length === 1 && btns[0] === `Сканировать ${ids.coolUiCoolCode}`, JSON.stringify(btns));
+    // Основное действие (scan-кнопка) видно в пределах viewport стандартного iPhone (без прокрутки).
+    ok("K/7: основное действие видно без прокрутки (mobile)", await ev(`(()=>{const b=[...document.querySelectorAll('[data-workflow-sheet] button')].find(x=>/Сканировать/.test(x.textContent)); if(!b) return false; const r=b.getBoundingClientRect(); return r.top>=0 && r.top<window.innerHeight && r.bottom<=window.innerHeight+2;})()`));
 
     // P2-fix: пропавшая активная бронь цели → красная ошибка на скане исходной ячейки, целевой шаг не открыт.
     if (prisma && ids.coolUiWhId) {
       const rsv = await prisma.cellReservation.findFirst({ where: { warehouseId: ids.coolUiWhId, sessionId: { not: null }, status: "ACTIVE" } });
       if (rsv) {
         await prisma.cellReservation.update({ where: { id: rsv.id }, data: { status: "RELEASED" } });
-        await clickScan("/Сканировать ячейку охлаждения/");
+        await clickScan(fromScan);
         await manualScan(ids.coolUiCellQr);
         let a = false; for (let i = 0; i < 40; i++) { if (await hasAlert()) { a = true; break; } await sleep(150); }
         ok("J/P2: пропавшая бронь цели → красная ошибка на скане исходной ячейки", a);
-        ok("J/P2: целевой шаг не открыт (кнопка не «назначенную»)", !(await scanBtns()).includes("Сканировать назначенную ячейку"));
+        ok("J/P2: целевой шаг не открыт (кнопка не про целевую ячейку)", !(await scanBtns()).some((b) => b.includes(ids.coolUiTargetCode)));
         ok("J/P2: отклонение не создало движения", (await movCount()) === m0);
         await retryErr();
         await prisma.cellReservation.update({ where: { id: rsv.id }, data: { status: "ACTIVE" } }); // восстановить бронь
@@ -730,24 +747,26 @@ async function main() {
     }
 
     // тест 5: неверная исходная ячейка (другая ВАЛИДНАЯ ячейка склада) сразу отклонена; целевой шаг не открыт.
-    await clickScan("/Сканировать ячейку охлаждения/");
+    await clickScan(fromScan);
     await manualScan(ids.coolUiTargetQr);                    // валидная STORAGE-ячейка склада, но не COOLING-источник
     alerted = false; for (let i = 0; i < 40; i++) { if (await hasAlert()) { alerted = true; break; } await sleep(150); }
     ok("J/5: другая валидная ячейка склада как источник → красная ошибка", alerted);
     ok("J/5: отклонение исходной ячейки не изменило StockMovement", (await movCount()) === m0);
     await retryErr();
 
-    // тест 6: правильная исходная ячейка подтверждена сервером → открывается скан назначенной цели.
-    await clickScan("/Сканировать ячейку охлаждения/");
+    // тест 6 + K/4: правильная исходная ячейка → зелёное «Ячейка <код> подтверждена» → открыт скан цели.
+    await clickScan(fromScan);
     await manualScan(ids.coolUiCellQr);
+    let srcConfirmed = false; for (let i = 0; i < 40; i++) { if ((await bodyText()).includes(`Ячейка ${ids.coolUiCoolCode} подтверждена`)) { srcConfirmed = true; break; } await sleep(120); }
+    ok("K/4: после правильного скана — зелёное подтверждение с кодом «Ячейка <код> подтверждена»", srcConfirmed);
     ok("J/6: верная исходная ячейка подтверждена → открыт скан цели (placeholder про назначенную ячейку)", await waitPlaceholder("назначенн"));
-    // подпись строго по шагу: выйти из камеры → «Сканировать назначенную ячейку»
+    // подпись строго по шагу: выйти из камеры → «Сканировать <код цели>»
     await clickText("/Назад к списку/"); await sleep(300);
     btns = await scanBtns();
-    ok("J/10: подпись реального шага после «Назад к списку» = «Сканировать назначенную ячейку»", btns.includes("Сканировать назначенную ячейку") && !btns.includes("Сканировать товар"), JSON.stringify(btns));
+    ok("K/5 + J/10: целевой шаг — кнопка с точным кодом STORAGE-ячейки", btns.length === 1 && btns[0] === `Сканировать ${ids.coolUiTargetCode}`, JSON.stringify(btns));
 
     // тест 7: неверная целевая ячейка отклонена без движения.
-    await clickScan("/Сканировать назначенную ячейку/");
+    await clickScan(targetScan);
     await manualScan(ids.coolUiCellQr);                      // COOLING-ячейка как цель — неверно
     alerted = false; for (let i = 0; i < 40; i++) { if (await hasAlert()) { alerted = true; break; } await sleep(150); }
     ok("J/7: неверная целевая ячейка → красная ошибка без движения", alerted && (await movCount()) === m0, `${m0} -> ${await movCount()}`);
@@ -757,12 +776,12 @@ async function main() {
     await clickText("/Назад к списку/"); await sleep(250);
     await clickText("/Начать заново/"); await sleep(300);
     btns = await scanBtns();
-    ok("J/10: «Начать заново» сбрасывает фазу вывоза к скану исходной COOLING-ячейки", btns[0] === "Сканировать ячейку охлаждения", JSON.stringify(btns));
+    ok("J/10: «Начать заново» сбрасывает фазу вывоза к скану исходной COOLING-ячейки", btns[0] === `Сканировать ${ids.coolUiCoolCode}`, JSON.stringify(btns));
     ok("J/10: «Начать заново» не создало движение/бронь (StockMovement неизменен)", (await movCount()) === m0);
     ok("J/12: мобайл без горизонтального скролла", await ev(`document.documentElement.scrollWidth <= window.innerWidth + 1`));
 
     // тест 8+11: правильная цель → ровно одно движение (ручная ветка = та же state-machine, что и камера).
-    await clickScan("/Сканировать ячейку охлаждения/");
+    await clickScan(fromScan);
     await manualScan(ids.coolUiCellQr);                      // исходная ячейка подтверждена → авто-переход к цели
     await waitPlaceholder("назначенн");
     await manualScan(ids.coolUiTargetQr);                    // назначенная цель → финальная транзакция
