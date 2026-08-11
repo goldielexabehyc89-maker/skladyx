@@ -168,11 +168,6 @@ async function lastMeasurement(tx: Tx, sessionId: string) {
   return tx.temperatureMeasurement.findFirst({ where: { sessionId }, orderBy: { measuredAt: "desc" } });
 }
 
-// ── Пакет 9B, Фаза 1 — замер и подготовка. Погрузчик сканирует исходную COOLING-ячейку, EAN и вводит
-// температуру. temp > X: замер + следующая отложенная задача, группа не двигается, резерв сохранён.
-// temp <= X: выбор цели (ур.1→2→резерв 3+), перевод активной CellReservation на выбранную ячейку и
-// возврат её кода (движения/завершения нет). Повтор при уже подготовленном вывозе возвращает ту же
-// цель без второго замера и новой брони. ──
 // ── COOL-003/004: отдельные READ-ONLY серверные проверки скана. Ничего не создают (ни замер, ни бронь,
 // ни событие, ни движение) — только авторитетно подтверждают текущий скан, чтобы шаг мог смениться. ──
 
@@ -202,10 +197,12 @@ export async function verifyCoolingRetrievalEan(input: { companyId: string; user
 }
 
 // Проверка исходной COOLING-ячейки (фаза вывоза): tenant/склад, именно coolingCellId сессии, группа
-// физически в этой ячейке, подготовленный замер актуален (последнее измерение ≤ X). Другая валидная
-// ячейка склада отклоняется. Read-only.
+// физически в этой ячейке, подготовленный замер актуален (последнее измерение ≤ X) И назначенная цель
+// действительна — есть активная бронь на активную STORAGE-ячейку. Другая валидная ячейка склада, а также
+// пропавшая бронь/недоступная цель отклоняются сразу (UI-005: ошибку видно на этом шаге, не на последнем).
+// Возвращает АВТОРИТЕТНЫЙ код целевой ячейки (клиент сверяет/обновляет его перед переходом). Read-only.
 export async function verifyCoolingRetrievalSourceCell(input: { companyId: string; userId: string; taskId: string; fromCellCode: string }):
-  Promise<{ coolingCellCode: string; targetCellCode: string | null }> {
+  Promise<{ coolingCellCode: string; targetCellCode: string }> {
   const { session, group } = await loadActiveRetrieval(input.companyId, input.userId, input.taskId);
   const fromCellId = await resolveCoolingCell(prisma, input.companyId, group.warehouseId, input.fromCellCode);
   if (fromCellId !== session.coolingCellId) throw new CoolingError("Отсканирована не та ячейка охлаждения");
@@ -214,10 +211,13 @@ export async function verifyCoolingRetrievalSourceCell(input: { companyId: strin
     throw new CoolingError("Сначала выполните замер (Фаза 1): группа ещё не готова к вывозу");
   const coolBal = await prisma.stockBalance.findFirst({ where: { lotId: group.lotId, locKey: `C:${session.coolingCellId}`, qty: { gt: 0 } } });
   if (!coolBal || !coolBal.qty.equals(group.qty)) throw new CoolingError("Остаток группы в ячейке охлаждения не совпадает");
+  // Активная бронь целевой ячейки обязана существовать; иначе — сразу ошибка (не «ложное зелёное»).
   const reservation = await prisma.cellReservation.findFirst({ where: { sessionId: session.id, status: "ACTIVE" } });
+  if (!reservation) throw new CoolingError("Активный резерв целевой ячейки не найден — размещение отменено");
+  const target = await prisma.cell.findFirst({ where: { id: reservation.cellId, companyId: input.companyId, warehouseId: group.warehouseId, isActive: true }, include: { zone: true } });
+  if (!target || target.zone?.kind !== "STORAGE") throw new CoolingError("Назначенная целевая ячейка недоступна — размещение отменено");
   const cool = await prisma.cell.findFirst({ where: { id: session.coolingCellId }, select: { code: true } });
-  const target = reservation ? await prisma.cell.findFirst({ where: { id: reservation.cellId }, select: { code: true } }) : null;
-  return { coolingCellCode: cool?.code ?? "", targetCellCode: target?.code ?? null };
+  return { coolingCellCode: cool?.code ?? "", targetCellCode: target.code };
 }
 
 // COOL-003: замер принимает taskId + EAN + температуру (без скана ячейки). EAN повторно сверяется

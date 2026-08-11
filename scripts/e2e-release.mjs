@@ -713,6 +713,22 @@ async function main() {
     btns = await scanBtns();
     ok("J: старт фазы вывоза — кнопка «Сканировать ячейку охлаждения»", btns[0] === "Сканировать ячейку охлаждения", JSON.stringify(btns));
 
+    // P2-fix: пропавшая активная бронь цели → красная ошибка на скане исходной ячейки, целевой шаг не открыт.
+    if (prisma && ids.coolUiWhId) {
+      const rsv = await prisma.cellReservation.findFirst({ where: { warehouseId: ids.coolUiWhId, sessionId: { not: null }, status: "ACTIVE" } });
+      if (rsv) {
+        await prisma.cellReservation.update({ where: { id: rsv.id }, data: { status: "RELEASED" } });
+        await clickScan("/Сканировать ячейку охлаждения/");
+        await manualScan(ids.coolUiCellQr);
+        let a = false; for (let i = 0; i < 40; i++) { if (await hasAlert()) { a = true; break; } await sleep(150); }
+        ok("J/P2: пропавшая бронь цели → красная ошибка на скане исходной ячейки", a);
+        ok("J/P2: целевой шаг не открыт (кнопка не «назначенную»)", !(await scanBtns()).includes("Сканировать назначенную ячейку"));
+        ok("J/P2: отклонение не создало движения", (await movCount()) === m0);
+        await retryErr();
+        await prisma.cellReservation.update({ where: { id: rsv.id }, data: { status: "ACTIVE" } }); // восстановить бронь
+      }
+    }
+
     // тест 5: неверная исходная ячейка (другая ВАЛИДНАЯ ячейка склада) сразу отклонена; целевой шаг не открыт.
     await clickScan("/Сканировать ячейку охлаждения/");
     await manualScan(ids.coolUiTargetQr);                    // валидная STORAGE-ячейка склада, но не COOLING-источник

@@ -383,6 +383,12 @@ async function main() {
   const badSrc = await err(() => verifyCoolingRetrievalSourceCell({ companyId, userId: L1, taskId: tE!.id, fromCellCode: wrongCellQr }));
   ok("verify source: другая валидная ячейка склада отклонена", badSrc.includes("не та ячейка"));
   ok("verify source: read-only — движений/замеров не добавилось", (await prisma.stockMovement.count({ where: { lotId: lotE } })) >= 0 && (await prisma.temperatureMeasurement.count({ where: { sessionId: sE!.id } })) === measBefore);
+  // P2-fix: пропавшая активная бронь цели → verify source отклоняет сразу (не «ложное зелёное»)
+  const resE = await prisma.cellReservation.findFirstOrThrow({ where: { sessionId: sE!.id, status: "ACTIVE" } });
+  await prisma.cellReservation.update({ where: { id: resE.id }, data: { status: "RELEASED" } });
+  const badNoRes = await err(() => verifyCoolingRetrievalSourceCell({ companyId, userId: L1, taskId: tE!.id, fromCellCode: fromE }));
+  ok("verify source: без активной брони цели → отказ (цель не подтверждается)", /резерв|цел/i.test(badNoRes));
+  await prisma.cellReservation.update({ where: { id: resE.id }, data: { status: "ACTIVE" } }); // восстановить для place-тестов
   // place: посторонняя целевая ячейка отклонена (до размещения)
   const badTarget = await err(() => placeCoolingRetrieval({ companyId, userId: L1, taskId: tE!.id, fromCellCode: fromE, ean: lotEan, targetCellCode: wrongCellQr }));
   ok("place: чужая целевая ячейка отклонена", badTarget.includes("не та целевая"));

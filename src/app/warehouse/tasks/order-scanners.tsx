@@ -308,8 +308,10 @@ export function CoolingRetrievalScanner({ cooling }: { cooling: Cooling }) {
     startTransition(async () => {
       const fd = new FormData(); fd.set("taskId", cooling.taskId); fd.set("fromCellCode", raw);
       const res = await verifyCoolingRetrievalSourceCellAction({}, fd);
-      if (res.error) { setCheck("idle"); setError(res.error); return; } // шаг не меняется
-      setFromRaw(raw); setCheck("confirmed"); vibrate(60);
+      // UI-005: без авторитетной цели (пропавшая бронь/недоступная ячейка) — красная ошибка на ЭТОМ шаге,
+      // целевой шаг не открывается. Сервер вернул код цели — сверяем/обновляем targetCode перед переходом.
+      if (res.error || !res.targetCellCode) { setCheck("idle"); setError(res.error ?? "Назначенная целевая ячейка недоступна — размещение отменено"); return; }
+      setFromRaw(raw); setTargetCode(res.targetCellCode); setCheck("confirmed"); vibrate(60);
       advanceTimer.current = setTimeout(() => { setCheck("idle"); setStep("target"); setScanning(true); setNotice("Ячейка охлаждения подтверждена — сканируйте назначенную ячейку"); }, 900);
     });
   }
