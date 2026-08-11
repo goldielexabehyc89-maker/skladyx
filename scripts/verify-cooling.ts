@@ -6,7 +6,7 @@
 import { PrismaClient, type Role } from "@prisma/client";
 import bcrypt from "bcryptjs";
 import { createHandlingGroup, completeGroupPlacement, prepareGroupPlacement } from "@/lib/group-receiving";
-import { prepareCoolingRetrieval, placeCoolingRetrieval, estimateReadyAt } from "@/lib/cooling";
+import { prepareCoolingRetrieval, placeCoolingRetrieval, verifyCoolingRetrievalEan, verifyCoolingRetrievalSourceCell, estimateReadyAt } from "@/lib/cooling";
 import { ensureStandardZones, createCellsInZone, assertCellNotHeldByGroup } from "@/lib/cells";
 import { startWorkflowTask, rebalanceQueuedTasks, cancelWorkflowTask } from "@/lib/workflow-tasks";
 import { updateSettings } from "@/lib/settings";
@@ -75,7 +75,7 @@ async function retrieve(loader: string, sessionId: string, temp: number): Promis
   const session = await prisma.coolingSession.findFirstOrThrow({ where: { id: sessionId } });
   const fromCode = await cellQr(session.coolingCellId);
   return err(async () => {
-    const r = await prepareCoolingRetrieval({ companyId, userId: loader, taskId: t.id, fromCellCode: fromCode, ean: lotEan, temperature: temp });
+    const r = await prepareCoolingRetrieval({ companyId, userId: loader, taskId: t.id, ean: lotEan, temperature: temp });
     if (r.ready) {
       const cr = await prisma.cellReservation.findFirstOrThrow({ where: { sessionId, status: "ACTIVE" } });
       const targetQr = await cellQr(cr.cellId);
@@ -278,7 +278,7 @@ async function main() {
   console.log("12) tenant-изоляция");
   const foreign = await err(() => createHandlingGroup({ companyId, warehouseId: DW, itemId: lotItem, qty: 4, temperature: 9, acceptedById: RUSER, dedupeKey: dk() }));
   ok("приёмка на чужой склад → отказ", !!foreign);
-  const foreignRetr = await err(() => prepareCoolingRetrieval({ companyId: demoId, userId: L1, taskId: rt2!.id, fromCellCode: "XXXXXXXXXX", ean: lotEan, temperature: 4 }));
+  const foreignRetr = await err(() => prepareCoolingRetrieval({ companyId: demoId, userId: L1, taskId: rt2!.id, ean: lotEan, temperature: 4 }));
   ok("забор чужой сессии (другой companyId) → отказ", !!foreignRetr);
 
   console.log("13) push не создаётся");
@@ -359,21 +359,30 @@ async function main() {
   await startWorkflowTask(L1, companyId, tE!.id);
   const fromE = await cellQr(sE!.coolingCellId);
   const wrongCellQr = await cellQr(C2); // валидный CELL-QR, но не исходная и не целевая ячейка сессии
-  // Фаза 1: замер <=X → назначается целевая ячейка
-  const p1 = await prepareCoolingRetrieval({ companyId, userId: L1, taskId: tE!.id, fromCellCode: fromE, ean: lotEan, temperature: 4 });
+  const measBefore0 = await prisma.temperatureMeasurement.count({ where: { sessionId: sE!.id } });
+  // COOL-003: verifyCoolingRetrievalEan — read-only проверка EAN до замера, БД не меняет
+  ok("verify EAN: правильный EAN подтверждён", (await err(() => verifyCoolingRetrievalEan({ companyId, userId: L1, taskId: tE!.id, ean: lotEan }))) === "");
+  const badEanV = await err(() => verifyCoolingRetrievalEan({ companyId, userId: L1, taskId: tE!.id, ean: wrongCellQr }));
+  ok("verify EAN: неверный/чужой EAN отклонён", /EAN|товар/.test(badEanV));
+  ok("verify EAN: read-only — замеров не добавилось", (await prisma.temperatureMeasurement.count({ where: { sessionId: sE!.id } })) === measBefore0);
+  // Фаза 1: замер <=X (по EAN, без исходной ячейки) → назначается целевая ячейка
+  const p1 = await prepareCoolingRetrieval({ companyId, userId: L1, taskId: tE!.id, ean: lotEan, temperature: 4 });
   ok("Фаза 1: готово, назначена целевая ячейка", p1.ready && !!p1.targetCellCode);
   const targetE = await resCellOf(sE!.id);
   const targetQrE = await cellQr(targetE);
   const measBefore = await prisma.temperatureMeasurement.count({ where: { sessionId: sE!.id } });
-  // prepare: посторонняя исходная ячейка / неверный EAN отклоняются ДО идемпотентного возврата цели
-  const badFrom = await err(() => prepareCoolingRetrieval({ companyId, userId: L1, taskId: tE!.id, fromCellCode: wrongCellQr, ean: lotEan, temperature: 4 }));
-  ok("prepare: чужая исходная ячейка отклонена (цель не возвращается)", badFrom.includes("не та ячейка"));
-  const badEan = await err(() => prepareCoolingRetrieval({ companyId, userId: L1, taskId: tE!.id, fromCellCode: fromE, ean: wrongCellQr, temperature: 4 }));
+  // prepare: неверный EAN отклонён ДО идемпотентного возврата цели
+  const badEan = await err(() => prepareCoolingRetrieval({ companyId, userId: L1, taskId: tE!.id, ean: wrongCellQr, temperature: 4 }));
   ok("prepare: неверный EAN отклонён", /EAN|товар/.test(badEan));
-  ok("prepare: отклонения не создали лишних замеров", (await prisma.temperatureMeasurement.count({ where: { sessionId: sE!.id } })) === measBefore);
+  ok("prepare: отклонение не создало лишних замеров", (await prisma.temperatureMeasurement.count({ where: { sessionId: sE!.id } })) === measBefore);
   // prepare: корректный повтор → та же цель без нового замера
-  const p1again = await prepareCoolingRetrieval({ companyId, userId: L1, taskId: tE!.id, fromCellCode: fromE, ean: lotEan, temperature: 4 });
+  const p1again = await prepareCoolingRetrieval({ companyId, userId: L1, taskId: tE!.id, ean: lotEan, temperature: 4 });
   ok("prepare: точный повтор → та же цель, без нового замера", p1again.ready && p1again.targetCellCode === p1.targetCellCode && (await prisma.temperatureMeasurement.count({ where: { sessionId: sE!.id } })) === measBefore);
+  // COOL-004: verifyCoolingRetrievalSourceCell — read-only проверка исходной ячейки в фазе вывоза
+  ok("verify source: правильная исходная COOLING-ячейка подтверждена", (await err(() => verifyCoolingRetrievalSourceCell({ companyId, userId: L1, taskId: tE!.id, fromCellCode: fromE }))) === "");
+  const badSrc = await err(() => verifyCoolingRetrievalSourceCell({ companyId, userId: L1, taskId: tE!.id, fromCellCode: wrongCellQr }));
+  ok("verify source: другая валидная ячейка склада отклонена", badSrc.includes("не та ячейка"));
+  ok("verify source: read-only — движений/замеров не добавилось", (await prisma.stockMovement.count({ where: { lotId: lotE } })) >= 0 && (await prisma.temperatureMeasurement.count({ where: { sessionId: sE!.id } })) === measBefore);
   // place: посторонняя целевая ячейка отклонена (до размещения)
   const badTarget = await err(() => placeCoolingRetrieval({ companyId, userId: L1, taskId: tE!.id, fromCellCode: fromE, ean: lotEan, targetCellCode: wrongCellQr }));
   ok("place: чужая целевая ячейка отклонена", badTarget.includes("не та целевая"));

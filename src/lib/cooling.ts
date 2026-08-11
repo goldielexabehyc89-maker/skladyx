@@ -173,8 +173,57 @@ async function lastMeasurement(tx: Tx, sessionId: string) {
 // temp <= X: выбор цели (ур.1→2→резерв 3+), перевод активной CellReservation на выбранную ячейку и
 // возврат её кода (движения/завершения нет). Повтор при уже подготовленном вывозе возвращает ту же
 // цель без второго замера и новой брони. ──
+// ── COOL-003/004: отдельные READ-ONLY серверные проверки скана. Ничего не создают (ни замер, ни бронь,
+// ни событие, ни движение) — только авторитетно подтверждают текущий скан, чтобы шаг мог смениться. ──
+
+// Общая read-only выборка задачи забора «в работе» + активной сессии + группы (проверки владения/tenant).
+async function loadActiveRetrieval(companyId: string, userId: string, taskId: string) {
+  const task = await prisma.workflowTask.findFirst({ where: { id: taskId, companyId } });
+  if (!task) throw new CoolingError("Задача не найдена");
+  if (task.type !== TASK_TYPES.RETRIEVE_COOLING) throw new CoolingError("Это не задача забора из охлаждения");
+  if (task.assignedUserId !== userId || task.status !== "IN_PROGRESS")
+    throw new CoolingError("Только назначенный исполнитель с задачей «в работе»");
+  const session = await prisma.coolingSession.findFirst({ where: { id: task.subjectId ?? "", companyId } });
+  if (!session || session.status !== "ACTIVE") throw new CoolingError("Сессия охлаждения не найдена или уже завершена");
+  const group = await prisma.handlingGroup.findFirst({ where: { id: session.handlingGroupId, companyId } });
+  if (!group) throw new CoolingError("Группа не найдена");
+  return { task, session, group };
+}
+
+// Проверка EAN (фаза замера): активен, tenant-scoped и соответствует товару группы.
+export async function verifyCoolingRetrievalEan(input: { companyId: string; userId: string; taskId: string; ean: string }):
+  Promise<{ itemName: string; qty: string }> {
+  const { group } = await loadActiveRetrieval(input.companyId, input.userId, input.taskId);
+  const itemId = await eanItemIdInTx(prisma, input.companyId, input.ean);
+  if (!itemId) throw new CoolingError("Неизвестный, неактивный или чужой EAN — операция отклонена");
+  if (itemId !== group.itemId) throw new CoolingError("Отсканирован не тот товар (EAN не совпадает с группой)");
+  const item = await prisma.item.findFirst({ where: { id: group.itemId, companyId: input.companyId }, select: { name: true } });
+  return { itemName: item?.name ?? "товар", qty: group.qty.toString() };
+}
+
+// Проверка исходной COOLING-ячейки (фаза вывоза): tenant/склад, именно coolingCellId сессии, группа
+// физически в этой ячейке, подготовленный замер актуален (последнее измерение ≤ X). Другая валидная
+// ячейка склада отклоняется. Read-only.
+export async function verifyCoolingRetrievalSourceCell(input: { companyId: string; userId: string; taskId: string; fromCellCode: string }):
+  Promise<{ coolingCellCode: string; targetCellCode: string | null }> {
+  const { session, group } = await loadActiveRetrieval(input.companyId, input.userId, input.taskId);
+  const fromCellId = await resolveCoolingCell(prisma, input.companyId, group.warehouseId, input.fromCellCode);
+  if (fromCellId !== session.coolingCellId) throw new CoolingError("Отсканирована не та ячейка охлаждения");
+  const last = await lastMeasurement(prisma, session.id);
+  if (!last || last.temperature.toNumber() > session.thresholdX.toNumber())
+    throw new CoolingError("Сначала выполните замер (Фаза 1): группа ещё не готова к вывозу");
+  const coolBal = await prisma.stockBalance.findFirst({ where: { lotId: group.lotId, locKey: `C:${session.coolingCellId}`, qty: { gt: 0 } } });
+  if (!coolBal || !coolBal.qty.equals(group.qty)) throw new CoolingError("Остаток группы в ячейке охлаждения не совпадает");
+  const reservation = await prisma.cellReservation.findFirst({ where: { sessionId: session.id, status: "ACTIVE" } });
+  const cool = await prisma.cell.findFirst({ where: { id: session.coolingCellId }, select: { code: true } });
+  const target = reservation ? await prisma.cell.findFirst({ where: { id: reservation.cellId }, select: { code: true } }) : null;
+  return { coolingCellCode: cool?.code ?? "", targetCellCode: target?.code ?? null };
+}
+
+// COOL-003: замер принимает taskId + EAN + температуру (без скана ячейки). EAN повторно сверяется
+// на сервере в этой транзакции; клиентскому «проверено» доверия нет.
 export async function prepareCoolingRetrieval(input: {
-  companyId: string; userId: string; taskId: string; fromCellCode: string; ean: string; temperature: number;
+  companyId: string; userId: string; taskId: string; ean: string; temperature: number;
 }): Promise<{ warehouseId: string; ready: boolean; targetCellCode: string | null }> {
   const out = await prisma.$transaction(async (tx) => {
     await lockCompany(tx, input.companyId);
@@ -190,10 +239,8 @@ export async function prepareCoolingRetrieval(input: {
     const X = session.thresholdX.toNumber();
     const reservation = await tx.cellReservation.findFirst({ where: { sessionId: session.id, status: "ACTIVE" } });
 
-    // Пакет 9B-fix: исходную COOLING-ячейку и EAN подтверждаем ВСЕГДА — до любого (в т.ч. идемпотентного) возврата,
-    // иначе посторонним кодом можно получить успешный ответ после подготовки.
-    const fromCellId = await resolveCoolingCell(tx, input.companyId, group.warehouseId, input.fromCellCode);
-    if (fromCellId !== session.coolingCellId) throw new CoolingError("Отсканирована не та ячейка охлаждения");
+    // EAN подтверждаем ВСЕГДА — до любого (в т.ч. идемпотентного) возврата, иначе посторонним кодом
+    // можно получить успешный ответ после подготовки. Исходную ячейку в фазе замера НЕ сканируют (COOL-003).
     const scannedItemId = await eanItemIdInTx(tx, input.companyId, input.ean);
     if (!scannedItemId) throw new CoolingError("Неизвестный, неактивный или чужой EAN — операция отклонена");
     if (scannedItemId !== group.itemId) throw new CoolingError("Отсканирован не тот товар (EAN не совпадает с группой)");

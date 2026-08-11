@@ -11,10 +11,11 @@ import {
   rejectTaskHandoff,
   rebalanceQueuedTasks,
 } from "@/lib/workflow-tasks";
-import { prepareCoolingRetrieval, placeCoolingRetrieval, CoolingError } from "@/lib/cooling";
+import { prepareCoolingRetrieval, placeCoolingRetrieval, verifyCoolingRetrievalEan, verifyCoolingRetrievalSourceCell, CoolingError } from "@/lib/cooling";
 
 export interface TaskActionState {
   error?: string;
+  ok?: boolean;
   ready?: boolean;
   targetCellCode?: string | null;
 }
@@ -65,18 +66,51 @@ export async function rejectHandoffAction(_prev: TaskActionState, formData: Form
 }
 
 // Пакет 5: завершение срочной задачи «Забрать из охлаждения» — погрузчик вводит фактическую температуру.
-export async function prepareCoolingRetrievalAction(_prev: TaskActionState, formData: FormData): Promise<TaskActionState> {
+// COOL-003 (фаза замера): авторитетная read-only проверка EAN до показа температуры. БД не меняет.
+export async function verifyCoolingRetrievalEanAction(_prev: TaskActionState, formData: FormData): Promise<TaskActionState> {
+  if (!coolingWorkflowEnabled()) return { error: "Охлаждение сейчас отключено" };
+  const session = await requireUser();
+  const s = scoped(session);
+  const taskId = String(formData.get("taskId") ?? "");
+  const ean = String(formData.get("ean") ?? "").trim();
+  if (!ean) return { error: "Отсканируйте EAN товара" };
+  try {
+    await verifyCoolingRetrievalEan({ companyId: s.companyId, userId: session.userId, taskId, ean });
+    return { ok: true };
+  } catch (e) {
+    if (e instanceof CoolingError) return { error: e.message };
+    throw e;
+  }
+}
+
+// COOL-004 (фаза вывоза): авторитетная read-only проверка исходной COOLING-ячейки до скана цели. БД не меняет.
+export async function verifyCoolingRetrievalSourceCellAction(_prev: TaskActionState, formData: FormData): Promise<TaskActionState> {
   if (!coolingWorkflowEnabled()) return { error: "Охлаждение сейчас отключено" };
   const session = await requireUser();
   const s = scoped(session);
   const taskId = String(formData.get("taskId") ?? "");
   const fromCellCode = String(formData.get("fromCellCode") ?? "").trim();
+  if (!fromCellCode) return { error: "Отсканируйте исходную ячейку охлаждения" };
+  try {
+    const r = await verifyCoolingRetrievalSourceCell({ companyId: s.companyId, userId: session.userId, taskId, fromCellCode });
+    return { ok: true, targetCellCode: r.targetCellCode };
+  } catch (e) {
+    if (e instanceof CoolingError) return { error: e.message };
+    throw e;
+  }
+}
+
+export async function prepareCoolingRetrievalAction(_prev: TaskActionState, formData: FormData): Promise<TaskActionState> {
+  if (!coolingWorkflowEnabled()) return { error: "Охлаждение сейчас отключено" };
+  const session = await requireUser();
+  const s = scoped(session);
+  const taskId = String(formData.get("taskId") ?? "");
   const ean = String(formData.get("ean") ?? "").trim();
   const temperature = Number(String(formData.get("temperature") ?? "").trim().replace(",", "."));
-  if (!fromCellCode || !ean) return { error: "Отсканируйте ячейку охлаждения и EAN товара" };
+  if (!ean) return { error: "Отсканируйте EAN товара" };
   if (!Number.isFinite(temperature)) return { error: "Укажите фактическую температуру" };
   try {
-    const r = await prepareCoolingRetrieval({ companyId: s.companyId, userId: session.userId, taskId, fromCellCode, ean, temperature });
+    const r = await prepareCoolingRetrieval({ companyId: s.companyId, userId: session.userId, taskId, ean, temperature });
     revalidatePath("/warehouse/tasks");
     return { ready: r.ready, targetCellCode: r.targetCellCode };
   } catch (e) {
