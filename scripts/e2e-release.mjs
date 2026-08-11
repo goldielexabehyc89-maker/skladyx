@@ -718,6 +718,7 @@ async function main() {
     ok("L: маршрут «<COOLING> → Хранение» показан один раз", has(tempScreen, ids.coolUiCoolCode) && has(tempScreen, "Хранение") && countOcc(tempScreen, "→") === 1);
     ok("L: есть подпись «Текущая температура, °C»", has(tempScreen, "Текущая температура, °C"));
     ok("L: нет «Фаза 1», порога X и инструкции про EAN", !has(tempScreen, "Фаза 1") && !has(tempScreen, "порог") && !has(tempScreen, "Отсканируйте EAN") && !has(tempScreen, "Сканируйте EAN"), tempScreen.replace(/\n/g, " ").slice(0, 0));
+    ok("L: нет подзаголовка «Замер температуры» на экране температуры", !has(tempScreen, "Замер температуры"), tempScreen.replace(/\n/g, " ").slice(0, 0));
     ok("L: нет дублирующего зелёного «Товар подтверждён — введите»", !has(tempScreen, "Товар подтверждён — введите"));
     ok("L: поле температуры и кнопка «Записать температуру» видны без прокрутки (mobile)", await ev(`(()=>{const inp=document.querySelector('[data-workflow-sheet] input[type="number"]'); const b=[...document.querySelectorAll('[data-workflow-sheet] button')].find(x=>/Записать температуру/.test(x.textContent)); if(!inp||!b) return false; const ri=inp.getBoundingClientRect(), rb=b.getBoundingClientRect(); return ri.top>=0 && rb.bottom<=window.innerHeight+2 && rb.top>=0;})()`));
 

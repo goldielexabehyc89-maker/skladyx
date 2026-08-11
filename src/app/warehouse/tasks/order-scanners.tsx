@@ -373,7 +373,7 @@ export function CoolingRetrievalScanner({ cooling }: { cooling: Cooling }) {
   return (
     <WorkflowSheet
       title="Забор из охлаждения"
-      subtitle={phase === "measure" ? "Замер температуры" : "Размещение в хранение"}
+      subtitle={phase === "place" ? "Размещение в хранение" : step === "temp" ? undefined : "Замер температуры"}
       context={
         phase === "place" ? (
           // Задача K (TASK-006, COOL-004): компактная фаза вывоза — команда + товар·количество + КРУПНЫЙ
