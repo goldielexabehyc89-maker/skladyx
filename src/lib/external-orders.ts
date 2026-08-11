@@ -607,6 +607,73 @@ export async function reportPickShortage(input: { companyId: string; userId: str
   });
 }
 
+// ── PICK-001: детерминированный следующий незавершённый резерв заказа. Единица сборки — (ячейка, группа):
+// финальный скан собирает ВСЕ активные резервы этого заказа в (ячейке, группе) сразу. Порядок обхода —
+// по коду ячейки ASC, затем группа/создание. Возвращает точную требуемую ячейку, товар и количество. ──
+async function pickNextReservation(companyId: string, orderId: string) {
+  const resvs = await prisma.stockReservation.findMany({
+    where: { orderId, status: "ACTIVE", cellId: { not: null }, handlingGroupId: { not: null } },
+    orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+  });
+  if (resvs.length === 0) return null;
+  const cellIds = [...new Set(resvs.map((r) => r.cellId!).filter(Boolean))];
+  const cells = await prisma.cell.findMany({ where: { companyId, id: { in: cellIds } }, select: { id: true, code: true, level: true } });
+  const cellById = new Map(cells.map((c) => [c.id, c]));
+  // детерминированный выбор: сначала по коду ячейки, затем по группе, затем по created (стабильный tie-break)
+  const sorted = [...resvs].sort((a, b) => {
+    const ca = cellById.get(a.cellId!)?.code ?? "", cb = cellById.get(b.cellId!)?.code ?? "";
+    if (ca !== cb) return ca < cb ? -1 : 1;
+    if (a.handlingGroupId !== b.handlingGroupId) return (a.handlingGroupId ?? "") < (b.handlingGroupId ?? "") ? -1 : 1;
+    return a.createdAt.getTime() - b.createdAt.getTime();
+  });
+  const head = sorted[0];
+  const group = await prisma.handlingGroup.findFirst({ where: { id: head.handlingGroupId!, companyId }, select: { itemId: true } });
+  const item = group ? await prisma.item.findFirst({ where: { id: group.itemId, companyId }, select: { id: true, name: true } }) : null;
+  // всё количество этой (ячейка, группа) — как соберёт финальный скан
+  const qty = resvs
+    .filter((r) => r.cellId === head.cellId && r.handlingGroupId === head.handlingGroupId)
+    .reduce((s, r) => s.plus(r.qty), D(0));
+  const cell = cellById.get(head.cellId!);
+  return { cellId: head.cellId!, cellCode: cell?.code ?? "", cellLevel: cell?.level ?? null, handlingGroupId: head.handlingGroupId!, itemId: group?.itemId ?? "", itemName: item?.name ?? "товар", qty };
+}
+
+// Общая read-only загрузка задачи сборки «в работе» + заказа + следующего резерва (проверки владения/tenant).
+async function loadActivePick(companyId: string, userId: string, taskId: string) {
+  const task = await prisma.workflowTask.findFirst({ where: { id: taskId, companyId } });
+  if (!task) throw new ExternalOrderError("Задача не найдена");
+  if (task.type !== TASK_TYPES.PICK_ORDER) throw new ExternalOrderError("Это не задача сборки");
+  if (task.assignedUserId !== userId) throw new ExternalOrderError("Это не ваша задача сборки");
+  if (task.status !== "IN_PROGRESS") throw new ExternalOrderError("Задача сборки не в работе");
+  const order = await prisma.externalOrder.findFirst({ where: { id: task.subjectId ?? "", companyId } });
+  if (!order) throw new ExternalOrderError("Заказ не найден");
+  const next = await pickNextReservation(companyId, order.id);
+  if (!next) throw new ExternalOrderError("Все резервы заказа уже собраны");
+  return { task, order, next };
+}
+
+// PICK-001 (read-only): проверка скана ЯЧЕЙКИ — совпадает с требуемой (следующий резерв), уровень 1–2.
+// Ничего не двигает и не создаёт.
+export async function verifyPickCell(input: { companyId: string; userId: string; taskId: string; cellCode: string }):
+  Promise<{ cellCode: string; itemName: string; qty: string }> {
+  const { order, next } = await loadActivePick(input.companyId, input.userId, input.taskId);
+  const cellId = await resolveScannedCell(prisma, input.companyId, order.warehouseId, input.cellCode);
+  if (cellId !== next.cellId) throw new ExternalOrderError(`Отсканирована не та ячейка — нужна ${next.cellCode}`);
+  if (!isPickableLevel(next.cellLevel)) throw new ExternalOrderError("Сборка только с нижних уровней (1-2)");
+  return { cellCode: next.cellCode, itemName: next.itemName, qty: next.qty.toString() };
+}
+
+// PICK-001 (read-only): проверка скана EAN — соответствует товару требуемого резерва в подтверждённой ячейке.
+export async function verifyPickEan(input: { companyId: string; userId: string; taskId: string; cellCode: string; ean: string }):
+  Promise<{ itemName: string; qty: string }> {
+  const { order, next } = await loadActivePick(input.companyId, input.userId, input.taskId);
+  const cellId = await resolveScannedCell(prisma, input.companyId, order.warehouseId, input.cellCode);
+  if (cellId !== next.cellId) throw new ExternalOrderError(`Отсканирована не та ячейка — нужна ${next.cellCode}`);
+  const itemId = await eanItemIdInTx(prisma, input.companyId, input.ean);
+  if (!itemId) throw new ExternalOrderError("Неизвестный, неактивный или чужой EAN — сборка отклонена");
+  if (itemId !== next.itemId) throw new ExternalOrderError(`Отсканирован не тот товар — нужен ${next.itemName}`);
+  return { itemName: next.itemName, qty: next.qty.toString() };
+}
+
 // ── Геттеры для UI ──
 export async function getPickOrderContext(companyId: string, taskId: string) {
   const task = await prisma.workflowTask.findFirst({ where: { id: taskId, companyId, type: TASK_TYPES.PICK_ORDER } });
@@ -614,25 +681,19 @@ export async function getPickOrderContext(companyId: string, taskId: string) {
   const order = await prisma.externalOrder.findFirst({ where: { id: task.subjectId, companyId } });
   if (!order) return null;
   const lines = await prisma.externalOrderLine.findMany({ where: { orderId: order.id }, orderBy: { externalLineId: "asc" } });
-  const items = await prisma.item.findMany({ where: { id: { in: lines.map((l) => l.itemId) } }, select: { id: true, name: true } });
-  const itemName = new Map(items.map((i) => [i.id, i.name]));
-  const lineItem = new Map(lines.map((l) => [l.id, l.itemId]));
-  const reservations = await prisma.stockReservation.findMany({ where: { orderId: order.id, status: "ACTIVE" } });
-  const cellIds = reservations.map((r) => r.cellId).filter((x): x is string => !!x);
-  const cells = await prisma.cell.findMany({ where: { id: { in: cellIds } }, select: { id: true, code: true, level: true } });
-  const cellById = new Map(cells.map((c) => [c.id, c]));
+  const totalRequired = lines.reduce((s, l) => s.plus(l.requiredQty), D(0));
+  const totalPicked = lines.reduce((s, l) => s.plus(l.pickedQty), D(0));
+  const linesDone = lines.filter((l) => l.pickedQty.gte(l.requiredQty)).length;
+  const next = await pickNextReservation(companyId, order.id);
   return {
     orderId: order.id,
     externalId: order.externalId,
-    lines: lines.map((l) => ({ id: l.id, item: itemName.get(l.itemId) ?? l.itemId, itemId: l.itemId, required: l.requiredQty.toString(), picked: l.pickedQty.toString() })),
-    picks: reservations.map((r) => {
-      const itId = lineItem.get(r.lineId) ?? "";
-      return {
-        itemId: itId, item: itemName.get(itId) ?? "",
-        cellId: r.cellId ?? "", cell: cellById.get(r.cellId ?? "")?.code ?? "", level: cellById.get(r.cellId ?? "")?.level ?? null,
-        qty: r.qty.toString(),
-      };
-    }),
+    positions: lines.length,
+    totalRequired: totalRequired.toString(),
+    totalPicked: totalPicked.toString(),
+    linesDone,
+    linesTotal: lines.length,
+    next: next ? { cell: next.cellCode, cellLevel: next.cellLevel, item: next.itemName, itemId: next.itemId, qty: next.qty.toString() } : null,
   };
 }
 

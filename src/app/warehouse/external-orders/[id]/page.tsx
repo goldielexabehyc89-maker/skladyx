@@ -1,12 +1,15 @@
 import { notFound } from "next/navigation";
+import QRCode from "qrcode";
 import { requireWarehouseViewerPage } from "@/lib/auth";
 import { scoped } from "@/lib/tenant";
 import { prisma } from "@/lib/db";
-import { externalOrderPickingEnabled } from "@/lib/roles";
+import { externalOrderPickingEnabled, hasRole } from "@/lib/roles";
+import { qrUrl } from "@/lib/qr";
 import { warehouseAccess, isWhAllowed } from "@/lib/warehouse-access";
 import { PageShell } from "@/components/page-shell";
 import { Card, CardTitle, Badge, EmptyState } from "@/components/ui";
 import type { ExternalOrderStatus } from "@prisma/client";
+import { OrderQr } from "./order-qr";
 
 const STATUS_RU: Record<ExternalOrderStatus, { label: string; tone: "neutral" | "blue" | "green" | "orange" | "red" }> = {
   IMPORTED: { label: "Импортирован", tone: "neutral" },
@@ -40,8 +43,36 @@ export default async function ExternalOrderPage({ params }: { params: Promise<{ 
   const itemName = new Map(items.map((i) => [i.id, i.name]));
   const st = STATUS_RU[order.status];
 
+  // ORDER-QR (ADMIN): существующий QrCode заказа. GET его НЕ создаёт; отсутствие — контролируемая ошибка.
+  const isAdmin = hasRole(session, "ADMIN");
+  let orderQrView: { svg: string; png: string; code: string; url: string } | null = null;
+  let orderQrMissing = false;
+  if (isAdmin) {
+    const qr = await prisma.qrCode.findFirst({ where: { companyId: s.companyId, type: "ORDER", refId: order.id }, select: { code: true } });
+    if (qr) {
+      const url = qrUrl(qr.code);
+      const [svg, png] = await Promise.all([
+        QRCode.toString(url, { type: "svg", margin: 1, errorCorrectionLevel: "M" }),
+        QRCode.toDataURL(url, { margin: 1, scale: 8, errorCorrectionLevel: "M" }),
+      ]);
+      orderQrView = { svg, png, code: qr.code, url };
+    } else {
+      orderQrMissing = true;
+    }
+  }
+
   return (
     <PageShell title={`Заказ ${order.externalId}`} action={<Badge tone={st.tone}>{st.label}</Badge>}>
+      {isAdmin && (
+        <Card>
+          <CardTitle>QR заказа</CardTitle>
+          {orderQrView ? (
+            <OrderQr svg={orderQrView.svg} png={orderQrView.png} code={orderQrView.code} url={orderQrView.url} />
+          ) : orderQrMissing ? (
+            <div role="alert" className="rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-700">QR заказа не найден. Сообщите администратору — переимпорт заказа создаст его.</div>
+          ) : null}
+        </Card>
+      )}
       <Card>
         <CardTitle>Строки заказа</CardTitle>
         {lines.length === 0 ? (

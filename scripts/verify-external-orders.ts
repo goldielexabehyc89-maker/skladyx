@@ -13,6 +13,9 @@ import {
   reserveAndPlanOrder,
   completeMoveGroup,
   pickOrderScan,
+  verifyPickCell,
+  verifyPickEan,
+  getPickOrderContext,
   reportPickShortage,
 } from "@/lib/external-orders";
 
@@ -246,6 +249,18 @@ async function main() {
   await rebalanceQueuedTasks(companyId, { warehouseId: W });
   await startWorkflowTask(pk, companyId, pt!.id);
   const cc7 = await cellCode(await cellId("EO-L1A")), gc7 = eanOf(itemA);
+  // Задача M (PICK-001): read-only проверки скана до движения — неверный/верный скан ячейки и EAN.
+  const mvBeforeV = await mvCount(g7.lotId);
+  const wrongCc7 = await cellCode(await cellId("EO-U3A")); // валидная ячейка склада, но не требуемая
+  const badCellV = await err(() => verifyPickCell({ companyId, userId: pk, taskId: pt!.id, cellCode: wrongCc7 }));
+  ok("verifyPickCell: не та ячейка → отказ", badCellV.includes("не та ячейка"));
+  ok("verifyPickCell: верная требуемая ячейка → ok", (await err(() => verifyPickCell({ companyId, userId: pk, taskId: pt!.id, cellCode: cc7 }))) === "");
+  const badEanV = await err(() => verifyPickEan({ companyId, userId: pk, taskId: pt!.id, cellCode: cc7, ean: eanOf(itemB) }));
+  ok("verifyPickEan: не тот товар → отказ", /товар|EAN/.test(badEanV));
+  ok("verifyPickEan: верный EAN → ok", (await err(() => verifyPickEan({ companyId, userId: pk, taskId: pt!.id, cellCode: cc7, ean: gc7 }))) === "");
+  ok("verify* сборки: read-only — движений не добавилось", (await mvCount(g7.lotId)) === mvBeforeV);
+  const pctx = await getPickOrderContext(companyId, pt!.id);
+  ok("getPickOrderContext.next: детерминированная ячейка EO-L1A · 8 шт, позиций 1", pctx?.next?.cell === "EO-L1A" && pctx?.next?.qty === "8" && pctx?.positions === 1);
   const ctrl7 = async () => (await prisma.stockBalance.aggregate({ where: { lotId: g7.lotId, locKey: `Z:${zControl}` }, _sum: { qty: true } }))._sum.qty?.toNumber() ?? 0;
   const excess = await err(() => pickOrderScan({ companyId, userId: pk, taskId: pt!.id, cellCode: cc7, ean: gc7, qty: 99 }));
   ok("излишек (qty>резерв) отклонён", excess.includes("больше зарезервированного"));

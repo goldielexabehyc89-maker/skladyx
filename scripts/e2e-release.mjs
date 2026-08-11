@@ -8,6 +8,7 @@ import { spawn } from "node:child_process";
 import { mkdtempSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import http from "node:http";
 import { PrismaClient } from "@prisma/client";
 
 const HOST = process.env.VERIFY_HOST || "rostagro.skladyx.ru";
@@ -807,6 +808,114 @@ async function main() {
     mFinal = await movCount();
     ok("J/8: правильная цель создала РОВНО одно движение", m0 === null ? true : mFinal === m0 + 1, `${m0} -> ${mFinal}`);
     if (prisma) await prisma.$disconnect();
+  }
+
+  // ── Задача M (Этап 1): сборщик — авторитетная проверка каждого скана, количество-в-подтверждении,
+  //    следующий резерв авто, компактная карточка PICK, QR заказа. Камера и ручной ввод — одна state-machine. ──
+  if (ids.pickToken && ids.pickCellAQr) {
+    let pr = null;
+    try { pr = new PrismaClient(); await pr.$queryRaw`SELECT 1`; } catch { pr = null; }
+    const movP = async () => { if (!pr || !ids.pickWhId) return null; try { return await pr.stockMovement.count({ where: { OR: [{ fromWarehouseId: ids.pickWhId }, { toWarehouseId: ids.pickWhId }] } }); } catch { return null; } };
+    const pScanBtns = () => ev(`[...document.querySelectorAll('[data-workflow-sheet] button')].map(b=>b.textContent.trim()).filter(x=>/Сканировать/.test(x))`);
+    const pAlert = () => ev(`!!document.querySelector('[role=alert]')`);
+    const pNum = () => ev(`!!document.querySelector('[data-workflow-sheet] input[type="number"]')`);
+    const pSheet = () => ev(`document.querySelector('[data-workflow-sheet]')?.innerText || ""`);
+    const pOpen = async () => { for (let i = 0; i < 40; i++) { if (await ev(`!!document.querySelector('[data-workflow-sheet]')`)) return true; await sleep(150); } return false; };
+    const pField = async () => { for (let i = 0; i < 30; i++) { if (await sheetCount()) return true; await sleep(150); } return false; };
+    const pScan = async (re) => { await clickText(re); await sleep(300); await pField(); };
+    const pManual = async (v) => { await setSheetField(v); await clickText("/Ввести/"); await sleep(700); };
+    const pRetry = async () => { await clickText("/Повторить/"); await sleep(300); };
+    const setNum = (v) => ev(`(()=>{const el=[...document.querySelectorAll('[data-workflow-sheet] input[type="number"]')].find(e=>e.offsetParent!==null); if(!el) return 0; const s=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el),'value').set; s.call(el,${JSON.stringify(v)}); el.dispatchEvent(new Event('input',{bubbles:true})); return 1;})()`);
+    const pWaitNum = async () => { for (let i = 0; i < 50; i++) { if (await pNum()) return true; await sleep(150); } return false; };
+    const pWaitBtn = async (sub) => { for (let i = 0; i < 50; i++) { if ((await pScanBtns()).some((x) => x.includes(sub))) return true; await sleep(200); } return false; };
+    const pWaitAlert = async () => { for (let i = 0; i < 40; i++) { if (await pAlert()) return true; await sleep(150); } return false; };
+
+    await setViewport(true); // мобайл
+    await setAuth(ids.pickToken);
+    await goto("/warehouse/tasks", `document.body.innerText.includes("Собрать заказ")`);
+    // компактная карточка PICK (часть 4) — команда «Собрать заказ» отображается uppercase (CSS) → без регистра
+    t = await bodyText();
+    ok("M/card: компактная PICK — команда/номер/позиции·количество", /собрать заказ/i.test(t) && has(t, `№ ${ids.pickOrderExt}`) && has(t, "2 поз.") && has(t, "2 шт") && has(t, "0/2"));
+    ok("M/card: нет техметаданных (тип/статус/создано)", !has(t, `Собрать заказ ${ids.pickOrderExt}`) && !has(t, "создано") && !has(t, "Назначена"));
+    ok("M/card: мобайл без переполнения", await ev(`document.documentElement.scrollWidth <= window.innerWidth + 1`));
+    const m0 = await movP();
+
+    await clickText("/Собрать \\(сканирование\\)/");
+    ok("M: сканер сборки открыт", await pOpen());
+    let b = await pScanBtns();
+    ok("M/1: шаг ячейки — кнопка с точным кодом PK-01", b.length === 1 && b[0] === `Сканировать ${ids.pickCellACode}`, JSON.stringify(b));
+
+    // неправильная ячейка (валидная зарезервированная PK-02, но НЕ следующая) → красная ошибка, без движения
+    await pScan(`/Сканировать ${ids.pickCellACode}/`);
+    await pManual(ids.pickCellBQr);
+    ok("M/1: неправильная ячейка → красная ошибка", await pWaitAlert());
+    ok("M/1: без движения и товар не открыт", (await movP()) === m0 && !(await pNum()));
+    await pRetry();
+
+    // правильная ячейка → зелёное подтверждение → шаг товара
+    await pScan(`/Сканировать ${ids.pickCellACode}/`);
+    await pManual(ids.pickCellAQr);
+    let cellOk = false; for (let i = 0; i < 40; i++) { if ((await bodyText()).includes(`Ячейка ${ids.pickCellACode} подтверждена`)) { cellOk = true; break; } await sleep(120); }
+    ok("M/2: правильная ячейка → зелёное подтверждение с кодом", cellOk);
+    // после подтверждения ячейки сценарий авто-переходит к товару (камера/ручной ввод ждут EAN)
+    let atProduct = false; for (let i = 0; i < 40; i++) { const ph = await ev(`document.querySelector('[data-workflow-sheet] input[placeholder]')?.getAttribute('placeholder') || ""`); if (ph.includes("EAN")) { atProduct = true; break; } await sleep(200); }
+    ok("M/2: авто-переход к шагу товара (ждёт EAN)", atProduct);
+
+    // неправильный EAN (валидный EAN заказа, но не тот товар) → ошибка, количество не открывается, без движения
+    await pScan(`/Сканировать ${ids.pickItemAName}/`);
+    await pManual(ids.pickEanWrong);
+    ok("M/3: неправильный EAN → красная ошибка", await pWaitAlert());
+    ok("M/3: количество не открылось, без движения", !(await pNum()) && (await movP()) === m0);
+    await pRetry();
+
+    // правильный EAN → количество в том же окне подтверждения товара (часть 2)
+    await pScan(`/Сканировать ${ids.pickItemAName}/`);
+    await pManual(ids.pickEanA);
+    ok("M/4: правильный EAN → поле количества в том же окне", await pWaitNum());
+    ok("M/4: окно «Товар подтверждён» + кнопка «Собрать» (без scan-кнопок и «ОК»)", has(await pSheet(), "Товар подтверждён") && (await pScanBtns()).length === 0 && (await ev(`[...document.querySelectorAll('[data-workflow-sheet] button')].some(x=>/^Собрать$/.test(x.textContent.trim()))`)));
+
+    // неправильное количество (2 > резерв 1) → ошибка без сброса ячейки/EAN, без движения
+    await setNum("2"); await clickText(/^Собрать$/);
+    ok("M/5: неправильное количество → ошибка без движения", (await pWaitAlert()) && (await movP()) === m0);
+    await pRetry();
+    ok("M/5: ячейка и EAN не сброшены — поле количества на месте", await pNum());
+
+    // правильное количество → ровно одно движение, следующий резерв авто
+    await setNum("1"); await clickText(/^Собрать$/);
+    let m1 = m0; for (let i = 0; i < 100; i++) { m1 = await movP(); if (m1 !== null && m0 !== null && m1 === m0 + 1) break; if ((await bodyText()).includes(ids.pickCellBCode)) break; await sleep(200); }
+    ok("M/6: правильное количество → ровно одно движение", m0 === null ? true : m1 === m0 + 1, `${m0}->${m1}`);
+    ok("M/7: следующий резерв (PK-02) показан автоматически", await pWaitBtn(ids.pickCellBCode));
+
+    // вторая (последняя) позиция → завершение без дубля движения
+    await pScan(`/Сканировать ${ids.pickCellBCode}/`);
+    await pManual(ids.pickCellBQr);
+    await pWaitBtn(ids.pickItemBName);
+    await pScan(`/Сканировать ${ids.pickItemBName}/`);
+    await pManual(ids.pickEanB);
+    await pWaitNum();
+    await setNum("1"); await clickText(/^Собрать$/);
+    let done = false, mFin = m1; for (let i = 0; i < 100; i++) { if ((await bodyText()).includes("Заказ собран")) { done = true; break; } mFin = await movP(); if (mFin !== null && m0 !== null && mFin === m0 + 2) { done = true; break; } await sleep(200); }
+    ok("M/8: последняя позиция завершает сборку (Заказ собран)", done);
+    mFin = await movP();
+    ok("M/8: всего ровно два движения (без дубля)", m0 === null ? true : mFin === m0 + 2, `${m0}->${mFin}`);
+
+    // QR заказа (часть 6): ADMIN видит QR + код + канонический URL; /q/<code> открывает нужный заказ
+    if (ids.adminToken && ids.pickOrderId && ids.pickOrderQrCode) {
+      await setViewport(false);
+      await setAuth(ids.adminToken);
+      await goto(`/warehouse/external-orders/${ids.pickOrderId}`, `document.body.innerText.includes("QR заказа")`);
+      const qt = await bodyText();
+      ok("M/QR: карточка заказа показывает «QR заказа» и ручной код", has(qt, "QR заказа") && has(qt, ids.pickOrderQrCode));
+      ok("M/QR: показан канонический URL /q/<code>", has(qt, `/q/${ids.pickOrderQrCode}`));
+      ok("M/QR: есть действия «Открыть крупно» и «Скачать/распечатать»", has(qt, "Открыть крупно") && has(qt, "Скачать"));
+      // /q/<code> с сессией → 307 на карточку ИМЕННО этого заказа (детерминированно, node:http с Host+cookie)
+      const qres = await new Promise((resolve) => {
+        const rq = http.request({ hostname: "127.0.0.1", port: PORT, path: `/q/${ids.pickOrderQrCode}`, method: "GET", headers: { host: HOST, cookie: `skx_session=${ids.adminToken}` } }, (res) => resolve({ status: res.statusCode ?? 0, loc: res.headers.location ?? "" }));
+        rq.on("error", () => resolve({ status: 0, loc: "" })); rq.end();
+      });
+      ok("M/QR: /q/<code> открывает именно нужный заказ", qres.status === 307 && qres.loc.includes(`/warehouse/external-orders/${ids.pickOrderId}`), `${qres.status} ${qres.loc}`);
+    }
+    if (pr) await pr.$disconnect();
   }
 
   // ── Задача H: монитор ADMIN — новые задачи сверху (createdAt DESC, id DESC) + серверная пагинация;

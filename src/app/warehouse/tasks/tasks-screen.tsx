@@ -80,8 +80,13 @@ export const LOADER_PHYSICAL_TYPES = new Set(["PLACE_GROUP", "RETRIEVE_COOLING",
 export interface PickOrderCtx {
   orderId: string;
   externalId: string;
-  lines: { id: string; item: string; itemId: string; required: string; picked: string }[];
-  picks: { itemId: string; item: string; cellId: string; cell: string; level: number | null; qty: string }[];
+  positions: number;
+  totalRequired: string;
+  totalPicked: string;
+  linesDone: number;
+  linesTotal: number;
+  // PICK-001: детерминированный следующий незавершённый резерв (конкретная ячейка/товар/количество).
+  next: { cell: string; cellLevel: number | null; item: string; itemId: string; qty: string } | null;
 }
 export interface MoveGroupCtx {
   taskId: string;
@@ -446,6 +451,27 @@ export function WorkerTasks({
             <DeliverOrderPanel ctx={deliverOrder} />
           </LoaderTaskCard>
         </Card>
+      ) : current && pickOrder && current.status === "IN_PROGRESS" ? (
+        // PICK-001: компактная карточка сборщика — команда/номер/позиции·количество/прогресс/текущее
+        // действие. Без title/description/типа/статуса/времени и повторяющихся инструкций.
+        <Card>
+          <CardTitle>Текущая задача</CardTitle>
+          <div className="rounded-xl border border-[#eee] p-3">
+            <div className="text-xs font-semibold uppercase tracking-wide text-[#667eea]">Собрать заказ</div>
+            <div className="mt-0.5 text-base font-semibold text-[#1a1a1a]">№ {pickOrder.externalId}</div>
+            <div className="mt-0.5 text-sm text-neutral-600">{pickOrder.positions} поз. · {pickOrder.totalRequired} шт</div>
+            <div className="mt-1 flex items-center gap-2">
+              <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-[#eef0f8]">
+                <div className="h-full rounded-full bg-gradient-to-r from-[#667eea] to-[#764ba2]" style={{ width: `${pickOrder.linesTotal ? Math.round((pickOrder.linesDone / pickOrder.linesTotal) * 100) : 0}%` }} />
+              </div>
+              <span className="text-xs text-neutral-500">{pickOrder.linesDone}/{pickOrder.linesTotal}</span>
+            </div>
+            <div className="mt-2 flex flex-col gap-2">
+              <PickOrderScanner ctx={pickOrder} taskId={current.id} />
+              <ShortageForm taskId={current.id} />
+            </div>
+          </div>
+        </Card>
       ) : current && LOADER_PHYSICAL_TYPES.has(current.type) && current.status === "IN_PROGRESS" ? (
         // Известная физическая задача погрузчика с повреждённым контекстом — ошибка, без метаданных.
         <Card>
@@ -466,12 +492,6 @@ export function WorkerTasks({
                 <Link href={current.actionUrl}>
                   <Button className="w-full">Открыть</Button>
                 </Link>
-              )}
-              {pickOrder && current.status === "IN_PROGRESS" && (
-                <>
-                  <PickOrderScanner ctx={pickOrder} taskId={current.id} />
-                  <ShortageForm taskId={current.id} />
-                </>
               )}
               {controlOrder && current.status === "IN_PROGRESS" && <ControlOrderPanel ctx={controlOrder} />}
               {correctOrder && current.status === "IN_PROGRESS" && <CorrectOrderPanel ctx={correctOrder} />}

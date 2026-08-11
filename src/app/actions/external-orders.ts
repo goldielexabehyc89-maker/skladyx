@@ -9,6 +9,8 @@ import {
   reserveAndPlanOrder,
   completeMoveGroup,
   pickOrderScan,
+  verifyPickCell,
+  verifyPickEan,
   reportPickShortage,
   ExternalOrderError,
   type ImportLine,
@@ -84,6 +86,39 @@ export async function completeMoveGroupAction(_prev: OrderActionState, formData:
   }
   revalidatePath("/warehouse/tasks");
   return { ok: true };
+}
+
+// PICK-001 (фаза сборки): авторитетная read-only проверка скана ЯЧЕЙКИ до показа товара. БД не меняет.
+export async function verifyPickCellAction(_prev: OrderActionState, formData: FormData): Promise<OrderActionState> {
+  if (!externalOrderPickingEnabled()) return OFF;
+  const session = await requireUser();
+  const s = scoped(session);
+  const taskId = String(formData.get("taskId") ?? "").trim();
+  const cellCode = String(formData.get("cellCode") ?? "").trim();
+  if (!cellCode) return { error: "Отсканируйте ячейку" };
+  try {
+    await verifyPickCell({ companyId: s.companyId, userId: session.userId, taskId, cellCode });
+    return { ok: true };
+  } catch (e) {
+    return { error: msg(e) };
+  }
+}
+
+// PICK-001 (фаза сборки): авторитетная read-only проверка скана EAN до ввода количества. БД не меняет.
+export async function verifyPickEanAction(_prev: OrderActionState, formData: FormData): Promise<OrderActionState> {
+  if (!externalOrderPickingEnabled()) return OFF;
+  const session = await requireUser();
+  const s = scoped(session);
+  const taskId = String(formData.get("taskId") ?? "").trim();
+  const cellCode = String(formData.get("cellCode") ?? "").trim();
+  const ean = String(formData.get("ean") ?? "").trim();
+  if (!cellCode || !ean) return { error: "Отсканируйте ячейку и EAN товара" };
+  try {
+    await verifyPickEan({ companyId: s.companyId, userId: session.userId, taskId, cellCode, ean });
+    return { ok: true };
+  } catch (e) {
+    return { error: msg(e) };
+  }
 }
 
 // Сборка: настоящее сканирование — QR ячейки + QR группы/партии + количество (коды, resolve на сервере).

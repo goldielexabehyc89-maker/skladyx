@@ -3,10 +3,10 @@
 import { useState, useTransition, useRef, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { ScanLine } from "lucide-react";
-import { pickScanAction, completeMoveGroupAction } from "@/app/actions/external-orders";
+import { pickScanAction, verifyPickCellAction, verifyPickEanAction, completeMoveGroupAction } from "@/app/actions/external-orders";
 import { completeGroupPlacementAction, verifyPlacementEanAction } from "@/app/actions/group-receiving";
 import { prepareCoolingRetrievalAction, placeCoolingRetrievalAction, verifyCoolingRetrievalEanAction, verifyCoolingRetrievalSourceCellAction } from "@/app/actions/tasks";
-import { Button, Badge } from "@/components/ui";
+import { Button } from "@/components/ui";
 import { WorkflowSheet, type ScanFormat } from "@/components/workflow-sheet";
 import type { PickOrderCtx, MoveGroupCtx, Placement, Cooling } from "./tasks-screen";
 
@@ -16,43 +16,76 @@ import type { PickOrderCtx, MoveGroupCtx, Placement, Cooling } from "./tasks-scr
 const CELL: ScanFormat[] = ["qr_code", "code_128"];
 const PRODUCT: ScanFormat[] = ["ean_8", "ean_13"];
 
-// ── Сборка заказа ──
+// ── Сборка заказа (PICK-001, UI-004/005) — авторитетная проверка каждого скана + количество прямо в
+// подтверждении товара. Последовательность: ячейка → EAN → количество; каждый скан проверяется сервером
+// ДО смены шага (read-only). Камера и ручной ввод — одна state-machine (handleScan). ──
 export function PickOrderScanner({ ctx, taskId }: { ctx: PickOrderCtx; taskId: string }) {
   const router = useRouter();
   const [open, setOpen] = useState(false);
   const [scanning, setScanning] = useState(false);
   const [step, setStep] = useState<"cell" | "product" | "qty">("cell");
-  const [cellRaw, setCellRaw] = useState("");
-  const [eanRaw, setEanRaw] = useState("");
+  const [cellRaw, setCellRaw] = useState("");    // подтверждённая сервером ячейка
+  const [eanRaw, setEanRaw] = useState("");      // подтверждённый сервером EAN
   const [qty, setQty] = useState("");
+  const [check, setCheck] = useState<"idle" | "checking" | "confirmed">("idle");
+  const [checkLabel, setCheckLabel] = useState("");
   const [busy, startTransition] = useTransition();
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
   const [finished, setFinished] = useState(false);
+  const advanceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const submitting = useRef(false);
 
-  const pickedLines = ctx.lines.filter((l) => Number(l.picked) >= Number(l.required)).length;
-  const pct = ctx.lines.length ? Math.round((pickedLines / ctx.lines.length) * 100) : 0;
+  const next = ctx.next;
+  const cellCode = next?.cell ?? "";
+  const itemName = next?.item ?? "товар";
+  const reqQty = next?.qty ?? "";
+  const pct = ctx.linesTotal ? Math.round((ctx.linesDone / ctx.linesTotal) * 100) : 0;
 
-  function reset() { setStep("cell"); setCellRaw(""); setEanRaw(""); setQty(""); setNotice(null); }
-  function closeAll() { setOpen(false); setScanning(false); reset(); setError(null); setFinished(false); router.refresh(); }
+  function clearAdvance() { if (advanceTimer.current) { clearTimeout(advanceTimer.current); advanceTimer.current = null; } }
+  function reset() { clearAdvance(); setStep("cell"); setCellRaw(""); setEanRaw(""); setQty(""); setCheck("idle"); }
+  function closeAll() { clearAdvance(); submitting.current = false; setOpen(false); setScanning(false); reset(); setError(null); setFinished(false); router.refresh(); }
 
-  function handleScan(raw: string) {
-    if (busy) return;
-    if (step === "cell") { setCellRaw(raw); setStep("product"); setNotice("Ячейка отсканирована — сканируйте EAN товара"); return; }
-    if (step === "product") { setEanRaw(raw); setScanning(false); setStep("qty"); setNotice("Товар отсканирован — введите количество"); return; }
+  function verifyCell(raw: string) {
+    setScanning(false); setCheck("checking"); setCheckLabel("Проверяем ячейку…");
+    startTransition(async () => {
+      const fd = new FormData(); fd.set("taskId", taskId); fd.set("cellCode", raw);
+      const res = await verifyPickCellAction({}, fd);
+      if (res.error) { setCheck("idle"); setError(res.error); return; } // шаг не меняется
+      setCellRaw(raw); setCheck("confirmed");
+      advanceTimer.current = setTimeout(() => { setCheck("idle"); setStep("product"); setScanning(true); }, 900);
+    });
   }
-
+  function verifyEan(raw: string) {
+    setScanning(false); setCheck("checking"); setCheckLabel("Проверяем товар…");
+    startTransition(async () => {
+      const fd = new FormData(); fd.set("taskId", taskId); fd.set("cellCode", cellRaw); fd.set("ean", raw);
+      const res = await verifyPickEanAction({}, fd);
+      if (res.error) { setCheck("idle"); setError(res.error); return; } // количество не открывается
+      setEanRaw(raw); setQty(reqQty); setCheck("confirmed"); // количество внутри подтверждения товара (PICK-001)
+      advanceTimer.current = setTimeout(() => { setCheck("idle"); setStep("qty"); }, 700);
+    });
+  }
   function submitQty() {
     const n = Number(qty.replace(",", "."));
     if (!Number.isFinite(n) || n <= 0) { setError("Укажите количество"); return; }
+    if (submitting.current) return;
+    submitting.current = true;
     startTransition(async () => {
       const fd = new FormData();
       fd.set("taskId", taskId); fd.set("cellCode", cellRaw); fd.set("ean", eanRaw); fd.set("qty", String(n));
       const res = await pickScanAction({}, fd);
-      if (res.error) { setError(res.error); return; }
+      submitting.current = false;
+      if (res.error) { setError(res.error); return; } // ошибка количества НЕ сбрасывает ячейку/EAN
       if (res.status === "IN_CONTROL") { setFinished(true); return; }
-      reset(); setNotice("✓ Собрано — продолжайте сканирование"); router.refresh();
+      reset(); router.refresh(); // следующий резерв покажется автоматически (ctx.next обновится)
     });
+  }
+
+  function handleScan(raw: string) {
+    if (busy || check !== "idle" || submitting.current) return;
+    const value = raw.trim(); if (!value) return;
+    if (step === "cell") { verifyCell(value); return; }
+    if (step === "product") { verifyEan(value); return; }
   }
 
   if (!open)
@@ -62,58 +95,69 @@ export function PickOrderScanner({ ctx, taskId }: { ctx: PickOrderCtx; taskId: s
       </Button>
     );
 
+  if (!next)
+    return (
+      <div className="rounded-xl border border-green-200 bg-green-50 p-3 text-sm font-medium text-green-700">Все позиции собраны — заказ уходит на контроль.</div>
+    );
+
   return (
     <WorkflowSheet
-      title={`Сборка · заказ ${ctx.externalId}`}
-      subtitle={`Строк собрано ${pickedLines} из ${ctx.lines.length}`}
+      title="Собрать заказ"
+      subtitle={step === "qty" ? undefined : `№ ${ctx.externalId}`}
       progressPct={pct}
+      context={
+        // Компактно: команда/товар·количество и крупный маршрут «ячейка → Контроль» (PICK-001).
+        <div className="min-w-0">
+          <div className="text-xs font-semibold uppercase tracking-wide text-[#667eea]">Собрать заказ</div>
+          <div className="mt-0.5 truncate text-sm font-semibold text-[#1a1a1a]">{itemName} · {reqQty} шт</div>
+          <div className="mt-1 flex items-center gap-2 font-mono text-lg font-bold">
+            <span className="text-[#1a1a1a]">{cellCode}</span>
+            <span className="text-neutral-400">→</span>
+            <span className="text-green-800">Контроль</span>
+          </div>
+        </div>
+      }
       scanning={scanning}
-      scanHint={step === "cell" ? "Сканируйте ячейку (QR/Code 128, уровень 1-2)" : "Сканируйте EAN товара"}
+      scanHint={step === "cell" ? `Сканируйте ячейку ${cellCode}` : `Сканируйте товар ${itemName}`}
       scanFormats={step === "cell" ? CELL : PRODUCT}
-      manualPlaceholder={step === "cell" ? "Код ячейки (QR/Code 128)" : "EAN товара (8/13 цифр)"}
+      manualPlaceholder={step === "cell" ? `Код ячейки ${cellCode}` : "EAN товара (8/13 цифр)"}
       manualInputMode={step === "product" ? "numeric" : "text"}
       onScan={handleScan}
-      scanPaused={busy}
+      scanPaused={busy || check !== "idle"}
       busy={busy}
       onBackToList={() => setScanning(false)}
       onClose={closeAll}
       error={error}
       onErrorRetry={() => setError(null)}
       onErrorExit={() => { setError(null); setScanning(false); reset(); }}
-      modal={finished ? { title: "Заказ собран", body: "Товар в зоне контроля", actions: (<Button type="button" variant="primary" onClick={closeAll} className="w-full">Ок</Button>) } : null}
+      modal={
+        finished
+          ? { title: "Заказ собран", body: "Товар в зоне контроля", actions: (<Button type="button" variant="primary" onClick={closeAll} className="w-full">Ок</Button>) }
+          : check === "checking"
+            ? { tone: "neutral" as const, title: checkLabel }
+            : check === "confirmed"
+              ? { title: "Подтверждено", body: step === "cell" ? `Ячейка ${cellCode} подтверждена` : `Товар подтверждён · ${itemName}` }
+              : null
+      }
       footer={
         step === "qty" ? (
+          // Устойчивое подтверждение товара с вводом количества (PICK-001): без отдельного экрана и кнопки «ОК».
           <>
-            <input autoFocus value={qty} onChange={(e) => setQty(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); submitQty(); } }} type="number" inputMode="decimal" step="1" placeholder="Количество" className="rounded-lg border border-[#e4e4f0] px-3 py-2 text-sm" />
+            <div className="text-xs font-medium text-green-700">Товар подтверждён · {itemName}</div>
+            <div className="text-xs text-neutral-500">Из ячейки {cellCode}</div>
+            <label htmlFor="pick-qty" className="text-xs font-medium text-neutral-500">Количество, шт</label>
+            <input id="pick-qty" autoFocus value={qty} onChange={(e) => setQty(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); submitQty(); } }} type="number" inputMode="decimal" step="1" placeholder="Количество" className="rounded-lg border border-[#e4e4f0] px-3 py-2 text-sm" />
             <Button type="button" variant="primary" disabled={busy} onClick={submitQty} className="w-full">{busy ? "…" : "Собрать"}</Button>
-            <Button type="button" variant="ghost" onClick={reset} className="w-full">Заново сканировать</Button>
+            <button type="button" onClick={reset} className="mx-auto text-xs text-neutral-400 underline underline-offset-2">Начать заново</button>
           </>
         ) : (
-          <Button type="button" variant="primary" onClick={() => { setScanning(true); setStep("cell"); setNotice(null); }} className="w-full">
-            <ScanLine size={18} /> Сканировать ячейку
+          <Button type="button" variant="primary" onClick={() => setScanning(true)} className="w-full">
+            <ScanLine size={18} /> {step === "cell" ? `Сканировать ${cellCode}` : `Сканировать ${itemName}`}
           </Button>
         )
       }
     >
-      {notice && <p className="pb-1 text-sm font-medium text-green-600">{notice}</p>}
-      <div className="text-xs font-medium text-neutral-500">Строки заказа</div>
-      {ctx.lines.map((l) => (
-        <div key={l.id} className="flex items-center justify-between rounded-xl bg-[#f7f8fc] px-3 py-2 text-sm">
-          <span className="min-w-0 truncate">{l.item}</span>
-          <Badge tone={Number(l.picked) >= Number(l.required) ? "green" : "neutral"}>{l.picked}/{l.required}</Badge>
-        </div>
-      ))}
-      {ctx.picks.length > 0 && (
-        <>
-          <div className="pt-1 text-xs font-medium text-neutral-500">Резервы (что и откуда собирать)</div>
-          {ctx.picks.map((p, i) => (
-            <div key={`${p.cellId}:${i}`} className="rounded-xl border border-[#eee] px-3 py-2 text-xs text-neutral-600">
-              {p.item}: ячейка <b>{p.cell}</b>{p.level != null ? ` (ур.${p.level})` : ""} · {p.qty} шт
-            </div>
-          ))}
-        </>
-      )}
-      <div className="pt-1 text-xs text-neutral-400">Без камеры: коды ниже, в списке задач — ручной ввод.</div>
+      <p className="text-sm text-neutral-600">{step === "cell" ? `Заберите ${itemName} · ${reqQty} шт из ячейки ${cellCode}` : step === "product" ? `Подтвердите товар: ${itemName}` : `Введите количество и нажмите «Собрать»`}</p>
     </WorkflowSheet>
   );
 }

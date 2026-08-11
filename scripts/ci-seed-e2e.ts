@@ -396,6 +396,46 @@ async function main() {
   // Задача I: отдельная сессия для UI-теста шага/кнопки (с реальным остатком → полный проход до размещения).
   const coolUi = await seedCoolingSession("CI-COOL-UI", "+79000009933", "CI Охлаждение UI", "OHU-01", "SU-01", true);
 
+  // ── Задача M (Этап 1): фикстура сборщика — PICK_ORDER «в работе», 2 позиции, детерминированные резервы.
+  //    Отдельные товары/склад (изоляция FIFO): резервы точно в PK-01 (товар А) и PK-02 (товар Б). ──
+  const pickWh = await prisma.warehouse.create({ data: { companyId, name: `CI-PICK-${Date.now()}`, isActive: true, coolingRate: 2 } });
+  await ensureStandardZones(companyId, pickWh.id);
+  const pickStorage = await prisma.warehouseZone.findFirstOrThrow({ where: { companyId, warehouseId: pickWh.id, kind: "STORAGE" } });
+  await createCellsInZone({ companyId, warehouseId: pickWh.id, zoneId: pickStorage.id, codes: ["PK-01", "PK-02", "PK-09"], level: 1 });
+  const PICK_EAN_A = ean13("460000009001"), PICK_EAN_B = ean13("460000009002");
+  const mkPickItem = async (name: string, ean: string) => {
+    const it = await prisma.item.create({ data: { companyId, name, uomId: uom.id, tracking: "LOT" } });
+    await prisma.itemBarcode.create({ data: { companyId, itemId: it.id, code: ean, symbology: "EAN13", source: "MANUAL", isActive: true } });
+    return it.id;
+  };
+  const PICK_ITEM_A_NAME = "CI Сборка А", PICK_ITEM_B_NAME = "CI Сборка Б";
+  const pickItemA = await mkPickItem(PICK_ITEM_A_NAME, PICK_EAN_A);
+  const pickItemB = await mkPickItem(PICK_ITEM_B_NAME, PICK_EAN_B);
+  const pickE2E = await mkUser(companyId, "+79000009934", "CI Сборщик e2e", "PICKER", "CiPickE2E-9934", pickWh.id);
+  await prisma.workShift.create({ data: { companyId, userId: pickE2E, warehouseId: pickWh.id, role: "PICKER" } });
+  let pickSeq = 9960000;
+  const seedPickStock = async (itemId: string, cellCode: string, qty: number) => {
+    const cellRow = await prisma.cell.findFirstOrThrow({ where: { companyId, warehouseId: pickWh.id, code: cellCode } });
+    const receipt = await prisma.receipt.create({ data: { companyId, number: ++pickSeq, warehouseId: pickWh.id, status: "POSTED", postedAt: new Date(), createdById: pickE2E } });
+    const line = await prisma.receiptLine.create({ data: { companyId, receiptId: receipt.id, itemId, qty } });
+    const lot = await prisma.lot.create({ data: { companyId, itemId, receiptLineId: line.id, qtyReceived: qty } });
+    await prisma.$transaction((tx) => applyLotMovement(tx, { companyId, docType: "RECEIPT", docId: receipt.id, itemId, lotId: lot.id, qty, from: null, to: { kind: "cell", warehouseId: pickWh.id, cellId: cellRow.id }, createdById: pickE2E }));
+    await prisma.handlingGroup.create({ data: { companyId, warehouseId: pickWh.id, itemId, lotId: lot.id, qty, temperature: 0, thresholdX: X, status: "IN_STORAGE", dedupeKey: `ci-pick-${pickSeq}`, acceptedById: pickE2E } });
+  };
+  await seedPickStock(pickItemA, "PK-01", 1);
+  await seedPickStock(pickItemB, "PK-02", 1);
+  const PICK_ORDER_EXT = "EO-CI-PICK";
+  const impPick = await importExternalOrder({ companyId, warehouseId: pickWh.id, externalId: PICK_ORDER_EXT, createdById: pickE2E, arrivalAt: null, lines: [{ externalLineId: "1", itemId: pickItemA, requiredQty: 1 }, { externalLineId: "2", itemId: pickItemB, requiredQty: 1 }] });
+  await reserveAndPlanOrder({ companyId, orderId: impPick.orderId });
+  let ppt = await prisma.workflowTask.findFirst({ where: { type: "PICK_ORDER", subjectId: impPick.orderId } });
+  if (ppt && ppt.status === "QUEUED") { await rebalanceQueuedTasks(companyId, { warehouseId: pickWh.id }); ppt = await prisma.workflowTask.findUniqueOrThrow({ where: { id: ppt.id } }); }
+  if (!ppt || ppt.assignedUserId !== pickE2E) throw new Error(`CI pick: PICK не назначен сборщику (${ppt?.status}/${ppt?.assignedUserId})`);
+  if (ppt.status === "ASSIGNED") { const r = await startWorkflowTask(pickE2E, companyId, ppt.id); if (r.error) throw new Error(`CI pick start: ${r.error}`); }
+  const pickCellQr = async (code: string) => (await prisma.qrCode.findFirstOrThrow({ where: { type: "CELL", refId: (await prisma.cell.findFirstOrThrow({ where: { companyId, warehouseId: pickWh.id, code } })).id } })).code;
+  const pickCellAQr = await pickCellQr("PK-01"), pickCellBQr = await pickCellQr("PK-02"), pickWrongCellQr = await pickCellQr("PK-09");
+  const pickOrderQrCode = (await prisma.qrCode.findFirstOrThrow({ where: { companyId, type: "ORDER", refId: impPick.orderId } })).code;
+  const pickToken = await mkToken(pickE2E, "PICKER");
+
   // ── Задача H: монитор ADMIN — новые задачи сверху (createdAt DESC, id DESC). Сентинел создаётся
   //    ПОСЛЕДНИМ → на мониторе он должен идти выше всех ранее созданных задач. QUEUED (не назначается).
   const MONITOR_NEWEST_TITLE = "CI Монитор сентинел (новейшая)";
@@ -478,6 +518,22 @@ async function main() {
     coolUiCoolCode: "OHU-01",         // Задача K: код исходной COOLING-ячейки (на кнопке фазы вывоза)
     coolUiTargetCode: "SU-01",
     coolUiTargetQr: coolUi.targetQr,  // QR назначенной STORAGE-ячейки для финального скана размещения
+    // Задача M (Этап 1): сборщик — авторитетный скан + количество-в-подтверждении + компактная карточка + QR
+    pickToken,
+    pickOrderId: impPick.orderId,
+    pickOrderExt: PICK_ORDER_EXT,
+    pickWhId: pickWh.id,
+    pickCellACode: "PK-01",
+    pickCellBCode: "PK-02",
+    pickItemAName: PICK_ITEM_A_NAME,
+    pickItemBName: PICK_ITEM_B_NAME,
+    pickEanA: PICK_EAN_A,          // верный EAN шага 1 (товар А в PK-01)
+    pickEanB: PICK_EAN_B,          // верный EAN шага 2 (товар Б в PK-02)
+    pickEanWrong: PICK_EAN_B,      // валидный EAN заказа, но не тот товар для шага 1 → ошибка
+    pickCellAQr,                   // верная ячейка шага 1
+    pickCellBQr,                   // валидная зарезервированная ячейка, но НЕ следующая → ошибка на шаге 1
+    pickWrongCellQr,               // валидная ячейка склада без резерва заказа
+    pickOrderQrCode,               // ORDER-QR: код для проверки /q/<code>
     monitorNewestTitle: MONITOR_NEWEST_TITLE, // Задача H: сентинел «новые сверху» в мониторе ADMIN
     asgUrgentTitleForSort: asgUrgent.title,   // более старая задача — для проверки порядка (новее выше)
   }));
