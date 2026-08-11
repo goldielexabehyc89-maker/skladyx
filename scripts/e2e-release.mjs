@@ -615,7 +615,7 @@ async function main() {
     await setSheetField(ean); await clickText("/Ввести/");                        // серверная проверка EAN → авто-переход к температуре
     for (let i = 0; i < 40 && !(await ev(`!!document.querySelector('[data-workflow-sheet] input[type="number"]')`)); i++) await sleep(200);
     if (!(await setSheetNumber(String(temp)))) return false;                      // шаг температуры (числовое поле)
-    await clickText("/Записать замер/");
+    await clickText("/Записать температуру/");
     return true;
   };
   if (ids.coolLeqToken && ids.coolLeqCellQr) {
@@ -711,8 +711,18 @@ async function main() {
     const sheetTxtI = () => ev(`document.querySelector('[data-workflow-sheet]')?.innerText || ""`);
     const countOcc = (s, sub) => s.split(sub).length - 1;
 
+    // ── Задача L: компактный экран ввода температуры (мы сейчас на нём после успешного скана EAN) ──
+    const tempScreen = await sheetTxtI();
+    ok("L: товар показан один раз", countOcc(tempScreen, ids.itemName) === 1, `${countOcc(tempScreen, ids.itemName)}×`);
+    ok("L: количество показано один раз", countOcc(tempScreen, " шт") === 1 && /\d+\s*шт/.test(tempScreen), `${countOcc(tempScreen, " шт")}×`);
+    ok("L: маршрут «<COOLING> → Хранение» показан один раз", has(tempScreen, ids.coolUiCoolCode) && has(tempScreen, "Хранение") && countOcc(tempScreen, "→") === 1);
+    ok("L: есть подпись «Текущая температура, °C»", has(tempScreen, "Текущая температура, °C"));
+    ok("L: нет «Фаза 1», порога X и инструкции про EAN", !has(tempScreen, "Фаза 1") && !has(tempScreen, "порог") && !has(tempScreen, "Отсканируйте EAN") && !has(tempScreen, "Сканируйте EAN"), tempScreen.replace(/\n/g, " ").slice(0, 0));
+    ok("L: нет дублирующего зелёного «Товар подтверждён — введите»", !has(tempScreen, "Товар подтверждён — введите"));
+    ok("L: поле температуры и кнопка «Записать температуру» видны без прокрутки (mobile)", await ev(`(()=>{const inp=document.querySelector('[data-workflow-sheet] input[type="number"]'); const b=[...document.querySelectorAll('[data-workflow-sheet] button')].find(x=>/Записать температуру/.test(x.textContent)); if(!inp||!b) return false; const ri=inp.getBoundingClientRect(), rb=b.getBoundingClientRect(); return ri.top>=0 && rb.bottom<=window.innerHeight+2 && rb.top>=0;})()`));
+
     // тест 4: температура <=X назначает ровно одну целевую ячейку.
-    await setSheetNumber(String(ids.thresholdX - 2)); await clickText("/Записать замер/"); await sleep(1200);
+    await setSheetNumber(String(ids.thresholdX - 2)); await clickText("/Записать температуру/"); await sleep(1200);
     let leqTarget = false; for (let i = 0; i < 50; i++) { if ((await bodyText()).includes(ids.coolUiTargetCode)) { leqTarget = true; break; } await sleep(200); }
     ok("J/4: температура ≤X → назначена целевая ячейка (фаза вывоза)", leqTarget, ids.coolUiTargetCode);
     ok("J/4: назначение цели не создало движения", (await movCount()) === m0);

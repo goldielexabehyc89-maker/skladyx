@@ -277,7 +277,6 @@ export function CoolingRetrievalScanner({ cooling }: { cooling: Cooling }) {
   const [checkLabel, setCheckLabel] = useState("");
   const [busy, startTransition] = useTransition();
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
   const [finished, setFinished] = useState(false);
   const [recycled, setRecycled] = useState(false);
   const advanceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -286,8 +285,8 @@ export function CoolingRetrievalScanner({ cooling }: { cooling: Cooling }) {
   function vibrate(ms: number) { try { navigator.vibrate?.(ms); } catch { /* not supported */ } }
   function clearAdvance() { if (advanceTimer.current) { clearTimeout(advanceTimer.current); advanceTimer.current = null; } }
   // Локальные сбросы — БЕЗ server action и записей в БД (COOL-003/004, «Начать заново»/крестик).
-  function resetMeasure() { clearAdvance(); setPhase("measure"); setStep("product"); setFromRaw(""); setEanRaw(""); setTemp(""); setCheck("idle"); setNotice(null); }
-  function resetPlace() { clearAdvance(); setStep("from"); setFromRaw(""); setCheck("idle"); setNotice(null); } // targetCode/eanRaw сохраняются
+  function resetMeasure() { clearAdvance(); setPhase("measure"); setStep("product"); setFromRaw(""); setEanRaw(""); setTemp(""); setCheck("idle"); }
+  function resetPlace() { clearAdvance(); setStep("from"); setFromRaw(""); setCheck("idle"); } // targetCode/eanRaw сохраняются
   function closeAll() { clearAdvance(); submitting.current = false; setOpen(false); setScanning(false); resetMeasure(); setTargetCode(null); setError(null); setFinished(false); setRecycled(false); router.refresh(); }
 
   // Фаза замера, шаг EAN: авторитетная серверная проверка ДО показа температуры (UI-005).
@@ -298,7 +297,8 @@ export function CoolingRetrievalScanner({ cooling }: { cooling: Cooling }) {
       const res = await verifyCoolingRetrievalEanAction({}, fd);
       if (res.error) { setCheck("idle"); setError(res.error); return; } // шаг не меняется
       setEanRaw(raw); setCheck("confirmed"); vibrate(60);
-      advanceTimer.current = setTimeout(() => { setCheck("idle"); setStep("temp"); setNotice("Товар подтверждён — введите фактическую температуру"); }, 900);
+      // Задача L: компактный экран температуры — без дублирующего зелёного notice (успех показан модалкой).
+      advanceTimer.current = setTimeout(() => { setCheck("idle"); setStep("temp"); }, 900);
     });
   }
 
@@ -428,10 +428,13 @@ export function CoolingRetrievalScanner({ cooling }: { cooling: Cooling }) {
       }
       footer={
         step === "temp" ? (
+          // Задача L: компактный экран температуры — подпись, поле, одна основная кнопка. «Начать заново» —
+          // компактное вторичное действие (не второй большой контрол). Автопереход/ветвление не трогаем.
           <>
-            <input autoFocus value={temp} onChange={(e) => setTemp(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); submitMeasure(); } }} type="number" inputMode="decimal" step="0.1" placeholder="Температура, °C" className="rounded-lg border border-[#e4e4f0] px-3 py-2 text-sm" />
-            <Button type="button" variant="primary" disabled={busy} onClick={submitMeasure} className="w-full">{busy ? "…" : "Записать замер"}</Button>
-            <Button type="button" variant="ghost" onClick={resetMeasure} className="w-full">Заново сканировать</Button>
+            <label htmlFor="cooling-temp" className="text-xs font-medium text-neutral-500">Текущая температура, °C</label>
+            <input id="cooling-temp" autoFocus value={temp} onChange={(e) => setTemp(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); submitMeasure(); } }} type="number" inputMode="decimal" step="0.1" placeholder="Температура, °C" className="rounded-lg border border-[#e4e4f0] px-3 py-2 text-sm" />
+            <Button type="button" variant="primary" disabled={busy} onClick={submitMeasure} className="w-full">{busy ? "…" : "Записать температуру"}</Button>
+            <button type="button" onClick={resetMeasure} className="mx-auto text-xs text-neutral-400 underline underline-offset-2">Начать заново</button>
           </>
         ) : (
           <>
@@ -448,15 +451,13 @@ export function CoolingRetrievalScanner({ cooling }: { cooling: Cooling }) {
         )
       }
     >
-      {phase === "measure" ? (
-        <>
-          {notice && <p className="pb-1 text-sm font-medium text-green-600">{notice}</p>}
-          <p className="text-sm text-neutral-500">Фаза 1 · замер (порог X = {cooling.thresholdX}°C). Отсканируйте EAN товара, затем введите фактическую температуру.</p>
-        </>
-      ) : (
+      {phase === "place" ? (
         // Задача K: одна короткая инструкция текущего шага (без «Фазы 2», повтора маршрута и статусов).
         <p className="text-sm text-neutral-600">{step === "from" ? `Заберите товар из ${cooling.coolingCell}` : `Разместите товар в ${targetCode ?? ""}`}</p>
-      )}
+      ) : step === "product" ? (
+        // Экран EAN: короткая инструкция сканирования (Задача L: на экране температуры её нет).
+        <p className="text-sm text-neutral-500">Фаза 1 · замер (порог X = {cooling.thresholdX}°C). Отсканируйте EAN товара, затем введите фактическую температуру.</p>
+      ) : null}
     </WorkflowSheet>
   );
 }
