@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import { ScanLine } from "lucide-react";
 import {
   scanOrderControlAction,
-  markControlScanAction,
+  confirmControlLineAction,
   finishControlAction,
   resolveShortageAction,
   resolveRemovalAction,
@@ -126,124 +126,41 @@ function ScanOrderCamera({ taskId, externalId }: { taskId: string; externalId: s
   );
 }
 
-// ── Контроль: строго пошагово (UI-004) — по одному полю на шаг ──
-// EAN → количество → тип/состояние → комментарий → итоговое подтверждение (без полей). После успешной
-// отметки: остались непроверенные строки → авто-переход к скану следующего EAN; все отмечены → закрыть
-// мастер и показать завершение. Ошибка сервера сохраняет EAN/количество/тип/комментарий (остаёмся на итоге).
-const TYPE_OPTIONS: { value: string; label: string }[] = [
-  { value: "", label: "без расхождения (по количеству)" },
-  { value: "EXCESS", label: "излишек / неожиданный товар" },
-  { value: "WRONG_ITEM", label: "не тот товар" },
-  { value: "DAMAGED", label: "повреждён" },
-  { value: "OTHER", label: "другое" },
-];
-function MarkGroupScanner({ taskId }: { taskId: string }) {
+// ── CONTROL-001 (Задача N): контролёр подтверждает строку заказа КЛИКОМ (без EAN/количества/мастера).
+// Неподтверждённая строка — крупная кнопка (наименование + ожидаемое количество). Нажатие серверно
+// подтверждает строку (countedQty=requiredQty, без расхождения). Подтверждённая — с галкой, не нажимается.
+function ConfirmLineButton({ taskId, line }: { taskId: string; line: ControlOrderCtx["lines"][number] }) {
   const router = useRouter();
-  const [open, setOpen] = useState(false);
-  const [scanning, setScanning] = useState(false);
-  const [step, setStep] = useState<"product" | "qty" | "type" | "comment" | "confirm">("product");
-  const [eanRaw, setEanRaw] = useState("");
-  const [qty, setQty] = useState("");
-  const [type, setType] = useState("");
-  const [comment, setComment] = useState("");
   const [busy, startTransition] = useTransition();
   const [error, setError] = useState<string | null>(null);
-
-  function reset() { setStep("product"); setEanRaw(""); setQty(""); setType(""); setComment(""); }
-  function openScan() { setScanning(true); setStep("product"); }
-  function handleScan(raw: string) {
+  const confirmed = line.counted != null;
+  if (confirmed)
+    return (
+      <div className="flex items-center justify-between rounded-xl border border-green-200 bg-green-50 px-3 py-3 text-sm">
+        <span className="min-w-0 truncate font-medium text-[#1a1a1a]">{line.item}</span>
+        <Badge tone="green">✓ {line.counted}</Badge>
+      </div>
+    );
+  function confirm() {
     if (busy) return;
-    const v = raw.trim();
-    if (!v) { setError("Отсканируйте заводской штрихкод товара (EAN)"); return; }
-    setEanRaw(v); setScanning(false); setStep("qty");
-  }
-  function submitQty() {
-    const n = Number(qty.replace(",", "."));
-    if (!Number.isFinite(n) || n < 0) { setError("Укажите фактическое количество"); return; }
-    setStep("type");
-  }
-  function submit() {
-    const n = Number(qty.replace(",", "."));
-    if (!Number.isFinite(n) || n < 0) { setError("Укажите фактическое количество"); return; }
+    setError(null);
     startTransition(async () => {
       const fd = new FormData();
-      fd.set("taskId", taskId); fd.set("ean", eanRaw); fd.set("countedQty", String(n));
-      fd.set("discrepancyType", type); fd.set("comment", comment.trim());
-      const res = await markControlScanAction({}, fd);
-      if (res.error) { setError(res.error); return; } // остаёмся на итоге — EAN/кол-во/тип/коммент сохранены
+      fd.set("taskId", taskId); fd.set("lineId", line.lineId);
+      const res = await confirmControlLineAction({}, fd);
+      if (res.error) { setError(res.error); return; } // строка не подтверждена, состояние не меняется
       router.refresh();
-      if (res.allMarked) { setOpen(false); reset(); }        // все строки отмечены → закрыть мастер
-      else { reset(); setScanning(true); }                    // остались строки → сразу скан следующего EAN
     });
   }
-  const inputCls = "rounded-lg border border-[#e4e4f0] px-3 py-2 text-sm outline-none focus:border-brand";
-  const typeLabel = TYPE_OPTIONS.find((o) => o.value === type)?.label ?? "—";
-  if (!open)
-    return (
-      <Button type="button" variant="primary" onClick={() => { setOpen(true); openScan(); }} className="w-full">
-        <ScanLine size={18} /> Проверить товар (сканирование)
-      </Button>
-    );
   return (
-    <WorkflowSheet
-      title="Проверка товара"
-      subtitle={step === "product" ? "Шаг 1 · штрихкод (EAN)" : step === "qty" ? "Шаг 2 · количество" : step === "type" ? "Шаг 3 · состояние" : step === "comment" ? "Шаг 4 · комментарий" : "Шаг 5 · подтверждение"}
-      scanning={scanning}
-      scanHint="Сканируйте заводской штрихкод товара (EAN)"
-      scanFormats={PRODUCT}
-      manualPlaceholder="EAN товара (8/13 цифр)"
-      manualInputMode="numeric"
-      onScan={handleScan}
-      scanPaused={busy}
-      busy={busy}
-      onBackToList={() => setScanning(false)}
-      onClose={() => { setOpen(false); setScanning(false); reset(); setError(null); }}
-      error={error}
-      onErrorRetry={() => setError(null)}
-      onErrorExit={() => { setError(null); openScan(); }}
-      footer={
-        step === "qty" ? (
-          <>
-            <input autoFocus value={qty} onChange={(e) => setQty(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); submitQty(); } }} type="number" inputMode="decimal" step="1" placeholder="Фактическое количество" className={inputCls} />
-            <Button type="button" variant="primary" onClick={submitQty} className="w-full">Дальше</Button>
-            <Button type="button" variant="ghost" onClick={openScan} className="w-full">Назад</Button>
-          </>
-        ) : step === "type" ? (
-          <>
-            <select autoFocus value={type} onChange={(e) => setType(e.target.value)} className={inputCls}>
-              {TYPE_OPTIONS.map((o) => (<option key={o.value} value={o.value}>{o.label}</option>))}
-            </select>
-            <Button type="button" variant="primary" onClick={() => setStep("comment")} className="w-full">Дальше</Button>
-            <Button type="button" variant="ghost" onClick={() => setStep("qty")} className="w-full">Назад</Button>
-          </>
-        ) : step === "comment" ? (
-          <>
-            <input autoFocus value={comment} onChange={(e) => setComment(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); setStep("confirm"); } }} placeholder="комментарий (необязательно)" className={inputCls} />
-            <Button type="button" variant="primary" onClick={() => setStep("confirm")} className="w-full">Дальше</Button>
-            <Button type="button" variant="ghost" onClick={() => setStep("type")} className="w-full">Назад</Button>
-          </>
-        ) : step === "confirm" ? (
-          <>
-            <Button type="button" variant="primary" disabled={busy} onClick={submit} className="w-full">{busy ? "…" : "Отметить"}</Button>
-            <Button type="button" variant="ghost" onClick={() => setStep("comment")} className="w-full">Назад</Button>
-          </>
-        ) : (
-          <Button type="button" variant="primary" onClick={openScan} className="w-full">
-            <ScanLine size={18} /> Сканировать товар (EAN)
-          </Button>
-        )
-      }
-    >
-      {step !== "product" && (
-        <div className="mb-1 rounded-lg bg-[#f7f8fc] px-3 py-2 text-sm">
-          <div className="flex justify-between gap-2"><span className="text-neutral-500">Товар (EAN)</span><span className="font-mono text-xs">{eanRaw}</span></div>
-          {(step === "type" || step === "comment" || step === "confirm") && <div className="flex justify-between gap-2"><span className="text-neutral-500">Количество</span><span className="font-medium">{qty}</span></div>}
-          {(step === "comment" || step === "confirm") && <div className="flex justify-between gap-2"><span className="text-neutral-500">Состояние</span><span className="font-medium">{typeLabel}</span></div>}
-          {step === "confirm" && comment.trim() && <div className="flex justify-between gap-2"><span className="text-neutral-500">Комментарий</span><span className="font-medium">{comment.trim()}</span></div>}
-        </div>
-      )}
-      <p className="text-sm text-neutral-500">Сканируйте заводской штрихкод (EAN) каждого товара заказа и вводите фактическое количество. Неожиданный товар отметьте как «излишек» или «не тот товар».</p>
-    </WorkflowSheet>
+    <div className="flex flex-col gap-1">
+      <button type="button" onClick={confirm} disabled={busy} aria-busy={busy}
+        className="flex w-full items-center justify-between rounded-xl border border-[#d7dbf5] bg-white px-3 py-3 text-left text-sm active:bg-[#f2f4fd] disabled:opacity-60">
+        <span className="min-w-0 truncate font-semibold text-[#1a1a1a]">{line.item}</span>
+        <Badge tone="neutral">{busy ? "…" : `нужно ${line.required}`}</Badge>
+      </button>
+      {error && <p role="alert" className="text-xs text-red-600">{error}</p>}
+    </div>
   );
 }
 
@@ -281,31 +198,9 @@ export function ControlOrderPanel({ ctx }: { ctx: ControlOrderCtx }) {
         // ввода убран как дублирующий; серверная проверка QR остаётся авторитетной.
         <ScanOrderCamera taskId={ctx.taskId} externalId={ctx.externalId} />
       ) : (
+        // CONTROL-001 (Задача N): подтверждение строк кликом — без EAN/количества/состояния/комментария.
         <>
-          {ctx.lines.map((l) => {
-            const marked = l.counted != null;
-            const ok = marked && !l.discrepancyType;
-            return (
-              <div key={l.lineId} className="flex items-center justify-between rounded-xl bg-[#f7f8fc] px-3 py-2 text-sm">
-                <span className="min-w-0 truncate">{l.item}</span>
-                <Badge tone={!marked ? "neutral" : ok ? "green" : "red"}>
-                  {!marked ? `нужно ${l.required}` : ok ? `✓ ${l.counted}` : `${DISCREPANCY_LABEL[l.discrepancyType ?? ""] ?? "расхождение"}: ${l.counted}/${l.required}`}
-                </Badge>
-              </div>
-            );
-          })}
-          {ctx.extras.length > 0 && (
-            <>
-              <div className="pt-1 text-xs font-medium text-neutral-500">Неожиданные товары</div>
-              {ctx.extras.map((e, i) => (
-                <div key={i} className="flex items-center justify-between rounded-xl border border-red-100 bg-red-50/40 px-3 py-2 text-sm">
-                  <span className="min-w-0 truncate">{e.item}</span>
-                  <Badge tone="red">{DISCREPANCY_LABEL[e.discrepancyType ?? ""] ?? "лишний"}: {e.counted}</Badge>
-                </div>
-              ))}
-            </>
-          )}
-          <MarkGroupScanner taskId={ctx.taskId} />
+          {ctx.lines.map((l) => (<ConfirmLineButton key={l.lineId} taskId={ctx.taskId} line={l} />))}
           <FinishControlForm ctx={ctx} />
         </>
       )}

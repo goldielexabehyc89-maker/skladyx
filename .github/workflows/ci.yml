@@ -81,6 +81,7 @@ jobs:
           WORKFLOW_TASKS_ENABLED=true EXTERNAL_ORDER_PICKING_ENABLED=true $V scripts/verify-external-orders.ts
           WORKFLOW_TASKS_ENABLED=true EXTERNAL_ORDER_PICKING_ENABLED=true $V scripts/verify-order-control.ts
           WORKFLOW_TASKS_ENABLED=true EXTERNAL_ORDER_PICKING_ENABLED=true $V scripts/verify-order-issue.ts
+          WORKFLOW_TASKS_ENABLED=true EXTERNAL_ORDER_PICKING_ENABLED=true $V scripts/verify-order-n.ts
           WORKFLOW_TASKS_ENABLED=true $V scripts/verify-scheduler.ts
           $V scripts/verify-launch-readiness.ts
 

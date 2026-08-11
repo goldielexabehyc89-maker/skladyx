@@ -396,49 +396,30 @@ async function main() {
     ok("UI-004 CORRECT: открыт пошаговый лист", sh);
     ok("UI-004 CORRECT: на текущем шаге видно ≤1 поля", (await sheetFields()) <= 1, String(await sheetFields()));
   }
-  // CONTROL_ORDER: пройти весь мастер валидным EAN фикстуры — по одному полю на шаг, 0 на итоге,
-  // отметка успешна, авто-переход к следующей строке, закрытие после последней. И текст без «по QR».
-  if (ids.controllerToken && ids.ctrlEanA) {
+  // CONTROL-001 (Задача N): после скана QR — только список строк-кнопок (без EAN/количества/состояния/
+  // комментария/мастера). Клик подтверждает строку (галка), завершение заблокировано до подтверждения
+  // всех строк. Заказ EO-CI-CTRL уже отсканирован в фикстуре → панель сразу показывает кнопки строк.
+  if (ids.controllerToken && ids.ctrlItemAName) {
     await setViewport(false);
     await setAuth(ids.controllerToken);
-    await goto("/warehouse/tasks", `document.body.innerText.includes("Проверить товар") || document.body.innerText.includes("Контроль заказа")`);
-    ok("UI-004 CONTROL: нет устаревшего текста «по QR»", !(await bodyText()).includes("по QR"));
-    ok("UI-004 CONTROL: в панели нет inline-набора полей (0 select)", (await visIn('main select')) === 0);
-    await sleep(1500);
-    await clickText(/Проверить товар/);
-    const sheetUp = async () => { for (let i = 0; i < 40; i++) { if (await ev(`!!document.querySelector('[data-workflow-sheet]')`)) return true; await sleep(150); } return false; };
-    ok("UI-004 CONTROL: мастер открыт (шаг EAN)", (await sheetUp()) && (await sheetFields()) <= 1, String(await sheetFields()));
-    const setField = (val) => ev(`(()=>{const el=[...document.querySelectorAll('[data-workflow-sheet] input:not([type=hidden]),[data-workflow-sheet] select,[data-workflow-sheet] textarea')].find(e=>e.offsetParent!==null); if(!el) return 0; const set=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el),'value').set; set.call(el,${JSON.stringify(val)}); el.dispatchEvent(new Event('input',{bubbles:true})); el.dispatchEvent(new Event('change',{bubbles:true})); return 1;})()`);
-    const waitSel = async (sel) => { for (let i = 0; i < 30; i++) { if (await ev(`!!document.querySelector('${sel}')`)) return true; await sleep(150); } return false; };
-    // Пройти один товар по шагам; вернуть число полей на каждом шаге.
-    const markOne = async (ean) => {
-      await setField(ean); await clickText(/Ввести/);                       // EAN → количество
-      await waitSel('[data-workflow-sheet] input[type="number"]');
-      const qf = await sheetFields();
-      await setField("1"); await clickText(/Дальше/);                        // количество → состояние
-      await waitSel('[data-workflow-sheet] select');
-      const tf = await sheetFields();
-      await clickText(/Дальше/); await sleep(500);                           // состояние → комментарий
-      const cf = await sheetFields();
-      await clickText(/Дальше/); await sleep(500);                           // комментарий → итог
-      const ff = await sheetFields();
-      await clickText(/Отметить/); await sleep(1200);                        // отметка
-      return { qf, tf, cf, ff };
-    };
-    const r1 = await markOne(ids.ctrlEanA);
-    ok("UI-004 CONTROL: шаг «количество» — 1 поле", r1.qf === 1, String(r1.qf));
-    ok("UI-004 CONTROL: шаг «состояние» — 1 поле (select)", r1.tf === 1, String(r1.tf));
-    ok("UI-004 CONTROL: шаг «комментарий» — 1 поле", r1.cf === 1, String(r1.cf));
-    ok("UI-004 CONTROL: итоговый шаг — 0 полей", r1.ff === 0, String(r1.ff));
-    // 2 строки: после первой — авто-переход к скану следующего товара (мастер открыт, без «Сканировать товар»)
-    let advanced = false;
-    for (let i = 0; i < 40; i++) { if ((await ev(`!!document.querySelector('[data-workflow-sheet]')`)) && (await ev(`!!document.querySelector('[data-workflow-sheet] form input:not([type=hidden])')`))) { advanced = true; break; } await sleep(150); }
-    ok("UI-004 CONTROL: авто-переход к следующему товару (мастер открыт, скан активен)", advanced);
-    // вторая (последняя) строка → все отмечены → мастер закрывается, показывается завершение
-    await markOne(ids.ctrlEanB);
-    let closed = false;
-    for (let i = 0; i < 50; i++) { if (!(await ev(`!!document.querySelector('[data-workflow-sheet]')`))) { closed = true; break; } await sleep(200); }
-    ok("UI-004 CONTROL: после последней строки мастер закрыт (завершение проверки)", closed);
+    await goto("/warehouse/tasks", `document.body.innerText.includes("нужно") || document.body.innerText.includes("Отметьте все строки")`);
+    t = await bodyText();
+    ok("N-CONTROL: после QR — список строк заказа (кнопки «нужно N»)", has(t, ids.ctrlItemAName) && has(t, ids.ctrlItemBName) && has(t, "нужно"));
+    ok("N-CONTROL: нет скана EAN/мастера товара/полей", !has(t, "Проверить товар") && !has(t, "сканирование") && (await visIn('main select')) === 0 && (await visIn('main input[type=number]')) === 0);
+    ok("N-CONTROL: «Завершить» заблокировано до подтверждения всех строк", has(t, "Отметьте все строки") && !has(t, "Завершить проверку"));
+    // клик по первой строке → серверное подтверждение → галка; завершение всё ещё недоступно
+    await clickText(new RegExp(ids.ctrlItemAName));
+    let oneMarked = false; for (let i = 0; i < 40; i++) { if ((await bodyText()).includes("✓")) { oneMarked = true; break; } await sleep(150); }
+    ok("N-CONTROL: подтверждённая строка получает галку ✓", oneMarked);
+    ok("N-CONTROL: одна неподтверждённая строка → завершение всё ещё заблокировано", (await bodyText()).includes("Отметьте все строки"));
+    // клик по второй строке → все подтверждены → «Завершить проверку» активна
+    await clickText(new RegExp(ids.ctrlItemBName));
+    let allMarked = false; for (let i = 0; i < 40; i++) { if ((await bodyText()).includes("Завершить проверку")) { allMarked = true; break; } await sleep(150); }
+    ok("N-CONTROL: после подтверждения всех строк «Завершить проверку» активна", allMarked && !(await bodyText()).includes("Отметьте все строки"));
+    // завершить проверку → контроль закрывается (задача уходит из текущих)
+    await clickText(/Завершить проверку/);
+    let finished = false; for (let i = 0; i < 40; i++) { if (!(await bodyText()).includes("нужно")) { finished = true; break; } await sleep(200); }
+    ok("N-CONTROL: завершение проверки закрыло контроль", finished);
   }
 
   // ── P2 (aria-current): ссылки «Мои задачи» (?view=mine) и «Монитор задач» (?view=monitor) ──
@@ -956,12 +937,12 @@ async function main() {
     ok("M/ctl: неверный QR не изменил БД (проверок не создано)", c0 === null ? true : (await checksA()) === c0, `${c0}`);
 
     await clickText(/Повторить/); await sleep(300);
-    // верный QR (заказ A) → зелёное подтверждение UI-005 → refresh → шаг EAN
+    // верный QR (заказ A) → зелёное подтверждение UI-005 → refresh → список строк-кнопок (без EAN)
     await setSheetField(ids.controlOrderAQr); await clickText("/Ввести/");
     let green = false; for (let i = 0; i < 90; i++) { if (await ev(`document.body.innerText.includes("Заказ подтверждён")`)) { green = true; break; } await sleep(60); }
     ok("M/ctl: верный QR → зелёное подтверждение UI-005", green);
-    let atEan = false; for (let i = 0; i < 60; i++) { if ((await bodyText()).includes("Проверить товар")) { atEan = true; break; } await sleep(200); }
-    ok("M/ctl: верный QR → переход к пошаговому контролю (шаг EAN)", atEan);
+    let atLines = false; for (let i = 0; i < 60; i++) { const b = await bodyText(); if (b.includes("нужно") && !b.includes("Проверить товар")) { atLines = true; break; } await sleep(200); }
+    ok("M/ctl: верный QR → переход к подтверждению строк (кнопки «нужно», без EAN)", atLines);
     ok("M/ctl: верный QR создал ровно одну проверку в БД", c0 === null ? true : (await checksA()) === c0 + 1, `${c0}`);
     if (cr) await cr.$disconnect();
   }
@@ -985,6 +966,44 @@ async function main() {
     ok("M/ctl-bad: повреждённую в очереди начать нельзя (нет «Начать»)", (await startCount()) === 0, String(await startCount()));
     ok("M/ctl-bad: без техданных в очереди (нет внутреннего номера)", !(await bodyText()).includes("BROKEN-ORD-INTERNAL"));
     ok("M/ctl-bad: мобайл без переполнения", await ev(`document.documentElement.scrollWidth <= window.innerWidth + 1`));
+  }
+
+  // ── ISSUE-002 v1 (Задача N): размещение целого заказа — QR заказа → зелёное подтверждение → скан
+  //    назначенной ячейки → финальный «Ок». Без EAN и лишних блоков. Неверный QR/ячейка → красная ошибка. ──
+  if (ids.issuePlaceToken && ids.issueAssignedCellQr) {
+    const iOpen = async () => { for (let i = 0; i < 40; i++) { if (await ev(`!!document.querySelector('[data-workflow-sheet]')`)) return true; await sleep(150); } return false; };
+    const iAlert = async () => { for (let i = 0; i < 40; i++) { if (await ev(`!!document.querySelector('[role=alert]')`)) return true; await sleep(150); } return false; };
+    await setViewport(true);
+    await setAuth(ids.issuePlaceToken);
+    await goto("/warehouse/tasks", `document.body.innerText.includes("Разместить заказ в выдаче")`);
+    t = await bodyText();
+    ok("N-ISSUE card: команда/№/маршрут «Контроль → назначенная ячейка»", has(t, "Разместить заказ в выдаче") && has(t, ids.issueOrderNExt) && has(t, "Контроль") && has(t, ids.issueAssignedCellCode));
+    ok("N-ISSUE card: мобайл без переполнения", await ev(`document.documentElement.scrollWidth <= window.innerWidth + 1`));
+    // открыть сканер — первый шаг: QR заказа (одно поле, без EAN и лишних блоков)
+    await clickText(/Разместить заказ \(сканирование\)/);
+    ok("N-ISSUE: сканер открыт на шаге QR заказа (одно поле, без EAN)", (await iOpen()) && (await sheetCount()) <= 1 && !(await ev(`!!document.querySelector('[data-workflow-sheet] input[placeholder*="EAN"]')`)));
+    // неверный QR заказа (QR ячейки — не заказ) → красная ошибка, шаг не меняется
+    await setSheetField(ids.issueWrongCellQr); await clickText("/Ввести/"); await sleep(700);
+    ok("N-ISSUE: неверный QR заказа → красная ошибка", await iAlert());
+    await clickText(/Повторить/); await sleep(300);
+    // верный QR заказа → зелёное подтверждение → авто-переход к скану назначенной ячейки
+    await setSheetField(ids.issueOrderNQr); await clickText("/Ввести/");
+    let green = false; for (let i = 0; i < 90; i++) { if (await ev(`document.body.innerText.includes("Заказ подтверждён")`)) { green = true; break; } await sleep(60); }
+    ok("N-ISSUE: верный QR заказа → зелёное подтверждение (UI-005)", green);
+    let atCell = false; for (let i = 0; i < 60; i++) { if (await ev(`!!document.querySelector('[data-workflow-sheet] input[placeholder*="ячейк"]')`)) { atCell = true; break; } await sleep(150); }
+    ok("N-ISSUE: авто-переход к скану назначенной ячейки", atCell);
+    // неназначенная ячейка → красная ошибка (без движения)
+    await setSheetField(ids.issueWrongCellQr); await clickText("/Ввести/"); await sleep(700);
+    ok("N-ISSUE: неназначенная ячейка → красная ошибка", await iAlert());
+    await clickText(/Повторить/); await sleep(300);
+    // правильная назначенная ячейка → финальный экран «Заказ размещён в выдаче» (держится до «Ок»)
+    await setSheetField(ids.issueAssignedCellQr); await clickText("/Ввести/");
+    let doneModal = false; for (let i = 0; i < 90; i++) { if (await ev(`document.body.innerText.includes("Заказ размещён в выдаче")`)) { doneModal = true; break; } await sleep(80); }
+    ok("N-ISSUE: правильная ячейка → финальный экран «Заказ размещён в выдаче»", doneModal);
+    // финал держится до «Ок» → жмём «Ок» → задача уходит из текущих (DELIVER_ORDER создана)
+    await clickText(/^Ок$/);
+    let gone = false; for (let i = 0; i < 40; i++) { if (!(await bodyText()).includes("Разместить заказ в выдаче")) { gone = true; break; } await sleep(200); }
+    ok("N-ISSUE: после «Ок» размещение завершено (задача больше не текущая)", gone);
   }
 
   // ── Задача H: монитор ADMIN — новые задачи сверху (createdAt DESC, id DESC) + серверная пагинация;

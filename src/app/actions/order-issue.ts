@@ -9,6 +9,8 @@ import {
   addIssueCell,
   finishIssuePlacement,
   issueOrderToDriver,
+  verifyIssueOrderScan,
+  placeWholeOrderInIssueCell,
   OrderIssueError,
 } from "@/lib/order-issue";
 
@@ -40,6 +42,41 @@ export async function placeGroupAction(_prev: IssueActionState, formData: FormDa
   try {
     await placeOrderGroup({ companyId: s.companyId, userId: session.userId, taskId, orderCode, cellCode, ean });
     revalidatePath("/warehouse/tasks");
+    return { ok: true };
+  } catch (e) {
+    return { error: msg(e) };
+  }
+}
+
+// ISSUE-002 v1 (Задача N): шаг 1 — read-only проверка скана QR заказа (без изменения БД). Клиент
+// показывает зелёное подтверждение (UI-005) и сам открывает скан ячейки → БЕЗ revalidatePath.
+export async function verifyIssueScanAction(_prev: IssueActionState, formData: FormData): Promise<IssueActionState> {
+  if (!orderIssueEnabled()) return OFF;
+  const session = await requireUser();
+  const s = scoped(session);
+  const taskId = String(formData.get("taskId") ?? "").trim();
+  const orderCode = String(formData.get("orderCode") ?? "").trim();
+  if (!orderCode) return { error: "Отсканируйте QR заказа" };
+  try {
+    await verifyIssueOrderScan({ companyId: s.companyId, userId: session.userId, taskId, orderCode });
+    return { ok: true };
+  } catch (e) {
+    return { error: msg(e) };
+  }
+}
+
+// ISSUE-002 v1 (Задача N): шаг 2 — скан назначенной ячейки → атомарное размещение всего заказа +
+// DELIVER_ORDER. БЕЗ revalidatePath: финальное уведомление держится до «Ок», затем клиент router.refresh().
+export async function placeWholeOrderAction(_prev: IssueActionState, formData: FormData): Promise<IssueActionState> {
+  if (!orderIssueEnabled()) return OFF;
+  const session = await requireUser();
+  const s = scoped(session);
+  const taskId = String(formData.get("taskId") ?? "").trim();
+  const orderCode = String(formData.get("orderCode") ?? "").trim();
+  const cellCode = String(formData.get("cellCode") ?? "").trim();
+  if (!orderCode || !cellCode) return { error: "Отсканируйте QR заказа и назначенную ячейку" };
+  try {
+    await placeWholeOrderInIssueCell({ companyId: s.companyId, userId: session.userId, taskId, orderCode, cellCode });
     return { ok: true };
   } catch (e) {
     return { error: msg(e) };

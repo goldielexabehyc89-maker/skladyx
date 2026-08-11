@@ -7,6 +7,7 @@ import { orderControlEnabled } from "@/lib/roles";
 import {
   scanOrderForControl,
   markOrderControlByScan,
+  confirmControlLine,
   finishOrderControl,
   resolveControlShortage,
   resolveControlRemoval,
@@ -67,6 +68,25 @@ export async function markControlScanAction(_prev: ControlActionState, formData:
   if (!Number.isFinite(countedQty)) return { error: "Укажите фактическое количество" };
   try {
     await markOrderControlByScan({ companyId: s.companyId, userId: session.userId, taskId, ean, countedQty, discrepancyType, comment });
+  } catch (e) {
+    return { error: msg(e) };
+  }
+  revalidatePath("/warehouse/tasks");
+  const ctx = await getControlOrderContext(s.companyId, taskId);
+  return { ok: true, allMarked: ctx?.allMarked ?? false };
+}
+
+// CONTROL-001 (Задача N): контролёр подтверждает строку заказа КЛИКОМ (без EAN/количества).
+// Сервер записывает countedQty=requiredQty без расхождения; идемпотентно; чужая строка/заказ отклонены.
+export async function confirmControlLineAction(_prev: ControlActionState, formData: FormData): Promise<ControlActionState> {
+  if (!orderControlEnabled()) return OFF;
+  const session = await requireUser();
+  const s = scoped(session);
+  const taskId = String(formData.get("taskId") ?? "").trim();
+  const lineId = String(formData.get("lineId") ?? "").trim();
+  if (!lineId) return { error: "Не указана строка заказа" };
+  try {
+    await confirmControlLine({ companyId: s.companyId, userId: session.userId, taskId, lineId });
   } catch (e) {
     return { error: msg(e) };
   }

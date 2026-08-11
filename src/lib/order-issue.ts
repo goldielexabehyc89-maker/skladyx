@@ -209,6 +209,99 @@ export async function placeOrderGroup(input: {
   });
 }
 
+// ── ISSUE-002 v1 (Задача N): немедленная read-only проверка скана QR заказа. Задача исполнителя,
+// ISSUE_ORDER IN_PROGRESS, tenant, склад и QR ИМЕННО заказа задачи. Fail-closed: ровно одна активная
+// назначенная ISSUE-ячейка. БД не меняется. Неверный QR/несоответствие — ошибка (шаг не меняется). ──
+export async function verifyIssueOrderScan(input: {
+  companyId: string; userId: string; taskId: string; orderCode: string;
+}): Promise<{ ok: true; cellCode: string }> {
+  return prisma.$transaction(async (tx) => {
+    const { order } = await requireIssueTask(tx, input.companyId, input.taskId, input.userId, TASK_TYPES.ISSUE_ORDER);
+    const scannedOrderId = await resolveScannedOrder(tx, input.companyId, input.orderCode);
+    if (scannedOrderId !== order.id) throw new OrderIssueError("Отсканирован не тот заказ");
+    const cells = await tx.orderIssueCell.findMany({ where: { orderId: order.id, status: { not: "RELEASED" } } });
+    if (cells.length === 0) throw new OrderIssueError("Заказу не назначена ячейка выдачи");
+    if (cells.length > 1) throw new OrderIssueError("Заказу назначено несколько ячеек выдачи — обратитесь к администратору");
+    const cellRow = await tx.cell.findFirst({ where: { id: cells[0].cellId, companyId: input.companyId }, select: { code: true } });
+    return { ok: true as const, cellCode: cellRow?.code ?? "" };
+  });
+}
+
+// ── ISSUE-002 v1 (Задача N): скан назначенной ISSUE-ячейки → ОДНА атомарная транзакция: перемещает
+// весь оставшийся объём заказа из CONTROL в эту ячейку (все FULFILLED-доли по lotId, чужие доли той же
+// партии не трогаются), помечает ячейку PLACED, завершает ISSUE_ORDER и создаёт ровно одну DELIVER_ORDER.
+// Сервер повторно проверяет заказ и назначенную ячейку (не доверяя клиенту). Идемпотентно: точный повтор
+// не создаёт второго движения/placement/задачи. Fail-closed при 0 или >1 назначенных ячейках. ──
+export async function placeWholeOrderInIssueCell(input: {
+  companyId: string; userId: string; taskId: string; orderCode: string; cellCode: string;
+}): Promise<{ done: boolean; alreadyDone: boolean }> {
+  const out = await prisma.$transaction(async (tx) => {
+    await lockCompany(tx, input.companyId);
+    const task = await tx.workflowTask.findFirst({ where: { id: input.taskId, companyId: input.companyId } });
+    if (!task || task.type !== TASK_TYPES.ISSUE_ORDER) throw new OrderIssueError("Это не задача размещения");
+    if (task.assignedUserId !== input.userId) throw new OrderIssueError("Это не ваша задача");
+    const order = await tx.externalOrder.findFirst({ where: { id: task.subjectId ?? "", companyId: input.companyId } });
+    if (!order) throw new OrderIssueError("Заказ не найден");
+    // идемпотентность точного повтора: задача уже завершена → без второго движения/placement/задачи
+    if (task.status === "COMPLETED") return { alreadyDone: true, order, deliverTask: null as TaskCreateResult | null, unblocked: [] as { id: string; title: string; warehouseId: string }[] };
+    if (task.status !== "IN_PROGRESS") throw new OrderIssueError("Задача размещения не в работе");
+    // повторная серверная проверка заказа (не доверяем клиентским проверкам)
+    const scannedOrderId = await resolveScannedOrder(tx, input.companyId, input.orderCode);
+    if (scannedOrderId !== order.id) throw new OrderIssueError("Отсканирован не тот заказ");
+    // fail-closed: ровно одна активная назначенная ячейка
+    const activeCells = await tx.orderIssueCell.findMany({ where: { orderId: order.id, status: { not: "RELEASED" } } });
+    if (activeCells.length === 0) throw new OrderIssueError("Заказу не назначена ячейка выдачи");
+    if (activeCells.length > 1) throw new OrderIssueError("Заказу назначено несколько ячеек выдачи — обратитесь к администратору");
+    const ic = activeCells[0];
+    // повторная проверка назначенной ячейки: скан обязан совпасть с назначенной
+    const scannedCellId = await resolveScannedCell(tx, input.companyId, order.warehouseId, input.cellCode);
+    if (scannedCellId !== ic.cellId) throw new OrderIssueError("Отсканирована не назначенная ячейка выдачи");
+    await lockCell(tx, input.companyId, ic.cellId);
+    const zoneCtl = await controlZoneId(tx, input.companyId, order.warehouseId);
+    // все FULFILLED-доли заказа (по lotId), ещё не размещённые — переместить каждую долю ЗАКАЗА
+    const resvs = await tx.stockReservation.findMany({ where: { orderId: order.id, status: "FULFILLED" }, select: { lotId: true }, distinct: ["lotId"] });
+    const lotIds = resvs.map((r) => r.lotId).filter((l): l is string => !!l);
+    const already = await tx.orderIssuePlacement.findMany({ where: { orderId: order.id }, select: { lotId: true } });
+    const placedSet = new Set(already.map((p) => p.lotId));
+    for (const lotId of lotIds) {
+      if (placedSet.has(lotId)) continue; // идемпотентно: доля уже перемещена
+      const qty = await orderLotPickedQty(tx, order.id, lotId);
+      if (qty.lte(0)) continue;
+      const lot = await tx.lot.findFirst({ where: { id: lotId, companyId: input.companyId }, select: { itemId: true } });
+      if (!lot) throw new OrderIssueError("Партия не найдена");
+      // в общей зоне CONTROL должно быть не меньше доли ЗАКАЗА (чужие количества той же партии не трогаем)
+      const bal = await tx.stockBalance.aggregate({ where: { lotId, locKey: `Z:${zoneCtl}`, qty: { gt: 0 } }, _sum: { qty: true } });
+      if (D(bal._sum.qty ?? 0).lt(qty)) throw new OrderIssueError("В зоне контроля недостаточно остатка партии для заказа");
+      await applyLotMovement(tx, {
+        companyId: input.companyId, docType: "TRANSFER", docId: order.id, itemId: lot.itemId, lotId, qty,
+        from: { kind: "zone", warehouseId: order.warehouseId, zoneId: zoneCtl },
+        to: { kind: "cell", warehouseId: order.warehouseId, cellId: ic.cellId },
+        createdById: input.userId,
+      });
+      await tx.orderIssuePlacement.create({ data: { companyId: input.companyId, issueCellId: ic.id, orderId: order.id, lotId, itemId: lot.itemId, qty } });
+    }
+    if (ic.status === "RESERVED") await tx.orderIssueCell.update({ where: { id: ic.id }, data: { status: "PLACED", placedAt: new Date() } });
+    // весь заказ перемещён из CONTROL → READY_FOR_DRIVER, завершить ISSUE_ORDER, создать одну DELIVER_ORDER
+    const remaining = await orderControlRemaining(tx, order.id);
+    if (remaining.gt(0)) throw new OrderIssueError("Не весь заказ перемещён из зоны контроля");
+    await tx.externalOrder.update({ where: { id: order.id }, data: { status: "READY_FOR_DRIVER" } });
+    const unblocked = await completeWorkflowTaskInTransaction(tx, task.id);
+    const deliverTask = await createWorkflowTaskInTx(tx, {
+      companyId: input.companyId, warehouseId: order.warehouseId, type: TASK_TYPES.DELIVER_ORDER, requiredRole: "LOADER", priority: "NORMAL",
+      title: `Выдать водителю: заказ ${order.externalId}`, subjectType: "externalOrder", subjectId: order.id,
+      dedupeKey: `deliver:${order.id}`, loadUnits: 1, dueAt: order.arrivalAt ?? undefined,
+    });
+    return { alreadyDone: false, order, deliverTask, unblocked };
+  });
+  if (!out.alreadyDone) {
+    await emitTaskCompleted({ companyId: input.companyId, warehouseId: out.order.warehouseId, title: "Заказ размещён в выдаче", taskId: input.taskId, unblocked: out.unblocked });
+    if (out.deliverTask) await emitTaskCreated(out.deliverTask);
+    await logEvent({ companyId: input.companyId, type: "order_ready_for_driver", title: "Заказ готов к выдаче", body: `Заказ ${out.order.externalId} размещён в ячейке выдачи`, url: "/warehouse/tasks", warehouseIds: [out.order.warehouseId], actorId: input.userId });
+    await rebalanceQueuedTasks(input.companyId, { warehouseId: out.order.warehouseId });
+  }
+  return { done: true, alreadyDone: out.alreadyDone };
+}
+
 // ── «Добавить ячейку»: скан свободной ячейки ISSUE → бронь под заказ. Идемпотентно. ──
 export async function addIssueCell(input: {
   companyId: string; userId: string; taskId: string; cellCode: string;
@@ -338,10 +431,18 @@ export async function getIssueOrderContext(companyId: string, taskId: string) {
   const cellRows = await prisma.cell.findMany({ where: { id: { in: cells.map((c) => c.cellId) } }, select: { id: true, code: true } });
   const nameByCell = new Map(cellRows.map((c) => [c.id, c.code]));
   const remaining = await prisma.$transaction((tx) => orderControlRemaining(tx, order.id));
+  // ISSUE-002 v1: компактная карточка — N поз. · M шт и назначенная ячейка (ровно одна). Больше/меньше
+  // одной активной ячейки → assignedCellCode=null (UI показывает fail-closed, движения не будет).
+  const orderLines = await prisma.externalOrderLine.findMany({ where: { orderId: order.id }, select: { requiredQty: true } });
+  const units = orderLines.reduce((s, l) => s.plus(l.requiredQty), new Prisma.Decimal(0));
+  const assignedCellCode = cells.length === 1 ? (nameByCell.get(cells[0].cellId) ?? null) : null;
   return {
     taskId: task.id, orderId: order.id, externalId: order.externalId,
     arrivalAt: order.arrivalAt ? order.arrivalAt.toISOString() : null,
     cells: cells.map((c) => ({ cell: nameByCell.get(c.cellId) ?? c.cellId, code: codeByCell.get(c.cellId) ?? null, status: c.status })),
+    positions: orderLines.length,
+    units: units.toString(),
+    assignedCellCode,
     remainingInControl: remaining.toString(),
     canFinish: remaining.lte(0) && cells.some((c) => c.status === "PLACED"),
   };

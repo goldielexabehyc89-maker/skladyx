@@ -224,6 +224,35 @@ export async function markOrderControlByScan(input: {
   });
 }
 
+// ── CONTROL-001 (Задача N): контролёр подтверждает строку заказа КЛИКОМ (без EAN/количества).
+// Записывает countedQty = requiredQty (ожидаемое), без расхождения. Идемпотентно. Проверяет
+// организацию, исполнителя, CONTROL_ORDER IN_PROGRESS, текущий ControlCheck и принадлежность
+// lineId ИМЕННО заказу задачи. Чужая строка/другой заказ/завершённая задача/чужая задача — отказ. ──
+export async function confirmControlLine(input: {
+  companyId: string;
+  userId: string;
+  taskId: string;
+  lineId: string;
+}): Promise<{ alreadyConfirmed: boolean }> {
+  return prisma.$transaction(async (tx) => {
+    await lockCompany(tx, input.companyId);
+    const task = await requireControlTask(tx, input.companyId, input.taskId, input.userId);
+    if (task.status !== "IN_PROGRESS") throw new OrderControlError("Задача контроля не в работе");
+    const check = await tx.controlCheck.findUnique({ where: { taskId: task.id } });
+    if (!check) throw new OrderControlError("Сначала отсканируйте QR заказа");
+    if (check.status !== "IN_PROGRESS") throw new OrderControlError("Проверка уже завершена");
+    // строка проверки этого заказа — по lineId (принадлежность заказу задачи). Чужой lineId → отказ.
+    const cl = await tx.controlCheckLine.findFirst({ where: { checkId: check.id, lineId: input.lineId } });
+    if (!cl) throw new OrderControlError("Строка не принадлежит этому заказу");
+    if (cl.countedQty !== null) return { alreadyConfirmed: true }; // идемпотентно: уже подтверждена
+    await tx.controlCheckLine.update({
+      where: { id: cl.id },
+      data: { countedQty: cl.expectedQty, discrepancyType: null, comment: null, byUserId: input.userId, checkedAt: new Date() },
+    });
+    return { alreadyConfirmed: false };
+  });
+}
+
 // Назначить CORRECT_ORDER исходному сборщику, если у него активна смена PICKER на этом складе;
 // иначе оставить авто-назначение наименее загруженному (createWorkflowTaskInTx уже назначил).
 async function createCorrectTaskInTx(
