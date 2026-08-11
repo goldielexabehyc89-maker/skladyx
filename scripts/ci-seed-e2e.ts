@@ -357,7 +357,7 @@ async function main() {
   //    seed не включён, поэтому воспроизводим состояние startCoolingInTx напрямую: COOLING-ячейка (скан),
   //    STORAGE l1 (цель ≤X), STORAGE l3 (верхний резерв под sessionId), RETRIEVE_COOLING «в работе».
   let coolRecSeq = 9970000; // высокая база номеров приёмок для фикстур охлаждения (без коллизий с другими)
-  const seedCoolingSession = async (name: string, phone: string, userName: string, coolCode: string, targetCode: string) => {
+  const seedCoolingSession = async (name: string, phone: string, userName: string, coolCode: string, targetCode: string, placeStock = false) => {
     const w = await prisma.warehouse.create({ data: { companyId, name: `${name}-${Date.now()}`, isActive: true, coolingRate: 2 } });
     await ensureStandardZones(companyId, w.id);
     const zStorage = await prisma.warehouseZone.findFirstOrThrow({ where: { companyId, warehouseId: w.id, kind: "STORAGE" } });
@@ -372,6 +372,10 @@ async function main() {
     const rec = await prisma.receipt.create({ data: { companyId, number: ++coolRecSeq, warehouseId: w.id, status: "POSTED", postedAt: new Date(), createdById: ldr } });
     const line = await prisma.receiptLine.create({ data: { companyId, receiptId: rec.id, itemId: item.id, qty: 5 } });
     const lot = await prisma.lot.create({ data: { companyId, itemId: item.id, receiptLineId: line.id, qtyReceived: 5 } });
+    // Задача I (UI-тест фазы размещения): реальный остаток в COOLING-ячейке, чтобы финальное
+    // placeCoolingRetrieval смогло выполнить ровно одно движение (COOLING → STORAGE-цель).
+    if (placeStock)
+      await prisma.$transaction((tx) => applyLotMovement(tx, { companyId, docType: "RECEIPT", docId: rec.id, itemId: item.id, lotId: lot.id, qty: 5, from: null, to: { kind: "cell", warehouseId: w.id, cellId: coolCell.id }, createdById: ldr }));
     const group = await prisma.handlingGroup.create({ data: { companyId, warehouseId: w.id, itemId: item.id, lotId: lot.id, qty: 5, temperature: 20, thresholdX: X, status: "IN_COOLING", dedupeKey: `ci-cool-${name}`, acceptedById: ldr } });
     const session = await prisma.coolingSession.create({ data: { companyId, warehouseId: w.id, handlingGroupId: group.id, coolingCellId: coolCell.id, startTemp: 20, thresholdX: X, coolingRate: 2, estimatedReadyAt: new Date(Date.now() + 3_600_000), status: "ACTIVE" } });
     const shift = await prisma.workShift.findFirstOrThrow({ where: { companyId, userId: ldr, endedAt: null } });
@@ -383,10 +387,14 @@ async function main() {
     // Верхний резерв под sessionId (как в startCoolingInTx) — обязателен для замера.
     await prisma.cellReservation.create({ data: { companyId, warehouseId: w.id, cellId: reserveCell.id, handlingGroupId: group.id, sessionId: session.id, taskId: task.id, status: "ACTIVE" } });
     const coolQr = (await prisma.qrCode.findFirstOrThrow({ where: { type: "CELL", refId: coolCell.id } })).code;
-    return { token: await mkToken(ldr, "LOADER"), coolQr, whId: w.id };
+    const targetCell = await prisma.cell.findFirstOrThrow({ where: { companyId, warehouseId: w.id, code: targetCode } });
+    const targetQr = (await prisma.qrCode.findFirstOrThrow({ where: { type: "CELL", refId: targetCell.id } })).code;
+    return { token: await mkToken(ldr, "LOADER"), coolQr, targetQr, whId: w.id };
   };
   const coolLeq = await seedCoolingSession("CI-COOL-LEQ", "+79000009931", "CI Охлаждение ≤X", "OHL-01", "SL-01");
   const coolGt = await seedCoolingSession("CI-COOL-GT", "+79000009932", "CI Охлаждение >X", "OHG-01", "SG-01");
+  // Задача I: отдельная сессия для UI-теста шага/кнопки (с реальным остатком → полный проход до размещения).
+  const coolUi = await seedCoolingSession("CI-COOL-UI", "+79000009933", "CI Охлаждение UI", "OHU-01", "SU-01", true);
 
   // ── Задача H: монитор ADMIN — новые задачи сверху (createdAt DESC, id DESC). Сентинел создаётся
   //    ПОСЛЕДНИМ → на мониторе он должен идти выше всех ранее созданных задач. QUEUED (не назначается).
@@ -464,6 +472,11 @@ async function main() {
     coolGtToken: coolGt.token,        // охлаждение: замер >X → новый срок, без ложного движения
     coolGtCellQr: coolGt.coolQr,
     coolGtWhId: coolGt.whId,          // фильтр монитора: новый запланированный забор (новый срок)
+    coolUiToken: coolUi.token,        // Задача I: UI-тест шага/кнопки RETRIEVE_COOLING (полный проход)
+    coolUiCellQr: coolUi.coolQr,
+    coolUiWhId: coolUi.whId,          // подсчёт StockMovement (ровно одно движение при финальном размещении)
+    coolUiTargetCode: "SU-01",
+    coolUiTargetQr: coolUi.targetQr,  // QR назначенной STORAGE-ячейки для финального скана размещения
     monitorNewestTitle: MONITOR_NEWEST_TITLE, // Задача H: сентинел «новые сверху» в мониторе ADMIN
     asgUrgentTitleForSort: asgUrgent.title,   // более старая задача — для проверки порядка (новее выше)
   }));

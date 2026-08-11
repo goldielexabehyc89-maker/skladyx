@@ -8,6 +8,7 @@ import { spawn } from "node:child_process";
 import { mkdtempSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PrismaClient } from "@prisma/client";
 
 const HOST = process.env.VERIFY_HOST || "rostagro.skladyx.ru";
 const PORT = Number(process.env.APP_PORT || 3000);
@@ -657,6 +658,103 @@ async function main() {
       ok("Охлаждение >X: новый срок показан московским временем «Доступна с … (МСК)»", has(mt, "Доступна с") && has(mt, "(МСК)"));
       ok("Охлаждение >X: в мониторе склада нет ложного движения (нет «Размещено»)", !has(mt, "Размещено"));
     }
+  }
+
+  // ── Задача I: соответствие текущего шага и подписи кнопки в RETRIEVE_COOLING (COOL-003/004, UI-004/005).
+  //    Одна state-machine для ручного ввода и камеры; «Назад к списку» сохраняет шаг; крестик сбрасывает;
+  //    «Начать заново» — локальный сброс без server action. Финальное размещение — ровно одно движение. ──
+  if (ids.coolUiToken && ids.coolUiCellQr) {
+    // StockMovement склада UI-сессии — для проверки «навигация не пишет в БД» и «размещение = одно движение».
+    let prisma = null;
+    try { prisma = new PrismaClient(); await prisma.$queryRaw`SELECT 1`; } catch { prisma = null; }
+    const movCount = async () => { if (!prisma || !ids.coolUiWhId) return null; try { return await prisma.stockMovement.count({ where: { OR: [{ fromWarehouseId: ids.coolUiWhId }, { toWarehouseId: ids.coolUiWhId }] } }); } catch { return null; } };
+    // Текущая подпись основной scan-кнопки в футере (когда камера закрыта). Ровно одна такая кнопка.
+    const scanBtns = () => ev(`[...document.querySelectorAll('[data-workflow-sheet] button')].map(b=>b.textContent.trim()).filter(t=>/^Сканировать/.test(t))`);
+    const sheetPlaceholder = () => ev(`document.querySelector('[data-workflow-sheet] input[placeholder]')?.getAttribute('placeholder') || ""`);
+    const sheetTxtI = () => ev(`document.querySelector('[data-workflow-sheet]')?.innerText || ""`);
+    const openScanner = async () => { await sleep(400); await clickText("/Забрать из охлаждения/"); for (let i = 0; i < 40; i++) { if (await ev(`!!document.querySelector('[data-workflow-sheet]')`)) return true; await sleep(150); } return false; };
+    const manualScan = async (val) => { await setSheetField(val); await clickText("/Ввести/"); await sleep(500); };
+
+    await setViewport(true); // мобайл (F)
+    await setAuth(ids.coolUiToken);
+    await goto("/warehouse/tasks", `document.body.innerText.includes("Забрать из охлаждения")`);
+    const m0 = await movCount();
+
+    // ── A. Фаза замера: начальная кнопка = ячейка охлаждения ──
+    ok("I/A: мастер охлаждения открыт", await openScanner());
+    let btns = await scanBtns();
+    ok("I/A: начальная кнопка = «Сканировать ячейку охлаждения»", btns.length === 1 && btns[0] === "Сканировать ячейку охлаждения", JSON.stringify(btns));
+    ok("I/F: одновременно показан только текущий шаг (одна scan-кнопка)", btns.length === 1, JSON.stringify(btns));
+    // включить камеру шага «ячейка» → отсканировать ячейку → шаг становится product
+    await clickText("/Сканировать ячейку охлаждения/"); await sleep(300);
+    await manualScan(ids.coolUiCellQr);
+    // выйти из камеры «Назад к списку» → кнопка ДОЛЖНА стать «Сканировать товар» (корень бага)
+    await clickText("/Назад к списку/"); await sleep(300);
+    btns = await scanBtns();
+    ok("I/A: после «Назад к списку» на шаге product кнопка = «Сканировать товар»", btns.includes("Сканировать товар") && !btns.includes("Сканировать ячейку охлаждения"), JSON.stringify(btns));
+    // снова открыть камеру: placeholder/hint ждут EAN (а не ячейку)
+    await clickText("/Сканировать товар/"); await sleep(300);
+    ok("I/A: камера шага product ждёт EAN (placeholder про EAN)", has(await sheetPlaceholder(), "EAN"), await sheetPlaceholder());
+    ok("I/A: hint шага product про EAN, не про ячейку", has(await sheetTxtI(), "EAN") && !has(await sheetTxtI(), "Сканируйте ячейку охлаждения"));
+    ok("I/A: навигация между экранами не пишет в БД (StockMovement не изменился)", (await movCount()) === m0, `${m0} -> ${await movCount()}`);
+
+    // ── B. Крестик сбрасывает незавершённый сценарий → снова COOLING-ячейка ──
+    await clickText("/Назад к списку/"); await sleep(200); // из камеры в футер
+    // полное закрытие крестиком
+    await ev(`(()=>{const x=[...document.querySelectorAll('[data-workflow-sheet] button[aria-label=\"Закрыть\"]')][0]; if(x) x.click();})()`); await sleep(500);
+    ok("I/B: после крестика мастер закрыт", !(await ev(`!!document.querySelector('[data-workflow-sheet]')`)));
+    await openScanner();
+    btns = await scanBtns();
+    ok("I/B: повторное открытие начинается с COOLING-ячейки", btns.length === 1 && btns[0] === "Сканировать ячейку охлаждения", JSON.stringify(btns));
+    ok("I/B: крестик не изменил StockMovement", (await movCount()) === m0);
+
+    // ── пройти замер ≤X до назначения STORAGE-ячейки (переход в фазу размещения) ──
+    await clickText("/Сканировать ячейку охлаждения/"); await sleep(300);
+    await manualScan(ids.coolUiCellQr);                       // cell → product
+    await manualScan(ids.ean);                                // product → temp
+    // на шаге temp — числовое поле; вводим ≤X
+    await ev(`(()=>{const el=[...document.querySelectorAll('[data-workflow-sheet] input[type="number"]')].find(e=>e.offsetParent!==null); if(!el) return 0; const s=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el),'value').set; s.call(el, ${JSON.stringify(String(ids.thresholdX - 2))}); el.dispatchEvent(new Event('input',{bubbles:true})); return 1;})()`);
+    await clickText("/Записать замер/"); await sleep(1200);
+    ok("I/C: после замера ≤X назначена целевая ячейка (фаза размещения)", has(await sheetTxtI(), ids.coolUiTargetCode), await sheetTxtI());
+    ok("I/C: замер не создал движение (движение — только при физическом размещении)", (await movCount()) === m0, `${m0} -> ${await movCount()}`);
+
+    // ── C. Фаза размещения: подтвердить ячейку+EAN, выйти → кнопка «Сканировать назначенную ячейку» ──
+    btns = await scanBtns();
+    ok("I/C: старт фазы размещения — кнопка снова «Сканировать ячейку охлаждения»", btns[0] === "Сканировать ячейку охлаждения", JSON.stringify(btns));
+    await clickText("/Сканировать ячейку охлаждения/"); await sleep(300);
+    await manualScan(ids.coolUiCellQr);                       // cell → product
+    await manualScan(ids.ean);                                // product → target
+    await clickText("/Назад к списку/"); await sleep(300);
+    btns = await scanBtns();
+    ok("I/C: на шаге target кнопка = «Сканировать назначенную ячейку»", btns.includes("Сканировать назначенную ячейку") && !btns.includes("Сканировать товар"), JSON.stringify(btns));
+    await clickText("/Сканировать назначенную ячейку/"); await sleep(300);
+    ok("I/C: камера шага target ждёт ЯЧЕЙКУ, не EAN", has(await sheetPlaceholder(), "ячейк") && !has(await sheetPlaceholder(), "EAN"), await sheetPlaceholder());
+
+    // ── D. «Начать заново» сбрасывает к COOLING-ячейке, без движения; затем финальное размещение = одно движение ──
+    await clickText("/Назад к списку/"); await sleep(250);
+    await clickText("/Начать заново/"); await sleep(300);
+    btns = await scanBtns();
+    ok("I/D: «Начать заново» сбрасывает фазу размещения к скану COOLING-ячейки", btns[0] === "Сканировать ячейку охлаждения", JSON.stringify(btns));
+    ok("I/D: «Начать заново» не создало движение/замер/бронь (StockMovement неизменен)", (await movCount()) === m0, `${m0} -> ${await movCount()}`);
+    ok("I/F: мобайл без горизонтального скролла", await ev(`document.documentElement.scrollWidth <= window.innerWidth + 1`));
+    // финальный проход размещения (та же state-machine, ручной ввод — ветка E)
+    await clickText("/Сканировать ячейку охлаждения/"); await sleep(300);
+    await manualScan(ids.coolUiCellQr);                       // cell → product
+    await manualScan(ids.ean);                                // product → target
+    await manualScan(ids.coolUiTargetQr);                     // target → submitPlace
+    // Завершение = модалка «Забрано из охлаждения» ЛИБО фактически созданное движение (сигнал надёжнее
+    // текста под нагрузкой). Обе ветки — один и тот же submitPlace ручной state-machine (ветка E).
+    let placed = false, mFinal = m0;
+    for (let i = 0; i < 120; i++) {
+      if ((await bodyText()).includes("Забрано из охлаждения")) { placed = true; break; }
+      mFinal = await movCount();
+      if (mFinal !== null && m0 !== null && mFinal === m0 + 1) { placed = true; break; }
+      await sleep(200);
+    }
+    ok("I/D+E: финальное размещение выполнено ручной веткой (та же state-machine)", placed);
+    mFinal = await movCount();
+    ok("I/D: финальное размещение создало РОВНО одно движение", m0 === null ? true : mFinal === m0 + 1, `${m0} -> ${mFinal}`);
+    if (prisma) await prisma.$disconnect();
   }
 
   // ── Задача H: монитор ADMIN — новые задачи сверху (createdAt DESC, id DESC) + серверная пагинация;

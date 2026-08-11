@@ -373,9 +373,18 @@ export function CoolingRetrievalScanner({ cooling }: { cooling: Cooling }) {
             <Button type="button" variant="ghost" onClick={resetMeasure} className="w-full">Заново сканировать</Button>
           </>
         ) : (
-          <Button type="button" variant="primary" onClick={() => setScanning(true)} className="w-full">
-            <ScanLine size={18} /> Сканировать ячейку охлаждения
-          </Button>
+          <>
+            <Button type="button" variant="primary" onClick={() => setScanning(true)} className="w-full">
+              {/* Задача I: подпись кнопки всегда соответствует текущему шагу (COOL-003/004, UI-004) —
+                  как и hint/placeholder/formats камеры; несоответствия «кнопка про ячейку → камера про EAN» нет. */}
+              <ScanLine size={18} /> {step === "product" ? "Сканировать товар" : step === "target" ? "Сканировать назначенную ячейку" : "Сканировать ячейку охлаждения"}
+            </Button>
+            {step !== "cell" && (
+              // Отказ от сохранённого промежуточного шага: сброс ТЕКУЩЕЙ фазы к скану исходной COOLING-ячейки.
+              // Только локальный сброс — без server action, замеров, движений и броней.
+              <Button type="button" variant="ghost" onClick={() => (phase === "measure" ? resetMeasure() : resetPlace())} className="w-full">Начать заново</Button>
+            )}
+          </>
         )
       }
     >
