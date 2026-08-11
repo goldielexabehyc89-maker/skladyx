@@ -47,7 +47,9 @@ export async function scanOrderControlAction(_prev: ControlActionState, formData
   } catch (e) {
     return { error: msg(e) };
   }
-  revalidatePath("/warehouse/tasks");
+  // Намеренно БЕЗ revalidatePath: клиент (ScanOrderCamera) показывает заметное зелёное подтверждение
+  // (UI-005), затем сам вызывает router.refresh() — иначе серверная ревалидация мгновенно подменит
+  // панель шагом EAN и подтверждение не будет видно.
   return { ok: true };
 }
 

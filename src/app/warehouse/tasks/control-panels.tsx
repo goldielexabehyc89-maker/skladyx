@@ -28,6 +28,9 @@ export interface ControlOrderCtx {
   externalId: string;
   scanConfirmed: boolean;
   attempt: number;
+  positions: number;
+  units: string;
+  marked: number;
   lines: { lineId: string; item: string; required: string; counted: string | null; discrepancyType: string | null }[];
   extras: { item: string; counted: string; discrepancyType: string | null }[];
   allMarked: boolean;
@@ -65,22 +68,26 @@ const METHOD_LABEL: Record<string, string> = {
 };
 
 // ── Скан QR заказа камерой (WorkflowSheet) ──
-function ScanOrderCamera({ taskId }: { taskId: string }) {
+function ScanOrderCamera({ taskId, externalId }: { taskId: string; externalId: string }) {
   const router = useRouter();
   const [open, setOpen] = useState(false);
   const [scanning, setScanning] = useState(false);
   const [busy, startTransition] = useTransition();
   const [error, setError] = useState<string | null>(null);
+  const [confirmed, setConfirmed] = useState(false); // UI-005: заметное зелёное подтверждение перед переходом
 
   function handleScan(raw: string) {
-    if (busy) return;
+    if (busy || confirmed) return;
     startTransition(async () => {
       const fd = new FormData();
       fd.set("taskId", taskId);
       fd.set("orderCode", raw);
+      // Сервер авторитетно сверяет, что QR относится ИМЕННО к этому заказу/задаче (иначе ошибка, БД не меняется).
       const res = await scanOrderControlAction({}, fd);
-      if (res.error) { setError(res.error); return; }
-      setOpen(false); setScanning(false); router.refresh();
+      if (res.error) { setError(res.error); return; } // неправильный QR — шаг не меняется
+      setScanning(false); setConfirmed(true);
+      // заметная пауза на зелёное подтверждение (UI-005), затем открывается пошаговый контроль товаров
+      setTimeout(() => { setOpen(false); router.refresh(); }, 1500);
     });
   }
 
@@ -93,42 +100,29 @@ function ScanOrderCamera({ taskId }: { taskId: string }) {
 
   return (
     <WorkflowSheet
-      title="Контроль заказа"
-      subtitle="Отсканируйте QR заказа"
+      title="Проверить заказ"
+      subtitle={confirmed ? undefined : `№ ${externalId}`}
       scanning={scanning}
       scanHint="Сканируйте QR заказа"
       scanFormats={ORDERF}
+      manualPlaceholder="Код QR заказа"
       onScan={handleScan}
-      scanPaused={busy}
+      scanPaused={busy || confirmed}
       busy={busy}
       onBackToList={() => setScanning(false)}
       onClose={() => { setOpen(false); setScanning(false); }}
       error={error}
       onErrorRetry={() => setError(null)}
       onErrorExit={() => { setError(null); setScanning(false); setOpen(false); }}
+      modal={confirmed ? { title: "Заказ подтверждён", body: `№ ${externalId} — проверьте товары` } : null}
       footer={
         <Button type="button" variant="primary" onClick={() => setScanning(true)} className="w-full">
           <ScanLine size={18} /> Сканировать QR заказа
         </Button>
       }
     >
-      <p className="text-sm text-neutral-500">Наведите камеру на QR-код заказа в зоне контроля.</p>
+      <p className="text-sm text-neutral-500">Отсканируйте QR заказа в зоне контроля.</p>
     </WorkflowSheet>
-  );
-}
-
-function ScanOrderManual({ taskId }: { taskId: string }) {
-  const [state, action, pending] = useActionState<ControlActionState, FormData>(scanOrderControlAction, {});
-  return (
-    <details className="text-xs text-neutral-500">
-      <summary className="cursor-pointer">Ввести код заказа вручную (без камеры)</summary>
-      <form action={action} className="mt-2 flex flex-col gap-2">
-        <input type="hidden" name="taskId" value={taskId} />
-        <input name="orderCode" required placeholder="Код QR заказа" className="rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm" />
-        {state.error && <p className="text-red-600">{state.error}</p>}
-        <Button type="submit" variant="ghost" disabled={pending}>{pending ? "…" : "Подтвердить заказ"}</Button>
-      </form>
-    </details>
   );
 }
 
@@ -275,19 +269,19 @@ function FinishControlForm({ ctx }: { ctx: ControlOrderCtx }) {
 export function ControlOrderPanel({ ctx }: { ctx: ControlOrderCtx }) {
   return (
     <div className="flex flex-col gap-2">
-      <div className="text-xs font-medium text-neutral-500">
-        Контроль заказа {ctx.externalId} · попытка {ctx.attempt}
-        {ctx.previousChecks.length > 0 && ` · ранее: ${ctx.previousChecks.map((p) => `#${p.attempt} ${p.status === "FAILED" ? "ошибка" : p.status === "PASSED" ? "ок" : "…"}`).join(", ")}`}
-      </div>
+      {/* Задача M Этап2: попытку/историю показываем только при повторном контроле (компактно). Номер
+          заказа и позиции/единицы — в карточке; здесь их не дублируем. */}
+      {ctx.previousChecks.length > 0 && (
+        <div className="text-xs font-medium text-neutral-500">
+          Попытка {ctx.attempt} · ранее: {ctx.previousChecks.map((p) => `#${p.attempt} ${p.status === "FAILED" ? "ошибка" : p.status === "PASSED" ? "ок" : "…"}`).join(", ")}
+        </div>
+      )}
       {!ctx.scanConfirmed ? (
-        <>
-          <ScanOrderCamera taskId={ctx.taskId} />
-          <ScanOrderManual taskId={ctx.taskId} />
-          <p className="text-xs text-neutral-400">Отсканируйте QR заказа, затем проверьте каждый товар по EAN.</p>
-        </>
+        // Один вход: сканер QR заказа (внутри — ручной ввод кода как fallback). Отдельный блок ручного
+        // ввода убран как дублирующий; серверная проверка QR остаётся авторитетной.
+        <ScanOrderCamera taskId={ctx.taskId} externalId={ctx.externalId} />
       ) : (
         <>
-          <div className="text-xs font-medium text-neutral-500">Строки заказа — проверьте каждую по заводскому штрихкоду (EAN)</div>
           {ctx.lines.map((l) => {
             const marked = l.counted != null;
             const ok = marked && !l.discrepancyType;

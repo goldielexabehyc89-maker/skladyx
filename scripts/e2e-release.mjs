@@ -920,6 +920,52 @@ async function main() {
     if (pr) await pr.$disconnect();
   }
 
+  // ── Задача M (Этап 2): контролёр — компактная карточка CONTROL_ORDER (до начала и в работе),
+  //    скан QR заказа ПЕРВЫМ шагом (авторитетная серверная проверка), неверный QR не меняет шаг/БД,
+  //    верный QR → зелёное подтверждение UI-005 → шаг EAN. Ни техметаданных, ни внутренних ID. ──
+  if (ids.controlE2EToken && ids.controlOrderAQr) {
+    let cr = null;
+    try { cr = new PrismaClient(); await cr.$queryRaw`SELECT 1`; } catch { cr = null; }
+    const checksA = async () => { if (!cr || !ids.controlOrderAId) return null; try { return await cr.controlCheck.count({ where: { orderId: ids.controlOrderAId } }); } catch { return null; } };
+    const cOpen = async () => { for (let i = 0; i < 40; i++) { if (await ev(`!!document.querySelector('[data-workflow-sheet]')`)) return true; await sleep(150); } return false; };
+    const cAlert = async () => { for (let i = 0; i < 40; i++) { if (await ev(`!!document.querySelector('[role=alert]')`)) return true; await sleep(150); } return false; };
+
+    // мобайл — компактная карточка «в работе» (заказ A = текущая задача)
+    await setViewport(true);
+    await setAuth(ids.controlE2EToken);
+    await goto("/warehouse/tasks", `document.body.innerText.includes("Проверить заказ")`);
+    t = await bodyText();
+    ok("M/ctl card в работе: команда/№/позиции·единицы/прогресс", /проверить заказ/i.test(t) && has(t, `№ ${ids.controlOrderAExt}`) && has(t, "2 поз.") && has(t, "2 ед.") && has(t, "0/2"));
+    ok("M/ctl card: нет техметаданных (тип/статус/создано/внутр. ID)", !has(t, `Контроль заказа ${ids.controlOrderAExt}`) && !has(t, "создано") && !has(t, "Назначена") && !has(t, "CONTROL_ORDER") && !has(t, ids.controlOrderAId));
+    ok("M/ctl card: мобайл без переполнения", await ev(`document.documentElement.scrollWidth <= window.innerWidth + 1`));
+
+    // компактная карточка «до начала» (заказ B в очереди) — раскрыть свёрнутую очередь
+    await clickText(/Показать/); await sleep(400);
+    t = await bodyText();
+    ok("M/ctl card до начала: № заказа B и позиции·единицы (без техметаданных)", has(t, `№ ${ids.controlOrderBExt}`) && has(t, "1 поз.") && has(t, "1 ед.") && !has(t, `Контроль заказа ${ids.controlOrderBExt}`));
+
+    // скан QR заказа ПЕРВЫМ шагом — открыть сканер
+    await clickText(/Сканировать QR заказа/);
+    ok("M/ctl: сканер QR заказа открыт (одно поле)", (await cOpen()) && (await sheetCount()) <= 1, String(await sheetCount()));
+
+    const c0 = await checksA();
+    // неверный QR (валидный QR ЧУЖОГО заказа B) → красная ошибка, шаг НЕ меняется, БД НЕ меняется
+    await setSheetField(ids.controlWrongQr); await clickText("/Ввести/"); await sleep(700);
+    ok("M/ctl: неверный QR → красная ошибка", await cAlert());
+    ok("M/ctl: неверный QR не подтвердил заказ и не открыл шаг EAN", !(await bodyText()).includes("Заказ подтверждён") && !(await ev(`!!document.querySelector('[data-workflow-sheet] input[placeholder*="EAN"]')`)));
+    ok("M/ctl: неверный QR не изменил БД (проверок не создано)", c0 === null ? true : (await checksA()) === c0, `${c0}`);
+
+    await clickText(/Повторить/); await sleep(300);
+    // верный QR (заказ A) → зелёное подтверждение UI-005 → refresh → шаг EAN
+    await setSheetField(ids.controlOrderAQr); await clickText("/Ввести/");
+    let green = false; for (let i = 0; i < 90; i++) { if (await ev(`document.body.innerText.includes("Заказ подтверждён")`)) { green = true; break; } await sleep(60); }
+    ok("M/ctl: верный QR → зелёное подтверждение UI-005", green);
+    let atEan = false; for (let i = 0; i < 60; i++) { if ((await bodyText()).includes("Проверить товар")) { atEan = true; break; } await sleep(200); }
+    ok("M/ctl: верный QR → переход к пошаговому контролю (шаг EAN)", atEan);
+    ok("M/ctl: верный QR создал ровно одну проверку в БД", c0 === null ? true : (await checksA()) === c0 + 1, `${c0}`);
+    if (cr) await cr.$disconnect();
+  }
+
   // ── Задача H: монитор ADMIN — новые задачи сверху (createdAt DESC, id DESC) + серверная пагинация;
   //    порядок держится и под фильтром. ──
   if (ids.adminToken && ids.monitorNewestTitle) {

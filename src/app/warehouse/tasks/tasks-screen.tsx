@@ -77,6 +77,11 @@ export interface LoaderCard {
 // Известные физические типы задач погрузчика — для них компактная карточка обязательна; fallback на
 // техническую карточку не допускается (повреждённый контекст → понятная ошибка, старт заблокирован).
 export const LOADER_PHYSICAL_TYPES = new Set(["PLACE_GROUP", "RETRIEVE_COOLING", "MOVE_GROUP", "ISSUE_ORDER", "DELIVER_ORDER"]);
+export interface ControlCard {
+  externalId: string;
+  positions: number;
+  units: string;
+}
 export interface PickOrderCtx {
   orderId: string;
   externalId: string;
@@ -322,9 +327,18 @@ function LoaderErrorCard({ task }: { task: TaskDTO }) {
   );
 }
 
-function QueueItem({ task, canStart, serverNow, card }: { task: TaskDTO; canStart: boolean; serverNow: string; card?: LoaderCard }) {
+function QueueItem({ task, canStart, serverNow, card, controlCard }: { task: TaskDTO; canStart: boolean; serverNow: string; card?: LoaderCard; controlCard?: ControlCard }) {
   // TASK-006 (расширение): физическая задача погрузчика — компактная карточка (команда/деталь/маршрут).
   if (card) return <LoaderTaskCard card={card} task={task} serverNow={serverNow} canStart={canStart} />;
+  // CONTROL-001 (Задача M Этап2): компактная карточка контролёра «до начала» — команда/№/позиции·единицы.
+  if (controlCard) return (
+    <div className="rounded-xl border border-[#eee] p-3">
+      <div className="text-xs font-semibold uppercase tracking-wide text-[#667eea]">Проверить заказ</div>
+      <div className="mt-0.5 text-base font-semibold text-[#1a1a1a]">№ {controlCard.externalId}</div>
+      <div className="mt-0.5 text-sm text-neutral-600">{controlCard.positions} поз. · {controlCard.units} ед.</div>
+      {canStart && <div className="mt-2"><StartTaskForm task={task} /></div>}
+    </div>
+  );
   // Известный физический тип без контекста — не откатываемся на техническую карточку.
   if (LOADER_PHYSICAL_TYPES.has(task.type)) return <LoaderErrorCard task={task} />;
   const urgentCard = isUrgentActive(task);
@@ -339,7 +353,7 @@ function QueueItem({ task, canStart, serverNow, card }: { task: TaskDTO; canStar
 
 // TASK-005: пока идёт текущая задача — ожидающая очередь показывается свёрнутой строкой
 // «Срочные: N · Обычные: N», раскрывается по нажатию; новая срочная выделяется, но не прерывает.
-function QueueSummary({ urgent, normal, serverNow, loaderCards }: { urgent: TaskDTO[]; normal: TaskDTO[]; serverNow: string; loaderCards: Record<string, LoaderCard> }) {
+function QueueSummary({ urgent, normal, serverNow, loaderCards, controlCards }: { urgent: TaskDTO[]; normal: TaskDTO[]; serverNow: string; loaderCards: Record<string, LoaderCard>; controlCards: Record<string, ControlCard> }) {
   const [open, setOpen] = useState(false);
   return (
     <Card>
@@ -353,8 +367,8 @@ function QueueSummary({ urgent, normal, serverNow, loaderCards }: { urgent: Task
       </button>
       {open && (
         <div className="mt-3 flex flex-col gap-3">
-          {urgent.map((t) => <QueueItem key={t.id} task={t} canStart={false} serverNow={serverNow} card={loaderCards[t.id]} />)}
-          {normal.map((t) => <QueueItem key={t.id} task={t} canStart={false} serverNow={serverNow} card={loaderCards[t.id]} />)}
+          {urgent.map((t) => <QueueItem key={t.id} task={t} canStart={false} serverNow={serverNow} card={loaderCards[t.id]} controlCard={controlCards[t.id]} />)}
+          {normal.map((t) => <QueueItem key={t.id} task={t} canStart={false} serverNow={serverNow} card={loaderCards[t.id]} controlCard={controlCards[t.id]} />)}
         </div>
       )}
     </Card>
@@ -377,6 +391,7 @@ export function WorkerTasks({
   deliverOrder,
   serverNow,
   loaderCards,
+  controlCards,
 }: {
   current: TaskDTO | null;
   urgent: TaskDTO[];
@@ -385,6 +400,7 @@ export function WorkerTasks({
   mates: Mate[];
   serverNow: string;
   loaderCards: Record<string, LoaderCard>;
+  controlCards: Record<string, ControlCard>;
   placement?: Placement | null;
   cooling?: Cooling | null;
   pickOrder?: PickOrderCtx | null;
@@ -472,6 +488,26 @@ export function WorkerTasks({
             </div>
           </div>
         </Card>
+      ) : current && controlOrder && current.status === "IN_PROGRESS" ? (
+        // CONTROL-001 (Задача M Этап2): компактная карточка контролёра — команда/номер/позиции·единицы/
+        // прогресс/текущее действие. Без title/description/типа/статуса/времени и повторяющихся инструкций.
+        <Card>
+          <CardTitle>Текущая задача</CardTitle>
+          <div className="rounded-xl border border-[#eee] p-3">
+            <div className="text-xs font-semibold uppercase tracking-wide text-[#667eea]">Проверить заказ</div>
+            <div className="mt-0.5 text-base font-semibold text-[#1a1a1a]">№ {controlOrder.externalId}</div>
+            <div className="mt-0.5 text-sm text-neutral-600">{controlOrder.positions} поз. · {controlOrder.units} ед.</div>
+            <div className="mt-1 flex items-center gap-2">
+              <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-[#eef0f8]">
+                <div className="h-full rounded-full bg-gradient-to-r from-[#667eea] to-[#764ba2]" style={{ width: `${controlOrder.positions ? Math.round((controlOrder.marked / controlOrder.positions) * 100) : 0}%` }} />
+              </div>
+              <span className="text-xs text-neutral-500">{controlOrder.marked}/{controlOrder.positions}</span>
+            </div>
+            <div className="mt-2">
+              <ControlOrderPanel ctx={controlOrder} />
+            </div>
+          </div>
+        </Card>
       ) : current && LOADER_PHYSICAL_TYPES.has(current.type) && current.status === "IN_PROGRESS" ? (
         // Известная физическая задача погрузчика с повреждённым контекстом — ошибка, без метаданных.
         <Card>
@@ -493,7 +529,6 @@ export function WorkerTasks({
                   <Button className="w-full">Открыть</Button>
                 </Link>
               )}
-              {controlOrder && current.status === "IN_PROGRESS" && <ControlOrderPanel ctx={controlOrder} />}
               {correctOrder && current.status === "IN_PROGRESS" && <CorrectOrderPanel ctx={correctOrder} />}
               {current.status === "IN_PROGRESS" && <HandoffForm taskId={current.id} mates={mates} />}
               {current.status === "HANDOFF_PENDING" && (
@@ -507,19 +542,19 @@ export function WorkerTasks({
       {/* TASK-005: очередь. При текущей задаче — свёрнутая сводка; без текущей — только непустые списки
           (срочные выше обычных); если всё пусто — одно компактное пустое состояние. */}
       {current ? (
-        (urgent.length + normal.length > 0) && <QueueSummary urgent={urgent} normal={normal} serverNow={serverNow} loaderCards={loaderCards} />
+        (urgent.length + normal.length > 0) && <QueueSummary urgent={urgent} normal={normal} serverNow={serverNow} loaderCards={loaderCards} controlCards={controlCards} />
       ) : urgent.length + normal.length > 0 ? (
         <>
           {urgent.length > 0 && (
             <Card>
               <CardTitle>Срочные</CardTitle>
-              <div className="flex flex-col gap-3">{urgent.map((t) => <QueueItem key={t.id} task={t} canStart serverNow={serverNow} card={loaderCards[t.id]} />)}</div>
+              <div className="flex flex-col gap-3">{urgent.map((t) => <QueueItem key={t.id} task={t} canStart serverNow={serverNow} card={loaderCards[t.id]} controlCard={controlCards[t.id]} />)}</div>
             </Card>
           )}
           {normal.length > 0 && (
             <Card>
               <CardTitle>Обычные задачи</CardTitle>
-              <div className="flex flex-col gap-3">{normal.map((t) => <QueueItem key={t.id} task={t} canStart serverNow={serverNow} card={loaderCards[t.id]} />)}</div>
+              <div className="flex flex-col gap-3">{normal.map((t) => <QueueItem key={t.id} task={t} canStart serverNow={serverNow} card={loaderCards[t.id]} controlCard={controlCards[t.id]} />)}</div>
             </Card>
           )}
         </>

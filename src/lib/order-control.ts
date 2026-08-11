@@ -523,12 +523,18 @@ export async function getControlOrderContext(companyId: string, taskId: string) 
     orderBy: { attempt: "asc" },
     select: { attempt: true, status: true },
   });
+  // Задача M Этап2: компактная карточка — позиции/единицы/прогресс проверки.
+  const units = orderLines.reduce((s, l) => s.plus(l.requiredQty), new Prisma.Decimal(0));
+  const marked = lines.filter((l) => l.counted != null).length;
   return {
     taskId: task.id,
     orderId: order.id,
     externalId: order.externalId,
     scanConfirmed: !!check,
     attempt: check?.attempt ?? previous.length + 1,
+    positions: orderLines.length,
+    units: units.toString(),
+    marked,
     lines,
     extras,
     allMarked,

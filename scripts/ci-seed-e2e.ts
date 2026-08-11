@@ -20,7 +20,7 @@ import { updateSettings } from "@/lib/settings";
 import { createHandlingGroup, completeGroupPlacement, prepareGroupPlacement } from "@/lib/group-receiving";
 import { startWorkflowTask, rebalanceQueuedTasks, createWorkflowTask } from "@/lib/workflow-tasks";
 import { importExternalOrder, reserveAndPlanOrder, pickOrderScan } from "@/lib/external-orders";
-import { scanOrderForControl, markOrderControlByScan, finishOrderControl } from "@/lib/order-control";
+import { scanOrderForControl, markOrderControlByScan, finishOrderControl, createControlTaskInTx } from "@/lib/order-control";
 import { applyLotMovement } from "@/lib/stock";
 import { createQrIn } from "@/lib/qr";
 import { createSessionToken } from "@/lib/jwt";
@@ -436,6 +436,29 @@ async function main() {
   const pickOrderQrCode = (await prisma.qrCode.findFirstOrThrow({ where: { companyId, type: "ORDER", refId: impPick.orderId } })).code;
   const pickToken = await mkToken(pickE2E, "PICKER");
 
+  // ── Задача M (Этап 2): фикстура контролёра — компактный CONTROL_ORDER. Отдельный контролёр
+  //    controlE2E (свой склад ctl2Wh) без остатков: A «в работе» (IN_PROGRESS, ещё НЕ отсканирован →
+  //    первый шаг = скан QR заказа), B «до начала» (ASSIGNED, очередь). Заказы засеяны прямо в IN_CONTROL
+  //    (без сборки/остатков) — e2e проверяет только компактные карточки, скан QR и появление шага EAN. ──
+  const ctl2Wh = await prisma.warehouse.create({ data: { companyId, name: `CI-CTL2-${Date.now()}`, isActive: true, coolingRate: 2 } });
+  await ensureStandardZones(companyId, ctl2Wh.id);
+  const controlE2E = await mkUser(companyId, "+79000009935", "CI Контролёр e2e", "CONTROLLER", "CiCtlE2E-9935", ctl2Wh.id);
+  const ctl2Shift = await prisma.workShift.create({ data: { companyId, userId: controlE2E, warehouseId: ctl2Wh.id, role: "CONTROLLER" } });
+  const mkCtlOrder = async (ext: string, items: string[], start: boolean) => {
+    const imp = await importExternalOrder({ companyId, warehouseId: ctl2Wh.id, externalId: ext, createdById: controlE2E, arrivalAt: null, lines: items.map((it, i) => ({ externalLineId: String(i + 1), itemId: it, requiredQty: 1 })) });
+    await prisma.externalOrder.update({ where: { id: imp.orderId }, data: { status: "IN_CONTROL" } });
+    const res = await prisma.$transaction((tx) => createControlTaskInTx(tx, { companyId, order: { id: imp.orderId, warehouseId: ctl2Wh.id, externalId: ext, arrivalAt: null }, dedupeKey: `ci-ctl2:${imp.orderId}` }));
+    await prisma.workflowTask.update({ where: { id: res.task.id }, data: { status: "ASSIGNED", assignedUserId: controlE2E, assignedShiftId: ctl2Shift.id, assignedAt: new Date(), startedAt: null } });
+    if (start) { const r = await startWorkflowTask(controlE2E, companyId, res.task.id); if (r.error) throw new Error(`CI ctl2 start: ${r.error}`); }
+    return imp.orderId;
+  };
+  const CTL2_A_EXT = "EO-CI-CTL2-A", CTL2_B_EXT = "EO-CI-CTL2-B";
+  const oCtl2A = await mkCtlOrder(CTL2_A_EXT, [ctlItemA.id, ctlItemB.id], true);  // «в работе», scanConfirmed=false
+  const oCtl2B = await mkCtlOrder(CTL2_B_EXT, [ctlItemA.id], false);              // «до начала»
+  const controlOrderAQr = await orderQr(oCtl2A);  // верный QR для задачи A
+  const controlWrongQr = await orderQr(oCtl2B);   // валидный, но ЧУЖОЙ QR (заказ B)
+  const controlE2EToken = await mkToken(controlE2E, "CONTROLLER");
+
   // ── Задача H: монитор ADMIN — новые задачи сверху (createdAt DESC, id DESC). Сентинел создаётся
   //    ПОСЛЕДНИМ → на мониторе он должен идти выше всех ранее созданных задач. QUEUED (не назначается).
   const MONITOR_NEWEST_TITLE = "CI Монитор сентинел (новейшая)";
@@ -536,6 +559,13 @@ async function main() {
     pickOrderQrCode,               // ORDER-QR: код для проверки /q/<code>
     monitorNewestTitle: MONITOR_NEWEST_TITLE, // Задача H: сентинел «новые сверху» в мониторе ADMIN
     asgUrgentTitleForSort: asgUrgent.title,   // более старая задача — для проверки порядка (новее выше)
+    // Задача M (Этап 2): контролёр — компактный CONTROL_ORDER, скан QR первым шагом
+    controlE2EToken,                 // контролёр: A «в работе» (скан-первый) + B «до начала»
+    controlOrderAExt: CTL2_A_EXT,    // № заказа A (2 поз., 2 ед.) — «в работе»
+    controlOrderBExt: CTL2_B_EXT,    // № заказа B (1 поз., 1 ед.) — «до начала»
+    controlOrderAId: oCtl2A,         // id заказа A (проверка неизменности БД при неверном QR)
+    controlOrderAQr,                 // верный QR заказа A → зелёное подтверждение + шаг EAN
+    controlWrongQr,                  // валидный QR заказа B → «не тот заказ», шаг не меняется
   }));
   process.exit(0);
 }

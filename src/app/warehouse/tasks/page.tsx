@@ -370,6 +370,27 @@ export default async function TasksPage({
     else if (current.type === "CORRECT_ORDER") correctOrder = await getCorrectOrderContext(s.companyId, current.id);
   }
 
+  // Задача M Этап2: компактные карточки CONTROL_ORDER «до начала» (очередь контролёра) — команда/№/
+  //   позиции·единицы, пакетно из ExternalOrder + строк. Без техметаданных.
+  const controlCards: Record<string, { externalId: string; positions: number; units: string }> = {};
+  if (orderControlEnabled()) {
+    const ctl = assigned.filter((t) => t.type === "CONTROL_ORDER" && t.subjectId);
+    if (ctl.length) {
+      const orderIds = [...new Set(ctl.map((t) => t.subjectId!))];
+      const [orders, lines] = await Promise.all([
+        prisma.externalOrder.findMany({ where: { companyId: s.companyId, id: { in: orderIds } }, select: { id: true, externalId: true } }),
+        prisma.externalOrderLine.findMany({ where: { orderId: { in: orderIds } }, select: { orderId: true, requiredQty: true } }),
+      ]);
+      const orderById = new Map(orders.map((o) => [o.id, o]));
+      const agg = new Map<string, { n: number; qty: number }>();
+      for (const l of lines) { const a = agg.get(l.orderId) ?? { n: 0, qty: 0 }; a.n += 1; a.qty += l.requiredQty.toNumber(); agg.set(l.orderId, a); }
+      for (const t of ctl) {
+        const o = orderById.get(t.subjectId!); const a = agg.get(t.subjectId!) ?? { n: 0, qty: 0 };
+        if (o) controlCards[t.id] = { externalId: o.externalId, positions: a.n, units: String(a.qty) };
+      }
+    }
+  }
+
   // Пакет 8: контекст текущей задачи размещения (ISSUE_ORDER) и выдачи (DELIVER_ORDER).
   let issueOrder = null as Awaited<ReturnType<typeof getIssueOrderContext>> | null;
   let deliverOrder = null as Awaited<ReturnType<typeof getDeliverOrderContext>> | null;
@@ -385,6 +406,7 @@ export default async function TasksPage({
       <WorkerTasks
         serverNow={new Date().toISOString()}
         loaderCards={loaderCards}
+        controlCards={controlCards}
         current={current ? toDTO(current) : null}
         urgent={assigned.filter((t) => t.priority === "URGENT").map(toDTO)}
         normal={assigned.filter((t) => t.priority === "NORMAL").map(toDTO)}
