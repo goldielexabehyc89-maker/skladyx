@@ -69,7 +69,7 @@ export default async function ExternalOrderPage({ params }: { params: Promise<{ 
           {orderQrView ? (
             <OrderQr svg={orderQrView.svg} png={orderQrView.png} code={orderQrView.code} url={orderQrView.url} />
           ) : orderQrMissing ? (
-            <div role="alert" className="rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-700">QR заказа не найден. Сообщите администратору — переимпорт заказа создаст его.</div>
+            <div role="alert" className="rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-700">QR заказа не найден. Обратитесь к администратору — потребуется ручное восстановление QR (повторный импорт того же заказа его не создаёт).</div>
           ) : null}
         </Card>
       )}

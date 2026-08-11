@@ -518,6 +518,13 @@ export async function pickOrderScan(input: {
     }
     if (task.status !== "IN_PROGRESS") throw new ExternalOrderError("Задача сборки не в работе");
 
+    // Задача M (коррекция): финальная транзакция обязана сверить скан именно с ДЕТЕРМИНИРОВАННЫМ следующим
+    // резервом (тем, что показывает UI), а не с любым валидным резервом заказа. Под lockCompany — атомарно.
+    const nextTx = await pickNextReservation(tx, input.companyId, order.id);
+    if (!nextTx) throw new ExternalOrderError("Нет активного резерва для сборки");
+    if (cellId !== nextTx.cellId || groupId !== nextTx.handlingGroupId)
+      throw new ExternalOrderError(`Скан не соответствует следующему резерву — соберите ячейку ${nextTx.cellCode}`);
+
     await lockCell(tx, input.companyId, cellId);
     // резерв ЭТОГО заказа для этой группы в этой ячейке — связывает заказ+группу+товар+ячейку+резерв
     const reservations = await tx.stockReservation.findMany({
@@ -610,14 +617,14 @@ export async function reportPickShortage(input: { companyId: string; userId: str
 // ── PICK-001: детерминированный следующий незавершённый резерв заказа. Единица сборки — (ячейка, группа):
 // финальный скан собирает ВСЕ активные резервы этого заказа в (ячейке, группе) сразу. Порядок обхода —
 // по коду ячейки ASC, затем группа/создание. Возвращает точную требуемую ячейку, товар и количество. ──
-async function pickNextReservation(companyId: string, orderId: string) {
-  const resvs = await prisma.stockReservation.findMany({
+async function pickNextReservation(client: Tx, companyId: string, orderId: string) {
+  const resvs = await client.stockReservation.findMany({
     where: { orderId, status: "ACTIVE", cellId: { not: null }, handlingGroupId: { not: null } },
     orderBy: [{ createdAt: "asc" }, { id: "asc" }],
   });
   if (resvs.length === 0) return null;
   const cellIds = [...new Set(resvs.map((r) => r.cellId!).filter(Boolean))];
-  const cells = await prisma.cell.findMany({ where: { companyId, id: { in: cellIds } }, select: { id: true, code: true, level: true } });
+  const cells = await client.cell.findMany({ where: { companyId, id: { in: cellIds } }, select: { id: true, code: true, level: true } });
   const cellById = new Map(cells.map((c) => [c.id, c]));
   // детерминированный выбор: сначала по коду ячейки, затем по группе, затем по created (стабильный tie-break)
   const sorted = [...resvs].sort((a, b) => {
@@ -627,8 +634,8 @@ async function pickNextReservation(companyId: string, orderId: string) {
     return a.createdAt.getTime() - b.createdAt.getTime();
   });
   const head = sorted[0];
-  const group = await prisma.handlingGroup.findFirst({ where: { id: head.handlingGroupId!, companyId }, select: { itemId: true } });
-  const item = group ? await prisma.item.findFirst({ where: { id: group.itemId, companyId }, select: { id: true, name: true } }) : null;
+  const group = await client.handlingGroup.findFirst({ where: { id: head.handlingGroupId!, companyId }, select: { itemId: true } });
+  const item = group ? await client.item.findFirst({ where: { id: group.itemId, companyId }, select: { id: true, name: true } }) : null;
   // всё количество этой (ячейка, группа) — как соберёт финальный скан
   const qty = resvs
     .filter((r) => r.cellId === head.cellId && r.handlingGroupId === head.handlingGroupId)
@@ -646,7 +653,7 @@ async function loadActivePick(companyId: string, userId: string, taskId: string)
   if (task.status !== "IN_PROGRESS") throw new ExternalOrderError("Задача сборки не в работе");
   const order = await prisma.externalOrder.findFirst({ where: { id: task.subjectId ?? "", companyId } });
   if (!order) throw new ExternalOrderError("Заказ не найден");
-  const next = await pickNextReservation(companyId, order.id);
+  const next = await pickNextReservation(prisma, companyId, order.id);
   if (!next) throw new ExternalOrderError("Все резервы заказа уже собраны");
   return { task, order, next };
 }
@@ -684,7 +691,7 @@ export async function getPickOrderContext(companyId: string, taskId: string) {
   const totalRequired = lines.reduce((s, l) => s.plus(l.requiredQty), D(0));
   const totalPicked = lines.reduce((s, l) => s.plus(l.pickedQty), D(0));
   const linesDone = lines.filter((l) => l.pickedQty.gte(l.requiredQty)).length;
-  const next = await pickNextReservation(companyId, order.id);
+  const next = await pickNextReservation(prisma, companyId, order.id);
   return {
     orderId: order.id,
     externalId: order.externalId,

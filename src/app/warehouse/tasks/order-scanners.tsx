@@ -128,7 +128,9 @@ export function PickOrderScanner({ ctx, taskId }: { ctx: PickOrderCtx; taskId: s
       onBackToList={() => setScanning(false)}
       onClose={closeAll}
       error={error}
-      onErrorRetry={() => setError(null)}
+      // Задача M (коррекция): «Повторить» немедленно возвращает к сканированию ТЕКУЩЕГО шага (камера/ручной
+      // ввод сразу активны). На шаге количества скан не нужен — остаёмся в окне подтверждения с полем.
+      onErrorRetry={() => { setError(null); if (step === "cell" || step === "product") setScanning(true); }}
       onErrorExit={() => { setError(null); setScanning(false); reset(); }}
       modal={
         finished

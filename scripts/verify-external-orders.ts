@@ -274,6 +274,27 @@ async function main() {
   ok("недостача после завершения (IN_CONTROL) отклонена", shortAfter.includes("уже собран") || shortAfter.includes("в работе"));
   await resetScenario();
 
+  console.log("7b) финальная транзакция сверяет ИМЕННО следующий детерминированный резерв (валидный, но не следующий → отказ)");
+  await seedGroup(itemA, await cellId("EO-L1A"), 3, new Date(now.getTime() - 30_000));
+  const g7bB = await seedGroup(itemB, await cellId("EO-L1B"), 3, new Date(now.getTime() - 20_000));
+  const oNext = await imp("EO-NEXT", [{ externalLineId: "1", itemId: itemA, requiredQty: 3 }, { externalLineId: "2", itemId: itemB, requiredQty: 3 }]);
+  await reserveAndPlanOrder({ companyId, orderId: oNext.orderId });
+  const ptN = await pickTask(oNext.orderId);
+  await rebalanceQueuedTasks(companyId, { warehouseId: W });
+  await startWorkflowTask(pk, companyId, ptN!.id);
+  const ccB = await cellCode(await cellId("EO-L1B")), ccA = await cellCode(await cellId("EO-L1A"));
+  const ctxNext0 = await getPickOrderContext(companyId, ptN!.id);
+  ok("getPickOrderContext.next: детерминированная следующая ячейка EO-L1A", ctxNext0?.next?.cell === "EO-L1A");
+  const mvB0 = await mvCount(g7bB.lotId);
+  const notNext = await err(() => pickOrderScan({ companyId, userId: pk, taskId: ptN!.id, cellCode: ccB, ean: eanOf(itemB), qty: 3 }));
+  ok("финальный скан НЕ следующего резерва (EO-L1B) отклонён", notNext.includes("следующему резерву"));
+  ok("отклонение НЕ создало движения (EO-L1B)", (await mvCount(g7bB.lotId)) === mvB0);
+  await pickOrderScan({ companyId, userId: pk, taskId: ptN!.id, cellCode: ccA, ean: eanOf(itemA), qty: 3 });
+  ok("после сбора EO-L1A следующий резерв — EO-L1B", (await getPickOrderContext(companyId, ptN!.id))?.next?.cell === "EO-L1B");
+  await pickOrderScan({ companyId, userId: pk, taskId: ptN!.id, cellCode: ccB, ean: eanOf(itemB), qty: 3 });
+  ok("сбор EO-L1B завершает заказ (IN_CONTROL)", (await orderStatus(oNext.orderId)) === "IN_CONTROL");
+  await resetScenario();
+
   console.log("8) уровень 3+: цепочка перестановки вниз (свободная нижняя) → сборка с ур.1");
   const g8 = await seedGroup(itemA, await cellId("EO-U3A"), 6, new Date(now.getTime() - 20_000)); // на ур.3
   const o8 = await imp("EO-MOVE1", [{ externalLineId: "1", itemId: itemA, requiredQty: 6 }]);
