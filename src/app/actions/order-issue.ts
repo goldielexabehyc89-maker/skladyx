@@ -5,9 +5,6 @@ import { requireUser } from "@/lib/auth";
 import { scoped } from "@/lib/tenant";
 import { orderIssueEnabled } from "@/lib/roles";
 import {
-  placeOrderGroup,
-  addIssueCell,
-  finishIssuePlacement,
   issueOrderToDriver,
   verifyIssueOrderScan,
   placeWholeOrderInIssueCell,
@@ -27,25 +24,6 @@ const OFF: IssueActionState = { error: "Выдача заказов сейчас
 function msg(e: unknown): string {
   if (e instanceof OrderIssueError) return e.message;
   return "Не удалось выполнить операцию";
-}
-
-// Погрузчик размещает: скан QR заказа + зарезервированной ячейки + группы/партии.
-export async function placeGroupAction(_prev: IssueActionState, formData: FormData): Promise<IssueActionState> {
-  if (!orderIssueEnabled()) return OFF;
-  const session = await requireUser();
-  const s = scoped(session);
-  const taskId = String(formData.get("taskId") ?? "").trim();
-  const orderCode = String(formData.get("orderCode") ?? "").trim();
-  const cellCode = String(formData.get("cellCode") ?? "").trim();
-  const ean = String(formData.get("ean") ?? "").trim();
-  if (!orderCode || !cellCode || !ean) return { error: "Отсканируйте QR заказа, ячейку и EAN товара" };
-  try {
-    await placeOrderGroup({ companyId: s.companyId, userId: session.userId, taskId, orderCode, cellCode, ean });
-    revalidatePath("/warehouse/tasks");
-    return { ok: true };
-  } catch (e) {
-    return { error: msg(e) };
-  }
 }
 
 // ISSUE-002 v1 (Задача N): шаг 1 — read-only проверка скана QR заказа (без изменения БД). Клиент
@@ -77,38 +55,6 @@ export async function placeWholeOrderAction(_prev: IssueActionState, formData: F
   if (!orderCode || !cellCode) return { error: "Отсканируйте QR заказа и назначенную ячейку" };
   try {
     await placeWholeOrderInIssueCell({ companyId: s.companyId, userId: session.userId, taskId, orderCode, cellCode });
-    return { ok: true };
-  } catch (e) {
-    return { error: msg(e) };
-  }
-}
-
-// «Добавить ячейку»: скан свободной ячейки выдачи → бронь под заказ.
-export async function addCellAction(_prev: IssueActionState, formData: FormData): Promise<IssueActionState> {
-  if (!orderIssueEnabled()) return OFF;
-  const session = await requireUser();
-  const s = scoped(session);
-  const taskId = String(formData.get("taskId") ?? "").trim();
-  const cellCode = String(formData.get("cellCode") ?? "").trim();
-  if (!cellCode) return { error: "Отсканируйте QR свободной ячейки выдачи" };
-  try {
-    await addIssueCell({ companyId: s.companyId, userId: session.userId, taskId, cellCode });
-    revalidatePath("/warehouse/tasks");
-    return { ok: true };
-  } catch (e) {
-    return { error: msg(e) };
-  }
-}
-
-// «Готово»: доступно только когда весь заказ перемещён из CONTROL.
-export async function finishPlacementAction(_prev: IssueActionState, formData: FormData): Promise<IssueActionState> {
-  if (!orderIssueEnabled()) return OFF;
-  const session = await requireUser();
-  const s = scoped(session);
-  const taskId = String(formData.get("taskId") ?? "").trim();
-  try {
-    await finishIssuePlacement({ companyId: s.companyId, userId: session.userId, taskId });
-    revalidatePath("/warehouse/tasks");
     return { ok: true };
   } catch (e) {
     return { error: msg(e) };

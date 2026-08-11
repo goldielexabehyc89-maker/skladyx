@@ -12,7 +12,7 @@ import { createQrIn } from "@/lib/qr";
 import { startWorkflowTask, rebalanceQueuedTasks } from "@/lib/workflow-tasks";
 import { importExternalOrder, reserveAndPlanOrder, pickOrderScan } from "@/lib/external-orders";
 import { scanOrderForControl, markOrderControlByScan, finishOrderControl } from "@/lib/order-control";
-import { placeOrderGroup, addIssueCell, finishIssuePlacement, issueOrderToDriver, getIssueOrderContext } from "@/lib/order-issue";
+import { verifyIssueOrderScan, placeWholeOrderInIssueCell, issueOrderToDriver, getIssueOrderContext } from "@/lib/order-issue";
 import { assertCellNotHeldByGroup } from "@/lib/cells";
 
 const prisma = new PrismaClient();
@@ -123,17 +123,22 @@ const taskAssignee = async (taskId: string) => (await prisma.workflowTask.findUn
 const reservedCellCode = async (orderId: string) => cellCode((await activeCells(orderId))[0].cellId);
 const allActiveCellCodes = async (orderId: string) => Promise.all((await activeCells(orderId)).map((c) => cellCode(c.cellId)));
 
-// разместить весь заказ (все строки в первую ячейку) + завершить + выдать (скан ВСЕХ активных ячеек)
+// ISSUE-002 v1: разместить ВЕСЬ заказ в назначенную ячейку (один скан) + выдать водителю.
 async function fullyIssue(orderId: string) {
   const tid = await startLoaderTask(orderId, "ISSUE_ORDER");
   const uid = await taskAssignee(tid);
-  const firstCell = await reservedCellCode(orderId);
+  const cell = await reservedCellCode(orderId);
   const oc = await orderQr(orderId);
-  for (const l of await orderLines(orderId)) await placeOrderGroup({ companyId, userId: uid, taskId: tid, orderCode: oc, cellCode: firstCell, ean: await lineEan(orderId, l.id) });
-  await finishIssuePlacement({ companyId, userId: uid, taskId: tid });
+  await placeWholeOrderInIssueCell({ companyId, userId: uid, taskId: tid, orderCode: oc, cellCode: cell });
   const dtid = await startLoaderTask(orderId, "DELIVER_ORDER");
   const duid = await taskAssignee(dtid);
   await issueOrderToDriver({ companyId, userId: duid, taskId: dtid, orderCode: oc, cellCodes: await allActiveCellCodes(orderId) });
+}
+// только выдача (заказ уже размещён) — освобождает ячейку/погрузчика
+async function deliverOrder(orderId: string) {
+  const d = await startLoaderTask(orderId, "DELIVER_ORDER");
+  const du = await taskAssignee(d);
+  await issueOrderToDriver({ companyId, userId: du, taskId: d, orderCode: await orderQr(orderId), cellCodes: await allActiveCellCodes(orderId) });
 }
 
 async function setIssueActive(activeCodes: string[]) {
@@ -208,201 +213,163 @@ async function cleanup() {
 async function main() {
   await provision();
   await setIssueActive(["OI-I1", "OI-I2", "OI-I3", "OI-I4", "OI-I5", "OI-I6"]);
+  const humanCode = async (cid: string) => (await prisma.cell.findUniqueOrThrow({ where: { id: cid } })).code;
 
   console.log("S1) Контроль пройден → авто-резерв ОДНОЙ ячейки выдачи + срочная ISSUE_ORDER (LOADER)");
   const o1 = await toControlPassed("OI-1", [{ externalLineId: "1", itemId: itemA, qty: 5, cell: "OI-L1A" }]);
   ok("[S1] заказ MOVING_TO_ISSUE", (await orderStatus(o1)) === "MOVING_TO_ISSUE", await orderStatus(o1));
   const it1 = await issueTaskOf(o1);
-  ok("[S1] ISSUE_ORDER создана: LOADER, URGENT, назначена погрузчику", !!it1 && it1.requiredRole === "LOADER" && it1.priority === "URGENT" && it1.assignedUserId === lo, `${it1?.priority}/${it1?.assignedUserId}`);
-  const cells1 = await activeCells(o1);
-  ok("[S1] ровно одна ячейка RESERVED", cells1.length === 1 && cells1[0].status === "RESERVED", `n=${cells1.length}`);
+  ok("[S1] ISSUE_ORDER создана: LOADER, URGENT, назначена", !!it1 && it1.requiredRole === "LOADER" && it1.priority === "URGENT" && !!it1.assignedUserId);
+  const c1 = await activeCells(o1);
+  ok("[S1] ровно одна ячейка RESERVED", c1.length === 1 && c1[0].status === "RESERVED", `n=${c1.length}`);
   const lotA1 = await lotOfLine(o1, (await orderLines(o1))[0].id);
-  ok("[S11] после контроля весь товар в зоне CONTROL (5), в ячейке выдачи 0", (await zoneBal(lotA1, zControl)) === 5 && (await cellBal(lotA1, cells1[0].cellId)) === 0);
+  ok("[S1] весь товар в CONTROL (5), в ячейке 0", (await zoneBal(lotA1, zControl)) === 5 && (await cellBal(lotA1, c1[0].cellId)) === 0);
 
-  console.log("S1) размещение: скан заказа+ячейки+группы → перемещение CONTROL→ячейка через ядро");
-  const t1 = await startLoaderTask(o1, "ISSUE_ORDER");
-  const cc1 = await cellCode(cells1[0].cellId);
-  const mvBeforePlace = await lotMv(lotA1);
-  const r1 = await placeOrderGroup({ companyId, userId: lo, taskId: t1, orderCode: await orderQr(o1), cellCode: cc1, ean: await lineEan(o1, (await orderLines(o1))[0].id) });
-  ok("[S1] размещено (не повтор)", r1.placed && !r1.alreadyPlaced);
-  ok("[S11] товар перемещён в ячейку (ядро, +1 движение): в ячейке 5, в CONTROL 0", (await cellBal(lotA1, cells1[0].cellId)) === 5 && (await zoneBal(lotA1, zControl)) === 0 && (await lotMv(lotA1)) === mvBeforePlace + 1);
-  ok("[S1] ячейка стала PLACED", (await prisma.orderIssueCell.findUniqueOrThrow({ where: { id: cells1[0].id } })).status === "PLACED");
-  const placeCount1 = await prisma.orderIssuePlacement.count({ where: { orderId: o1 } });
-  ok("[S1] создана строка размещения (order,lot)", placeCount1 === 1);
+  const t1 = await startLoaderTask(o1, "ISSUE_ORDER"); const u1 = await taskAssignee(t1);
+  const cc1 = await cellCode(c1[0].cellId); const o1qr = await orderQr(o1);
 
-  console.log("S10) идемпотентность размещения: повтор скана → без второго движения/строки");
-  const mvAfterPlace = await lotMv(lotA1);
-  const r1r = await placeOrderGroup({ companyId, userId: lo, taskId: t1, orderCode: await orderQr(o1), cellCode: cc1, ean: await lineEan(o1, (await orderLines(o1))[0].id) });
-  ok("[S10] повтор размещения идемпотентен (alreadyPlaced, без движения, без дубля строки)", r1r.alreadyPlaced && (await lotMv(lotA1)) === mvAfterPlace && (await prisma.orderIssuePlacement.count({ where: { orderId: o1 } })) === 1);
-
-  console.log("S1) «Готово» → READY_FOR_DRIVER + задача выдачи (DELIVER_ORDER)");
-  const finR = await finishIssuePlacement({ companyId, userId: lo, taskId: t1 });
-  ok("[S1] размещение завершено, заказ READY_FOR_DRIVER", finR.ready && (await orderStatus(o1)) === "READY_FOR_DRIVER");
-  ok("[S1] ISSUE_ORDER COMPLETED", (await issueTaskOf(o1))?.status === "COMPLETED");
-  const dt1 = await deliverTaskOf(o1);
-  ok("[S1] DELIVER_ORDER создана (LOADER), dueAt учитывает приезд", !!dt1 && dt1.requiredRole === "LOADER" && dt1.type === "DELIVER_ORDER");
-
-  console.log("S1/S12/S13) выдача водителю: скан заказа + ячейки → расход через ядро, без подтверждения водителя");
-  const dtid1 = await startLoaderTask(o1, "DELIVER_ORDER");
-  const mvBeforeIssue = await lotMv(lotA1);
-  const iss1 = await issueOrderToDriver({ companyId, userId: lo, taskId: dtid1, orderCode: await orderQr(o1), cellCodes: [cc1] });
-  ok("[S1] выдано (не повтор)", iss1.issued && !iss1.alreadyIssued);
-  ok("[S1] заказ ISSUED", (await orderStatus(o1)) === "ISSUED", await orderStatus(o1));
-  ok("[S11] расход во внешний мир через ядро (+1 движение), остаток партии = 0 везде", (await totalBal(lotA1)) === 0 && (await lotMv(lotA1)) === mvBeforeIssue + 1);
-  const ship1 = await prisma.orderShipment.findUnique({ where: { orderId: o1 } });
-  ok("[S13] OrderShipment создан: issuedById=погрузчик, поля подтверждения водителя нет", !!ship1 && ship1.issuedById === lo && !("driverConfirmedAt" in ship1));
-  ok("[S12] после выдачи ячейка RELEASED (свободна)", (await activeCells(o1)).length === 0 && (await prisma.orderIssueCell.count({ where: { orderId: o1, status: "RELEASED" } })) === 1);
-  ok("[S1] DELIVER_ORDER COMPLETED", (await deliverTaskOf(o1))?.status === "COMPLETED");
-
-  console.log("S10) идемпотентность выдачи: повтор → без второго расхода");
-  const dtid1b = await startLoaderTask(o1, "DELIVER_ORDER").catch(() => dtid1);
-  const mvAfterIssue = await lotMv(lotA1);
-  const iss1r = await issueOrderToDriver({ companyId, userId: lo, taskId: dtid1b, orderCode: await orderQr(o1), cellCodes: [cc1] });
-  ok("[S10] повтор выдачи идемпотентен (alreadyIssued, без второго движения)", iss1r.alreadyIssued && (await lotMv(lotA1)) === mvAfterIssue);
-
-  console.log("S2/S7/S9) большой заказ → несколько ячеек");
-  const o2 = await toControlPassed("OI-2", [{ externalLineId: "1", itemId: itemA, qty: 4, cell: "OI-L1B" }, { externalLineId: "2", itemId: itemB, qty: 3, cell: "OI-L1C" }]);
-  const [o2a, o2b] = await orderLines(o2);
-  const t2 = await startLoaderTask(o2, "ISSUE_ORDER");
-  const cell2a = await reservedCellCode(o2);
-  await placeOrderGroup({ companyId, userId: lo, taskId: t2, orderCode: await orderQr(o2), cellCode: cell2a, ean: await lineEan(o2, o2a.id) });
-  const eEarly = await err(() => finishIssuePlacement({ companyId, userId: lo, taskId: t2 }));
-  ok("[S7] нельзя «Готово», пока не весь заказ перемещён из контроля", /Не весь заказ перемещён/.test(eEarly), eEarly);
-  const addRes = await addIssueCell({ companyId, userId: lo, taskId: t2, cellCode: await cellCode(await cellId("OI-I2")) });
-  ok("[S2] «Добавить ячейку» → вторая ячейка зарезервирована", addRes.added && !addRes.alreadyReserved && (await activeCells(o2)).length === 2);
-  await placeOrderGroup({ companyId, userId: lo, taskId: t2, orderCode: await orderQr(o2), cellCode: await cellCode(await cellId("OI-I2")), ean: await lineEan(o2, o2b.id) });
-  const lotB2 = await lotOfLine(o2, o2b.id);
-  ok("[S2] itemB размещён во вторую ячейку", (await cellBal(lotB2, await cellId("OI-I2"))) === 3);
-  const fin2 = await finishIssuePlacement({ companyId, userId: lo, taskId: t2 });
-  ok("[S2] «Готово» после размещения всего заказа → READY_FOR_DRIVER", fin2.ready && (await orderStatus(o2)) === "READY_FOR_DRIVER");
-  const dt2 = await startLoaderTask(o2, "DELIVER_ORDER");
-  const codes2 = await allActiveCellCodes(o2);
-  ok("[S2] у заказа две активные ячейки выдачи", codes2.length === 2);
-  const o2qr = await orderQr(o2);
-  const ePartial = await err(() => issueOrderToDriver({ companyId, userId: lo, taskId: dt2, orderCode: o2qr, cellCodes: [codes2[0]] }));
-  ok("[S9] выдача требует скан ВСЕХ ячеек (одной мало)", /не все ячейки/.test(ePartial), ePartial);
-  const iss2 = await issueOrderToDriver({ companyId, userId: lo, taskId: dt2, orderCode: o2qr, cellCodes: codes2 });
-  ok("[S2/S12] выдача при полном наборе ячеек → ISSUED, обе ячейки освобождены", iss2.issued && (await orderStatus(o2)) === "ISSUED" && (await activeCells(o2)).length === 0);
-
-  console.log("S8) изоляция: чужой tenant / чужой заказ / неверный QR / чужой исполнитель");
-  const o3 = await toControlPassed("OI-3", [{ externalLineId: "1", itemId: itemA, qty: 2, cell: "OI-L1D" }]);
-  const t3 = await startLoaderTask(o3, "ISSUE_ORDER");
-  const cc3 = await reservedCellCode(o3);
-  const gc3 = eanOf(itemA);
+  console.log("S2) read-only проверка QR: неверный/чужой отклонён, верный → ok + код ячейки; БД не меняется");
+  const mvV0 = await lotMv(lotA1);
+  const eBadQr = await err(async () => verifyIssueOrderScan({ companyId, userId: u1, taskId: t1, orderCode: "ZZZZZZZZZZ" }));
+  ok("[S2] неверный QR отклонён", eBadQr.length > 0, eBadQr);
   const demoOrder = await prisma.externalOrder.create({ data: { companyId: demoId, warehouseId: DW, externalId: "OI-DEMO", status: "CONTROL_PASSED", payloadHash: "x", createdById: pk } });
   const demoQr = await prisma.$transaction((tx) => createQrIn(tx, { companyId: demoId, type: "ORDER", refId: demoOrder.id }));
-  const eForeign = await err(() => placeOrderGroup({ companyId, userId: lo, taskId: t3, orderCode: demoQr, cellCode: cc3, ean: gc3 }));
-  ok("[S8] чужой tenant (ORDER-QR другой организации) — отказ", /этой организации/.test(eForeign), eForeign);
-  const o2qr2 = await orderQr(o2);
-  const eWrongOrder = await err(() => placeOrderGroup({ companyId, userId: lo, taskId: t3, orderCode: o2qr2, cellCode: cc3, ean: gc3 }));
-  ok("[S8] не тот заказ — отказ", /не тот заказ/.test(eWrongOrder), eWrongOrder);
-  const eBadQr = await err(() => placeOrderGroup({ companyId, userId: lo, taskId: t3, orderCode: "ZZZZZZZZZZ", cellCode: cc3, ean: gc3 }));
-  ok("[S8] неверный QR заказа — отказ", eBadQr.length > 0, eBadQr);
-  const o3qr = await orderQr(o3);
-  const eForeignTask = await err(() => placeOrderGroup({ companyId, userId: pk, taskId: t3, orderCode: o3qr, cellCode: cc3, ean: gc3 }));
-  ok("[S8] чужой исполнитель (не назначен) — отказ", /не ваша задача/.test(eForeignTask), eForeignTask);
-  await fullyIssue(o3); // довести до ISSUED (освободить ячейку)
+  const eForeignTenant = await err(async () => verifyIssueOrderScan({ companyId, userId: u1, taskId: t1, orderCode: demoQr }));
+  ok("[S2] чужой tenant отклонён", /этой организации/.test(eForeignTenant), eForeignTenant);
+  const otherOrd = await prisma.externalOrder.create({ data: { companyId, warehouseId: W, externalId: "OI-OTHER", status: "CONTROL_PASSED", payloadHash: "y", createdById: pk } });
+  const otherQr = await prisma.$transaction((tx) => createQrIn(tx, { companyId, type: "ORDER", refId: otherOrd.id }));
+  const eWrongOrder = await err(async () => verifyIssueOrderScan({ companyId, userId: u1, taskId: t1, orderCode: otherQr }));
+  ok("[S2] не тот заказ отклонён", /не тот заказ/.test(eWrongOrder), eWrongOrder);
+  const eForeignUser = await err(async () => verifyIssueOrderScan({ companyId, userId: pk, taskId: t1, orderCode: o1qr }));
+  ok("[S2] чужой исполнитель отклонён", /не ваша задача/.test(eForeignUser), eForeignUser);
+  const vok = await verifyIssueOrderScan({ companyId, userId: u1, taskId: t1, orderCode: o1qr });
+  ok("[S2] верный QR → ok + код назначенной ячейки", vok.ok && vok.cellCode === (await humanCode(c1[0].cellId)));
+  ok("[S2] проверка QR не создала движений", (await lotMv(lotA1)) === mvV0);
 
-  console.log("S3/S4) одна ячейка — под один заказ; конкурентный резерв (два погрузчика)");
-  await mkShift(lo2, "LOADER"); // второй погрузчик выходит на смену — задачи двух заказов распределятся по одному
-  const o4 = await toControlPassed("OI-4", [{ externalLineId: "1", itemId: itemA, qty: 2, cell: "OI-L1E" }]);
-  const o5 = await toControlPassed("OI-5", [{ externalLineId: "1", itemId: itemA, qty: 2, cell: "OI-L1F" }]);
-  const t4 = await startLoaderTask(o4, "ISSUE_ORDER");
-  const u4 = await taskAssignee(t4);
-  const t5 = await startLoaderTask(o5, "ISSUE_ORDER");
-  const u5 = await taskAssignee(t5);
-  ok("[S4] задачи двух заказов у РАЗНЫХ погрузчиков (обе IN_PROGRESS одновременно)", u4 !== u5, `${u4} vs ${u5}`);
-  // свободная третья ячейка, за которую конкурируют оба заказа
-  const freeCode = await cellCode(await cellId("OI-I3"));
-  const par = await Promise.allSettled([
-    addIssueCell({ companyId, userId: u4, taskId: t4, cellCode: freeCode }),
-    addIssueCell({ companyId, userId: u5, taskId: t5, cellCode: freeCode }),
-  ]);
-  const added = par.filter((r) => r.status === "fulfilled").length;
-  ok("[S4] конкурентный резерв: ровно один заказ добавил ячейку, второй отклонён", added === 1, `added=${added}`);
-  const activeOnFree = await prisma.orderIssueCell.count({ where: { cellId: await cellId("OI-I3"), status: { not: "RELEASED" } } });
-  ok("[S4] на ячейку ровно одна активная бронь (partial unique + lock)", activeOnFree === 1, `n=${activeOnFree}`);
-  // владелец ячейки I3 — тот заказ, что победил
-  const ownerOfFree = (await prisma.orderIssueCell.findFirstOrThrow({ where: { cellId: await cellId("OI-I3"), status: { not: "RELEASED" } } })).orderId;
-  const loser = ownerOfFree === o4 ? { t: t5, u: u5 } : { t: t4, u: u4 };
-  const eOccupied = await err(() => addIssueCell({ companyId, userId: loser.u, taskId: loser.t, cellCode: freeCode }));
-  ok("[S3] ячейка занята другим заказом — второй заказ получает отказ", /занята другим заказом/.test(eOccupied), eOccupied);
-  await fullyIssue(o4); await fullyIssue(o5);
-  await endShift(lo2); // возвращаем один погрузчик для детерминизма следующих сценариев
+  console.log("S3) размещение всего заказа: скан назначенной ячейки → CONTROL→ячейка (ядро), +1 движение");
+  const eWrongCell = await err(async () => placeWholeOrderInIssueCell({ companyId, userId: u1, taskId: t1, orderCode: o1qr, cellCode: await cellCode(await cellId("OI-I2")) }));
+  ok("[S3] неназначенная ячейка → ошибка без движения", /не назначенн/i.test(eWrongCell) && (await lotMv(lotA1)) === mvV0, eWrongCell);
+  const r1 = await placeWholeOrderInIssueCell({ companyId, userId: u1, taskId: t1, orderCode: o1qr, cellCode: cc1 });
+  ok("[S3] размещено (не повтор)", r1.done && !r1.alreadyDone);
+  ok("[S3] товар в ячейке 5, CONTROL 0, +1 движение", (await cellBal(lotA1, c1[0].cellId)) === 5 && (await zoneBal(lotA1, zControl)) === 0 && (await lotMv(lotA1)) === mvV0 + 1);
+  ok("[S3] ячейка PLACED", (await prisma.orderIssueCell.findUniqueOrThrow({ where: { id: c1[0].id } })).status === "PLACED");
+  ok("[S3] READY_FOR_DRIVER + ISSUE COMPLETED + ровно одна DELIVER_ORDER", (await orderStatus(o1)) === "READY_FOR_DRIVER" && (await issueTaskOf(o1))?.status === "COMPLETED" && (await prisma.workflowTask.count({ where: { type: "DELIVER_ORDER", subjectId: o1 } })) === 1);
 
-  console.log("S5/S6) нет свободной ячейки → AWAITING (без задачи); освобождение активирует ближайший ожидающий");
-  await setIssueActive(["OI-I4"]); // только одна активная свободная ячейка на складе
-  const oP = await toControlPassed("OI-P", [{ externalLineId: "1", itemId: itemA, qty: 2, cell: "OI-L1G" }], plusH(1));
-  ok("[S5] первый заказ занял единственную ячейку → MOVING_TO_ISSUE + задача", (await orderStatus(oP)) === "MOVING_TO_ISSUE" && !!(await issueTaskOf(oP)));
-  const oQ = await toControlPassed("OI-Q", [{ externalLineId: "1", itemId: itemA, qty: 2, cell: "OI-L1H" }], plusH(2));
-  const oR = await toControlPassed("OI-R", [{ externalLineId: "1", itemId: itemA, qty: 2, cell: "OI-L1A" }], plusH(3));
-  ok("[S5] нет свободной ячейки → заказ AWAITING_ISSUE_CELL, задача НЕ создана", (await orderStatus(oQ)) === "AWAITING_ISSUE_CELL" && !(await issueTaskOf(oQ)));
-  ok("[S5] второй ожидающий тоже AWAITING без задачи", (await orderStatus(oR)) === "AWAITING_ISSUE_CELL" && !(await issueTaskOf(oR)));
-  await fullyIssue(oP); // выдача oP → ячейка I4 освобождается → реобработка ожидающих
-  ok("[S6] освобождение ячейки активировало БЛИЖАЙШИЙ ожидающий (arrivalAt раньше): oQ → MOVING_TO_ISSUE + задача", (await orderStatus(oQ)) === "MOVING_TO_ISSUE" && !!(await issueTaskOf(oQ)));
-  ok("[S6] следующий по очереди (oR, приезд позже) остаётся AWAITING", (await orderStatus(oR)) === "AWAITING_ISSUE_CELL" && !(await issueTaskOf(oR)));
-  await fullyIssue(oQ); // выдача oQ → ячейка → oR активируется
-  ok("[S6] после следующего освобождения активируется oR", (await orderStatus(oR)) === "MOVING_TO_ISSUE" && !!(await issueTaskOf(oR)));
-  await fullyIssue(oR);
+  console.log("S5) точная идемпотентность ПОСЛЕ COMPLETED: проверка QR/ячейки, повтор без движения/DELIVER");
+  const mvC0 = await lotMv(lotA1);
+  const eIdemBadOrder = await err(async () => placeWholeOrderInIssueCell({ companyId, userId: u1, taskId: t1, orderCode: otherQr, cellCode: cc1 }));
+  ok("[S5] неверный QR после COMPLETED → отказ (не тот заказ)", /не тот заказ/.test(eIdemBadOrder), eIdemBadOrder);
+  const eIdemBadCell = await err(async () => placeWholeOrderInIssueCell({ companyId, userId: u1, taskId: t1, orderCode: o1qr, cellCode: await cellCode(await cellId("OI-I3")) }));
+  ok("[S5] неверная ячейка после COMPLETED → отказ", /не назначенн/i.test(eIdemBadCell), eIdemBadCell);
+  const rep = await placeWholeOrderInIssueCell({ companyId, userId: u1, taskId: t1, orderCode: o1qr, cellCode: cc1 });
+  ok("[S5] точный повтор → alreadyDone, без второго движения/строки/DELIVER", rep.alreadyDone && (await lotMv(lotA1)) === mvC0 && (await prisma.orderIssuePlacement.count({ where: { orderId: o1 } })) === 1 && (await prisma.workflowTask.count({ where: { type: "DELIVER_ORDER", subjectId: o1 } })) === 1);
 
-  console.log("P1.1) две заявки из ОДНОЙ партии в общей зоне CONTROL не смешиваются");
-  await setIssueActive(["OI-I1", "OI-I2", "OI-I3", "OI-I4", "OI-I5", "OI-I6"]);
-  await mkShift(lo2, "LOADER"); // два погрузчика → задачи двух заказов распределяются по одному на каждого
-  const shLot = await seedGroup(itemA, await cellId("OI-L1A"), 10); // одна партия 10 шт на два заказа
+  console.log("S8) выдача водителю: расход через ядро, ячейка RELEASED, shipment; идемпотентно");
+  const dtid1 = await startLoaderTask(o1, "DELIVER_ORDER"); const du1 = await taskAssignee(dtid1);
+  const mvBI = await lotMv(lotA1);
+  const iss1 = await issueOrderToDriver({ companyId, userId: du1, taskId: dtid1, orderCode: o1qr, cellCodes: [cc1] });
+  ok("[S8] выдано, ISSUED, остаток 0, +1 движение (расход)", iss1.issued && (await orderStatus(o1)) === "ISSUED" && (await totalBal(lotA1)) === 0 && (await lotMv(lotA1)) === mvBI + 1);
+  ok("[S8] ячейка RELEASED + shipment создан", (await activeCells(o1)).length === 0 && !!(await prisma.orderShipment.findUnique({ where: { orderId: o1 } })));
+  const mvAI = await lotMv(lotA1);
+  const iss1r = await issueOrderToDriver({ companyId, userId: du1, taskId: dtid1, orderCode: o1qr, cellCodes: [cc1] });
+  ok("[S8] повтор выдачи идемпотентен (без второго расхода)", iss1r.alreadyIssued && (await lotMv(lotA1)) === mvAI);
+
+  console.log("S4) многострочный заказ (2 партии) размещается ОДНИМ сканом ячейки (+2 движения)");
+  const o4 = await toControlPassed("OI-4", [{ externalLineId: "1", itemId: itemA, qty: 4, cell: "OI-L1B" }, { externalLineId: "2", itemId: itemB, qty: 3, cell: "OI-L1C" }]);
+  const [o4a, o4b] = await orderLines(o4);
+  const t4 = await startLoaderTask(o4, "ISSUE_ORDER"); const u4 = await taskAssignee(t4);
+  const c4 = (await activeCells(o4))[0]; const cc4 = await cellCode(c4.cellId);
+  const lot4a = await lotOfLine(o4, o4a.id), lot4b = await lotOfLine(o4, o4b.id);
+  const mv4 = (await lotMv(lot4a)) + (await lotMv(lot4b));
+  await placeWholeOrderInIssueCell({ companyId, userId: u4, taskId: t4, orderCode: await orderQr(o4), cellCode: cc4 });
+  ok("[S4] обе партии в ячейке (4,3), CONTROL 0, +2 движения, 2 placement", (await cellBal(lot4a, c4.cellId)) === 4 && (await cellBal(lot4b, c4.cellId)) === 3 && (await zoneBal(lot4a, zControl)) === 0 && (await zoneBal(lot4b, zControl)) === 0 && ((await lotMv(lot4a)) + (await lotMv(lot4b))) === mv4 + 2 && (await prisma.orderIssuePlacement.count({ where: { orderId: o4 } })) === 2);
+  ok("[S4] READY_FOR_DRIVER + ровно одна DELIVER", (await orderStatus(o4)) === "READY_FOR_DRIVER" && (await prisma.workflowTask.count({ where: { type: "DELIVER_ORDER", subjectId: o4 } })) === 1);
+  await deliverOrder(o4);
+
+  console.log("S6) валидация назначенной ячейки: неактивна / перенесена в другую зону → fail-closed без движения");
+  const o6 = await toControlPassed("OI-6", [{ externalLineId: "1", itemId: itemA, qty: 2, cell: "OI-L1D" }]);
+  const t6 = await startLoaderTask(o6, "ISSUE_ORDER"); const u6 = await taskAssignee(t6);
+  const ic6 = (await activeCells(o6))[0]; const cc6 = await cellCode(ic6.cellId); const o6qr = await orderQr(o6);
+  const lot6 = await lotOfLine(o6, (await orderLines(o6))[0].id); const mv6 = await lotMv(lot6);
+  await prisma.cell.update({ where: { id: ic6.cellId }, data: { isActive: false } });
+  const eInactiveV = await err(async () => verifyIssueOrderScan({ companyId, userId: u6, taskId: t6, orderCode: o6qr }));
+  ok("[S6] неактивная ячейка → verify fail-closed (без зелёного)", /недоступна/.test(eInactiveV), eInactiveV);
+  const eInactiveP = await err(async () => placeWholeOrderInIssueCell({ companyId, userId: u6, taskId: t6, orderCode: o6qr, cellCode: cc6 }));
+  ok("[S6] неактивная ячейка → place fail-closed без движения", /недоступна/.test(eInactiveP) && (await lotMv(lot6)) === mv6, eInactiveP);
+  await prisma.cell.update({ where: { id: ic6.cellId }, data: { isActive: true } });
+  await prisma.cell.update({ where: { id: ic6.cellId }, data: { zoneId: zStorage } });
+  const eZoneV = await err(async () => verifyIssueOrderScan({ companyId, userId: u6, taskId: t6, orderCode: o6qr }));
+  ok("[S6] перенос в другую зону → verify fail-closed", /не в зоне выдачи/.test(eZoneV), eZoneV);
+  const eZoneP = await err(async () => placeWholeOrderInIssueCell({ companyId, userId: u6, taskId: t6, orderCode: o6qr, cellCode: cc6 }));
+  ok("[S6] перенос в другую зону → place fail-closed без движения", /не в зоне выдачи/.test(eZoneP) && (await lotMv(lot6)) === mv6, eZoneP);
+  await prisma.cell.update({ where: { id: ic6.cellId }, data: { zoneId: zIssue } });
+  await placeWholeOrderInIssueCell({ companyId, userId: u6, taskId: t6, orderCode: o6qr, cellCode: cc6 });
+  ok("[S6] после восстановления ячейки размещение выполнено", (await orderStatus(o6)) === "READY_FOR_DRIVER");
+  await deliverOrder(o6);
+
+  console.log("S7) fail-closed: 0 или >1 назначенных ячеек — без движения");
+  const o7 = await toControlPassed("OI-7", [{ externalLineId: "1", itemId: itemA, qty: 2, cell: "OI-L1E" }]);
+  const t7 = await startLoaderTask(o7, "ISSUE_ORDER"); const u7 = await taskAssignee(t7);
+  const ic7 = (await activeCells(o7))[0]; const cc7 = await cellCode(ic7.cellId); const o7qr = await orderQr(o7);
+  const lot7 = await lotOfLine(o7, (await orderLines(o7))[0].id); const mv7 = await lotMv(lot7);
+  const freeIssue = await prisma.cell.findMany({ where: { warehouseId: W, zone: { kind: "ISSUE" } }, select: { id: true } });
+  const activeSet = new Set((await prisma.orderIssueCell.findMany({ where: { status: { not: "RELEASED" } }, select: { cellId: true } })).map((c) => c.cellId));
+  const spare = freeIssue.find((c) => !activeSet.has(c.id))!.id;
+  const extra = await prisma.orderIssueCell.create({ data: { companyId, orderId: o7, warehouseId: W, cellId: spare, status: "RESERVED" } });
+  const eMulti = await err(async () => placeWholeOrderInIssueCell({ companyId, userId: u7, taskId: t7, orderCode: o7qr, cellCode: cc7 }));
+  ok("[S7] >1 ячейки → fail-closed без движения", /несколько ячеек/i.test(eMulti) && (await lotMv(lot7)) === mv7, eMulti);
+  await prisma.orderIssueCell.delete({ where: { id: extra.id } });
+  await prisma.orderIssueCell.updateMany({ where: { orderId: o7, status: { not: "RELEASED" } }, data: { status: "RELEASED", releasedAt: new Date() } });
+  const eZero = await err(async () => placeWholeOrderInIssueCell({ companyId, userId: u7, taskId: t7, orderCode: o7qr, cellCode: cc7 }));
+  ok("[S7] 0 ячеек → fail-closed без движения", /не назначена ячейка/i.test(eZero) && (await lotMv(lot7)) === mv7, eZero);
+  // восстановить o7 в размещаемое состояние и довести (иначе задача остаётся IN_PROGRESS у погрузчика)
+  const activeSet2 = new Set((await prisma.orderIssueCell.findMany({ where: { status: { not: "RELEASED" } }, select: { cellId: true } })).map((c) => c.cellId));
+  const spare2 = freeIssue.find((c) => !activeSet2.has(c.id))!.id;
+  await prisma.orderIssueCell.create({ data: { companyId, orderId: o7, warehouseId: W, cellId: spare2, status: "RESERVED" } });
+  await placeWholeOrderInIssueCell({ companyId, userId: u7, taskId: t7, orderCode: o7qr, cellCode: await cellCode(spare2) });
+  await deliverOrder(o7);
+
+  console.log("S9) общая партия в CONTROL: перемещается только доля ЗАКАЗА (чужая доля цела)");
+  const shLot = await seedGroup(itemA, await cellId("OI-L1A"), 10);
   const oSA = await toControlPassed("OI-SH-A", [{ externalLineId: "1", itemId: itemA, qty: 4, cell: "OI-L1A" }], null, false);
   const oSB = await toControlPassed("OI-SH-B", [{ externalLineId: "1", itemId: itemA, qty: 4, cell: "OI-L1A" }], null, false);
-  const laA = (await orderLines(oSA))[0], laB = (await orderLines(oSB))[0];
-  ok("[P1.1] обе заявки собраны из ОДНОЙ партии", (await lotOfLine(oSA, laA.id)) === shLot && (await lotOfLine(oSB, laB.id)) === shLot);
-  ok("[P1.1] в общей зоне CONTROL 8 (4+4) по одной партии", (await zoneBal(shLot, zControl)) === 8);
-  const aCellId = (await activeCells(oSA))[0].cellId;
+  ok("[S9] обе заявки из ОДНОЙ партии, в CONTROL 8", (await lotOfLine(oSA, (await orderLines(oSA))[0].id)) === shLot && (await zoneBal(shLot, zControl)) === 8);
   const tSA = await startLoaderTask(oSA, "ISSUE_ORDER"); const uSA = await taskAssignee(tSA);
-  const ccSA = await cellCode(aCellId);
-  await placeOrderGroup({ companyId, userId: uSA, taskId: tSA, orderCode: await orderQr(oSA), cellCode: ccSA, ean: await lineEan(oSA, laA.id) });
-  ok("[P1.1] A разместил РОВНО 4 в свою ячейку (не 8)", (await cellBal(shLot, aCellId)) === 4);
-  ok("[P1.1] доля B в CONTROL не тронута (осталось 4)", (await zoneBal(shLot, zControl)) === 4);
-  ok("[P1.1] OrderIssuePlacement A = 4", Number((await prisma.orderIssuePlacement.aggregate({ where: { orderId: oSA }, _sum: { qty: true } }))._sum.qty ?? 0) === 4);
-  const ctxA = await getIssueOrderContext(companyId, tSA);
-  ok("[P1.1] remaining(A)=0 → «Готово» доступно (видит только долю A)", ctxA?.remainingInControl === "0" && ctxA?.canFinish === true);
-  const ctxB0 = await getIssueOrderContext(companyId, (await issueTaskOf(oSB))!.id);
-  ok("[P1.1] remaining(B)=4 (не тронут размещением A)", ctxB0?.remainingInControl === "4");
-  const mvSh1 = await lotMv(shLot);
-  const repA = await placeOrderGroup({ companyId, userId: uSA, taskId: tSA, orderCode: await orderQr(oSA), cellCode: ccSA, ean: await lineEan(oSA, laA.id) });
-  ok("[P1.1] повтор размещения A идемпотентен (без второго движения)", repA.alreadyPlaced && (await lotMv(shLot)) === mvSh1);
-  await finishIssuePlacement({ companyId, userId: uSA, taskId: tSA });
-  const dSA = await startLoaderTask(oSA, "DELIVER_ORDER"); const duSA = await taskAssignee(dSA);
-  await issueOrderToDriver({ companyId, userId: duSA, taskId: dSA, orderCode: await orderQr(oSA), cellCodes: [ccSA] });
-  ok("[P1.1] A выдан: из ячейки ушло 4, доля B (4) по-прежнему в CONTROL", (await orderStatus(oSA)) === "ISSUED" && (await cellBal(shLot, aCellId)) === 0 && (await zoneBal(shLot, zControl)) === 4);
-  await fullyIssue(oSB);
-  ok("[P1.1] B размещён и выдан НЕЗАВИСИМО", (await orderStatus(oSB)) === "ISSUED");
-  // партия была 10, заказы забрали 8 → в CONTROL 0, в ячейках выдачи 0, а 2 незаказанных остались в складской ячейке
-  ok("[P1.1] выдано ровно 8 (по 4 на заказ), в CONTROL 0, остаток партии 2 (незаказанное, ledger сходится)",
-    (await zoneBal(shLot, zControl)) === 0 && (await totalBal(shLot)) === 2 && (await cellBal(shLot, aCellId)) === 0);
-  await endShift(lo2); // возвращаем один погрузчик
+  const cSA = (await activeCells(oSA))[0].cellId; const ccSA = await cellCode(cSA);
+  await placeWholeOrderInIssueCell({ companyId, userId: uSA, taskId: tSA, orderCode: await orderQr(oSA), cellCode: ccSA });
+  ok("[S9] A разместил РОВНО долю 4 (не 8), доля B (4) в CONTROL цела", (await cellBal(shLot, cSA)) === 4 && (await zoneBal(shLot, zControl)) === 4);
+  const ctxB = await getIssueOrderContext(companyId, (await issueTaskOf(oSB))!.id);
+  ok("[S9] B видит только свою долю (remaining=4), назначена своя ячейка", ctxB?.remainingInControl === "4" && !!ctxB?.assignedCellCode);
+  // разместить B (его ISSUE — URGENT, погрузчик свободен после завершения A) — сначала оба размещения,
+  // затем обе выдачи: срочный ISSUE не блокирует старт обычной DELIVER, когда оба ISSUE завершены.
+  const tSB = await startLoaderTask(oSB, "ISSUE_ORDER"); const uSB = await taskAssignee(tSB);
+  await placeWholeOrderInIssueCell({ companyId, userId: uSB, taskId: tSB, orderCode: await orderQr(oSB), cellCode: await cellCode((await activeCells(oSB))[0].cellId) });
+  await deliverOrder(oSA); await deliverOrder(oSB);
+  ok("[S9] выдано ровно 8 (по 4), в CONTROL 0, остаток партии 2 (незаказанное)", (await zoneBal(shLot, zControl)) === 0 && (await totalBal(shLot)) === 2);
 
-  console.log("P1.2) гонка за ячейку ISSUE со старыми операциями");
+  console.log("S10) нет свободной ячейки → AWAITING (без задачи); освобождение активирует ближайший ожидающий");
+  await setIssueActive(["OI-I4"]);
+  const oP = await toControlPassed("OI-P", [{ externalLineId: "1", itemId: itemA, qty: 2, cell: "OI-L1F" }], plusH(1));
+  ok("[S10] первый занял единственную ячейку → MOVING_TO_ISSUE + задача", (await orderStatus(oP)) === "MOVING_TO_ISSUE" && !!(await issueTaskOf(oP)));
+  const oQ = await toControlPassed("OI-Q", [{ externalLineId: "1", itemId: itemA, qty: 2, cell: "OI-L1G" }], plusH(2));
+  ok("[S10] нет свободной ячейки → AWAITING_ISSUE_CELL, задача НЕ создана", (await orderStatus(oQ)) === "AWAITING_ISSUE_CELL" && !(await issueTaskOf(oQ)));
+  await fullyIssue(oP);
+  ok("[S10] освобождение активировало ожидающий oQ → MOVING_TO_ISSUE + задача", (await orderStatus(oQ)) === "MOVING_TO_ISSUE" && !!(await issueTaskOf(oQ)));
+  await fullyIssue(oQ);
+
+  console.log("S11) изоляция размещения: чужой tenant / не тот заказ / неверный QR / чужой исполнитель");
   await setIssueActive(["OI-I1", "OI-I2", "OI-I3", "OI-I4", "OI-I5", "OI-I6"]);
-  const oG = await toControlPassed("OI-GUARD", [{ externalLineId: "1", itemId: itemA, qty: 2, cell: "OI-L1B" }]);
-  const gCellId = (await activeCells(oG))[0].cellId;
-  const eGuard = await err(() => prisma.$transaction((tx) => assertCellNotHeldByGroup(tx, companyId, gCellId)));
-  ok("[P1.2a] старая операция в ячейку с активной бронью выдачи — отказ (симметричный guard)", /под выдачу заказа/.test(eGuard), eGuard);
-  await fullyIssue(oG);
-  // (b) старая операция занимает ISSUE-ячейку ДО авто-резерва → пропускается, берётся следующая
-  await setIssueActive(["OI-I1", "OI-I2"]);
-  await seedGroup(itemB, await cellId("OI-I1"), 3); // чужой товар (старая операция) в ячейке I1
-  const oSk = await toControlPassed("OI-SKIP", [{ externalLineId: "1", itemId: itemA, qty: 2, cell: "OI-L1C" }]);
-  const skCellId = (await activeCells(oSk))[0].cellId;
-  ok("[P1.2b] авто-резерв ПРОПУСТИЛ занятую I1 и взял свободную I2", skCellId === (await cellId("OI-I2")));
-  ok("[P1.2b] инвариант: I1 без брони заказа; ячейка заказа без чужого товара",
-    (await prisma.orderIssueCell.count({ where: { cellId: await cellId("OI-I1"), status: { not: "RELEASED" } } })) === 0
-    && (await prisma.stockBalance.count({ where: { cellId: skCellId, qty: { gt: 0 } } })) === 0);
-  await fullyIssue(oSk);
-  // (c) занята единственная активная ячейка → заказ AWAITING (свободных кандидатов нет)
-  await setIssueActive(["OI-I1"]); // I1 всё ещё занят чужим товаром (itemB)
-  const oAw = await toControlPassed("OI-AWAIT", [{ externalLineId: "1", itemId: itemA, qty: 2, cell: "OI-L1D" }]);
-  ok("[P1.2c] единственная активная ячейка занята старой операцией → заказ AWAITING без задачи", (await orderStatus(oAw)) === "AWAITING_ISSUE_CELL" && !(await issueTaskOf(oAw)));
-  // oAw остаётся AWAITING (тест-инвариант «занятая ячейка не берётся»); данные удалит cleanup
+  const o11 = await toControlPassed("OI-11", [{ externalLineId: "1", itemId: itemA, qty: 2, cell: "OI-L1H" }]);
+  const t11 = await startLoaderTask(o11, "ISSUE_ORDER"); const u11 = await taskAssignee(t11);
+  const cc11 = await cellCode((await activeCells(o11))[0].cellId); const o11qr = await orderQr(o11);
+  ok("[S11] чужой tenant отклонён", /этой организации/.test(await err(async () => placeWholeOrderInIssueCell({ companyId, userId: u11, taskId: t11, orderCode: demoQr, cellCode: cc11 }))));
+  ok("[S11] не тот заказ отклонён", /не тот заказ/.test(await err(async () => placeWholeOrderInIssueCell({ companyId, userId: u11, taskId: t11, orderCode: otherQr, cellCode: cc11 }))));
+  ok("[S11] неверный QR отклонён", (await err(async () => placeWholeOrderInIssueCell({ companyId, userId: u11, taskId: t11, orderCode: "ZZZZZZZZZZ", cellCode: cc11 }))).length > 0);
+  ok("[S11] чужой исполнитель отклонён", /не ваша задача/.test(await err(async () => placeWholeOrderInIssueCell({ companyId, userId: pk, taskId: t11, orderCode: o11qr, cellCode: cc11 }))));
+  await placeWholeOrderInIssueCell({ companyId, userId: u11, taskId: t11, orderCode: o11qr, cellCode: cc11 });
+  await deliverOrder(o11);
 
-  console.log(failures === 0 ? "\nВСЕ ПРОВЕРКИ P8 ПРОЙДЕНЫ ✓" : `\nПРОВАЛ: ${failures} проверок`);
+  console.log(failures === 0 ? "\nВСЕ ПРОВЕРКИ P8 (v1) ПРОЙДЕНЫ ✓" : `\nПРОВАЛ: ${failures} проверок`);
 }
 
 main()
