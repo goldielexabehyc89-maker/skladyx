@@ -91,14 +91,14 @@ async function main() {
   await prisma.stockBalance.create({ data: { companyId, itemId: "z-item", lotId: "z-lot", locKey: `C:${ic!.id}`, warehouseId: W1, cellId: ic!.id, qty: 5 } });
   let errLot = "";
   try { await changeCellZone({ companyId, cellId: ic!.id, zoneId: issue.id, level: null }); } catch (e) { errLot = (e as Error).message; }
-  ok("занята партией → смена зоны отклонена нужным текстом", errLot === "Нельзя изменить зону занятой ячейки. Сначала переместите товар", errLot);
+  ok("занята партией → смена зоны отклонена нужным текстом", /занятой или зарезервированной/.test(errLot), errLot);
   ok("после отказа зона не изменилась (осталась STORAGE)", (await zoneOf(ic!.id)) === storage.id);
   await prisma.stockBalance.deleteMany({ where: { cellId: ic!.id } });
   // Занимаем поштучным товаром (ItemUnit).
   await prisma.itemUnit.create({ data: { companyId, itemId: "z-item", receiptLineId: "z-rl", serial: 1, warehouseId: W1, cellId: ic!.id, status: "IN_STOCK" } });
   let errUnit = "";
   try { await changeCellZone({ companyId, cellId: ic!.id, zoneId: issue.id, level: null }); } catch (e) { errUnit = (e as Error).message; }
-  ok("занята единицей → смена зоны отклонена", errUnit === "Нельзя изменить зону занятой ячейки. Сначала переместите товар", errUnit);
+  ok("занята единицей → смена зоны отклонена", /занятой или зарезервированной/.test(errUnit), errUnit);
   await prisma.itemUnit.deleteMany({ where: { cellId: ic!.id } });
   // Пустую ячейку переносим в ISSUE — isStaging синхронизируется в true, level → null.
   await changeCellZone({ companyId, cellId: ic!.id, zoneId: issue.id, level: null });

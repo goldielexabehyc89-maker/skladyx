@@ -162,6 +162,19 @@ async function requireSingleAssignedCell(tx: Tx, companyId: string, orderId: str
   return cells[0];
 }
 
+// Фактически использованная (историческая) ячейка размещения заказа — по сохранённым
+// OrderIssuePlacement/OrderIssueCell, независимо от текущего статуса (в т.ч. после RELEASED). Нужна
+// для точной идемпотентности повтора размещения ПОСЛЕ последующей выдачи водителю.
+async function usedIssueCellId(tx: Tx, orderId: string): Promise<string | null> {
+  const placement = await tx.orderIssuePlacement.findFirst({ where: { orderId }, orderBy: { id: "asc" }, select: { issueCellId: true } });
+  if (placement) {
+    const oic = await tx.orderIssueCell.findUnique({ where: { id: placement.issueCellId }, select: { cellId: true } });
+    if (oic) return oic.cellId;
+  }
+  const ic = await tx.orderIssueCell.findFirst({ where: { orderId }, orderBy: { reservedAt: "asc" }, select: { cellId: true } });
+  return ic?.cellId ?? null;
+}
+
 // ── ISSUE-002 v1 (Задача N): немедленная read-only проверка скана QR заказа. Задача исполнителя,
 // ISSUE_ORDER IN_PROGRESS, tenant, склад и QR ИМЕННО заказа задачи. Fail-closed: ровно одна активная
 // назначенная ISSUE-ячейка. БД не меняется. Неверный QR/несоответствие — ошибка (шаг не меняется). ──
@@ -195,20 +208,29 @@ export async function placeWholeOrderInIssueCell(input: {
     if (task.status !== "IN_PROGRESS" && task.status !== "COMPLETED") throw new OrderIssueError("Задача размещения не в работе");
     const order = await tx.externalOrder.findFirst({ where: { id: task.subjectId ?? "", companyId: input.companyId } });
     if (!order) throw new OrderIssueError("Заказ не найден");
-    // Точная идемпотентность: проверки заказа и ячейки выполняются ВСЕГДА (в т.ч. после COMPLETED),
-    // не доверяя клиенту. Неверный заказ или неверная/недоступная ячейка отклоняются даже на повторе.
+    // Проверка заказа выполняется ВСЕГДА (в т.ч. после COMPLETED), не доверяя клиенту.
     const scannedOrderId = await resolveScannedOrder(tx, input.companyId, input.orderCode);
     if (scannedOrderId !== order.id) throw new OrderIssueError("Отсканирован не тот заказ");
-    // fail-closed: ровно одна активная назначенная ячейка + существует/активна/этот склад/зона ISSUE
+    // Точная идемпотентность ПОСЛЕ завершения задачи: даже после последующей выдачи (OrderIssueCell
+    // RELEASED) фактически использованную ячейку определяем по сохранённым OrderIssuePlacement/
+    // OrderIssueCell. Точный QR заказа + точная историческая ячейка → alreadyDone без записей.
+    // Неправильный QR или другая ячейка → отказ. Текущее состояние/активность исторической ячейки
+    // НЕ отменяют уже состоявшийся точный повтор (без валидации активности/зоны/лока).
+    if (task.status === "COMPLETED") {
+      const usedCellId = await usedIssueCellId(tx, order.id);
+      if (!usedCellId) throw new OrderIssueError("Нет исторической ячейки размещения");
+      const scannedCellIdC = await resolveScannedCell(tx, input.companyId, order.warehouseId, input.cellCode);
+      if (scannedCellIdC !== usedCellId) throw new OrderIssueError("Отсканирована не та ячейка размещения");
+      return { alreadyDone: true, order, deliverTask: null as TaskCreateResult | null, unblocked: [] as { id: string; title: string; warehouseId: string }[] };
+    }
+    // IN_PROGRESS: fail-closed — ровно одна АКТИВНАЯ назначенная ячейка + существует/активна/этот
+    // склад/зона ISSUE. Скан обязан совпасть с назначенной ячейкой.
     const ic = await requireSingleAssignedCell(tx, input.companyId, order.id, order.warehouseId);
-    // скан обязан совпасть с фактически назначенной ячейкой
     const scannedCellId = await resolveScannedCell(tx, input.companyId, order.warehouseId, input.cellCode);
     if (scannedCellId !== ic.cellId) throw new OrderIssueError("Отсканирована не назначенная ячейка выдачи");
     await lockCell(tx, input.companyId, ic.cellId);
     // повторная валидация ячейки под lockCell непосредственно перед движением (гонка с переносом зоны)
     await assertAssignedIssueCell(tx, input.companyId, ic.cellId, order.warehouseId);
-    // точный повтор после завершения задачи → успех без движения/placement/события/второй DELIVER_ORDER
-    if (task.status === "COMPLETED") return { alreadyDone: true, order, deliverTask: null as TaskCreateResult | null, unblocked: [] as { id: string; title: string; warehouseId: string }[] };
     const zoneCtl = await controlZoneId(tx, input.companyId, order.warehouseId);
     // все FULFILLED-доли заказа (по lotId), ещё не размещённые — переместить каждую долю ЗАКАЗА
     const resvs = await tx.stockReservation.findMany({ where: { orderId: order.id, status: "FULFILLED" }, select: { lotId: true }, distinct: ["lotId"] });

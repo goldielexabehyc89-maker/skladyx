@@ -216,27 +216,28 @@ export async function changeCellZone(input: {
   return prisma.$transaction(async (tx) => {
     const cell = await tx.cell.findFirst({ where: { id: input.cellId, companyId: input.companyId } });
     if (!cell) throw new CellError("Ячейка не найдена");
-    // Занятую ячейку переносить нельзя: сначала переместить товар через ядро остатков.
-    // Занята, если есть партионный остаток (StockBalance qty>0) ИЛИ поштучная единица (ItemUnit)
-    // с этим cellId (moveUnit обнуляет cellId при выходе — остаются только физически лежащие).
-    const [lotHere, unitHere] = await Promise.all([
-      tx.stockBalance.findFirst({ where: { cellId: cell.id, qty: { gt: 0 } }, select: { id: true } }),
-      tx.itemUnit.findFirst({ where: { cellId: cell.id }, select: { id: true } }),
-    ]);
-    if (lotHere || unitHere)
-      throw new CellError("Нельзя изменить зону занятой ячейки. Сначала переместите товар");
+    // Тот же per-cell lock, что и у размещения/резерва — держим ячейку до конца транзакции, затем
+    // ПОВТОРНО читаем состояние под lock (гонка с placeWholeOrderInIssueCell / авто-резервом выдачи).
+    await lockCell(tx, input.companyId, cell.id);
+    const fresh = await tx.cell.findFirst({ where: { id: input.cellId, companyId: input.companyId } });
+    if (!fresh) throw new CellError("Ячейка не найдена");
+    // Занятую/зарезервированную ячейку переносить нельзя: cellOccupied() покрывает остаток, единицу,
+    // активную CellReservation, активную StockReservation и НЕ-RELEASED OrderIssueCell (бронь выдачи).
+    // Ячейку, зарезервированную под ISSUE_ORDER, нельзя перенести ни до, ни во время размещения.
+    if (await cellOccupied(tx, fresh.id))
+      throw new CellError("Нельзя изменить зону занятой или зарезервированной ячейки. Сначала освободите её");
     const zone = await tx.warehouseZone.findFirst({
-      where: { id: input.zoneId, companyId: input.companyId, warehouseId: cell.warehouseId },
+      where: { id: input.zoneId, companyId: input.companyId, warehouseId: fresh.warehouseId },
     });
     if (!zone) throw new CellError("Зона не найдена");
     if (!isPhysicalZoneKind(zone.kind))
       throw new CellError("Нельзя перенести ячейку в виртуальную зону");
     const level = normalizeLevel(zone.kind, input.level);
     await tx.cell.update({
-      where: { id: cell.id },
+      where: { id: fresh.id },
       data: { zoneId: zone.id, level, isStaging: zoneKindIsStaging(zone.kind) },
     });
-    return { warehouseId: cell.warehouseId };
+    return { warehouseId: fresh.warehouseId };
   });
 }
 
