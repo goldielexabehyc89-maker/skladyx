@@ -12,7 +12,7 @@ import { createQrIn } from "@/lib/qr";
 import { startWorkflowTask, rebalanceQueuedTasks } from "@/lib/workflow-tasks";
 import { importExternalOrder, reserveAndPlanOrder, pickOrderScan } from "@/lib/external-orders";
 import { scanOrderForControl, markOrderControlByScan, finishOrderControl } from "@/lib/order-control";
-import { verifyIssueOrderScan, placeWholeOrderInIssueCell, issueOrderToDriver, getIssueOrderContext } from "@/lib/order-issue";
+import { verifyIssueOrderScan, placeWholeOrderInIssueCell, verifyDeliverOrderScan, deliverWholeOrder, getIssueOrderContext } from "@/lib/order-issue";
 import { assertCellNotHeldByGroup, changeCellZone } from "@/lib/cells";
 
 const prisma = new PrismaClient();
@@ -132,13 +132,13 @@ async function fullyIssue(orderId: string) {
   await placeWholeOrderInIssueCell({ companyId, userId: uid, taskId: tid, orderCode: oc, cellCode: cell });
   const dtid = await startLoaderTask(orderId, "DELIVER_ORDER");
   const duid = await taskAssignee(dtid);
-  await issueOrderToDriver({ companyId, userId: duid, taskId: dtid, orderCode: oc, cellCodes: await allActiveCellCodes(orderId) });
+  await deliverWholeOrder({ companyId, userId: duid, taskId: dtid, orderCode: oc, cellCode: await reservedCellCode(orderId) });
 }
 // только выдача (заказ уже размещён) — освобождает ячейку/погрузчика
 async function deliverOrder(orderId: string) {
   const d = await startLoaderTask(orderId, "DELIVER_ORDER");
   const du = await taskAssignee(d);
-  await issueOrderToDriver({ companyId, userId: du, taskId: d, orderCode: await orderQr(orderId), cellCodes: await allActiveCellCodes(orderId) });
+  await deliverWholeOrder({ companyId, userId: du, taskId: d, orderCode: await orderQr(orderId), cellCode: await reservedCellCode(orderId) });
 }
 
 async function setIssueActive(activeCodes: string[]) {
@@ -264,15 +264,27 @@ async function main() {
   const rep = await placeWholeOrderInIssueCell({ companyId, userId: u1, taskId: t1, orderCode: o1qr, cellCode: cc1 });
   ok("[S5] точный повтор → alreadyDone, без второго движения/строки/DELIVER", rep.alreadyDone && (await lotMv(lotA1)) === mvC0 && (await prisma.orderIssuePlacement.count({ where: { orderId: o1 } })) === 1 && (await prisma.workflowTask.count({ where: { type: "DELIVER_ORDER", subjectId: o1 } })) === 1);
 
-  console.log("S8) выдача водителю: расход через ядро, ячейка RELEASED, shipment; идемпотентно");
+  console.log("S8) DELIVER v1: verify QR → ячейка → атомарная выдача; идемпотентность; неверный QR/ячейка");
   const dtid1 = await startLoaderTask(o1, "DELIVER_ORDER"); const du1 = await taskAssignee(dtid1);
+  // read-only проверка QR: неверный/чужой отклонён, верный → ok + код ячейки; БД не меняется
+  const mvV = await lotMv(lotA1);
+  ok("[S8] DELIVER verify: неверный QR отклонён", (await err(async () => verifyDeliverOrderScan({ companyId, userId: du1, taskId: dtid1, orderCode: "ZZZZZZZZZZ" }))).length > 0);
+  ok("[S8] DELIVER verify: не тот заказ отклонён", /не тот заказ/.test(await err(async () => verifyDeliverOrderScan({ companyId, userId: du1, taskId: dtid1, orderCode: otherQr }))));
+  ok("[S8] DELIVER verify: чужой исполнитель отклонён", /не ваша задача/.test(await err(async () => verifyDeliverOrderScan({ companyId, userId: pk, taskId: dtid1, orderCode: o1qr }))));
+  const vD = await verifyDeliverOrderScan({ companyId, userId: du1, taskId: dtid1, orderCode: o1qr });
+  ok("[S8] DELIVER verify: верный QR → ok + код ячейки; БД не менялась", vD.ok && vD.cellCode === (await humanCode(c1[0].cellId)) && (await lotMv(lotA1)) === mvV);
+  // неверная ячейка → отказ без движения
+  ok("[S8] DELIVER: неверная ячейка → отказ без движения", /не та ячейка/.test(await err(async () => deliverWholeOrder({ companyId, userId: du1, taskId: dtid1, orderCode: o1qr, cellCode: await cellCode(await cellId("OI-I3")) }))) && (await lotMv(lotA1)) === mvV);
   const mvBI = await lotMv(lotA1);
-  const iss1 = await issueOrderToDriver({ companyId, userId: du1, taskId: dtid1, orderCode: o1qr, cellCodes: [cc1] });
+  const iss1 = await deliverWholeOrder({ companyId, userId: du1, taskId: dtid1, orderCode: o1qr, cellCode: cc1 });
   ok("[S8] выдано, ISSUED, остаток 0, +1 движение (расход)", iss1.issued && (await orderStatus(o1)) === "ISSUED" && (await totalBal(lotA1)) === 0 && (await lotMv(lotA1)) === mvBI + 1);
   ok("[S8] ячейка RELEASED + shipment создан", (await activeCells(o1)).length === 0 && !!(await prisma.orderShipment.findUnique({ where: { orderId: o1 } })));
   const mvAI = await lotMv(lotA1);
-  const iss1r = await issueOrderToDriver({ companyId, userId: du1, taskId: dtid1, orderCode: o1qr, cellCodes: [cc1] });
-  ok("[S8] повтор выдачи идемпотентен (без второго расхода)", iss1r.alreadyIssued && (await lotMv(lotA1)) === mvAI);
+  // точный повтор после выдачи → alreadyIssued без второго расхода; историческая ячейка (RELEASED)
+  const iss1r = await deliverWholeOrder({ companyId, userId: du1, taskId: dtid1, orderCode: o1qr, cellCode: cc1 });
+  ok("[S8] точный повтор выдачи → alreadyIssued без второго расхода", iss1r.alreadyIssued && (await lotMv(lotA1)) === mvAI);
+  ok("[S8] неверный QR после выдачи → отказ (не повтор)", /не тот заказ/.test(await err(async () => deliverWholeOrder({ companyId, userId: du1, taskId: dtid1, orderCode: otherQr, cellCode: cc1 }))));
+  ok("[S8] неверная ячейка после выдачи → отказ (не повтор)", /не та ячейка/.test(await err(async () => deliverWholeOrder({ companyId, userId: du1, taskId: dtid1, orderCode: o1qr, cellCode: await cellCode(await cellId("OI-I3")) }))));
 
   console.log("S13) точная идемпотентность ПОСЛЕ выдачи (OrderIssueCell RELEASED): историческая ячейка");
   ok("[S13] после выдачи ячейка RELEASED (нет активной)", (await activeCells(o1)).length === 0);

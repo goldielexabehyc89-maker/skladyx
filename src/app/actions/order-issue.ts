@@ -1,13 +1,13 @@
 "use server";
 
-import { revalidatePath } from "next/cache";
 import { requireUser } from "@/lib/auth";
 import { scoped } from "@/lib/tenant";
 import { orderIssueEnabled } from "@/lib/roles";
 import {
-  issueOrderToDriver,
   verifyIssueOrderScan,
   placeWholeOrderInIssueCell,
+  verifyDeliverOrderScan,
+  deliverWholeOrder,
   OrderIssueError,
 } from "@/lib/order-issue";
 
@@ -61,20 +61,35 @@ export async function placeWholeOrderAction(_prev: IssueActionState, formData: F
   }
 }
 
-// Выдача водителю: скан QR заказа + всех занятых ячеек (несколько полей cellCode или список через запятую).
-export async function issueAction(_prev: IssueActionState, formData: FormData): Promise<IssueActionState> {
+// ISSUE-003 v1 (Задача O): DELIVER шаг 1 — read-only проверка скана QR заказа (без изменения БД).
+// Клиент показывает зелёное подтверждение (UI-005) и сам открывает скан ячейки → БЕЗ revalidatePath.
+export async function verifyDeliverScanAction(_prev: IssueActionState, formData: FormData): Promise<IssueActionState> {
   if (!orderIssueEnabled()) return OFF;
   const session = await requireUser();
   const s = scoped(session);
   const taskId = String(formData.get("taskId") ?? "").trim();
   const orderCode = String(formData.get("orderCode") ?? "").trim();
-  const codes = new Set<string>();
-  for (const v of formData.getAll("cellCode")) { const c = String(v).trim(); if (c) codes.add(c); }
-  for (const v of String(formData.get("cellCodes") ?? "").split(/[,\s]+/)) { const c = v.trim(); if (c) codes.add(c); }
-  if (!orderCode || codes.size === 0) return { error: "Отсканируйте QR заказа и все ячейки выдачи" };
+  if (!orderCode) return { error: "Отсканируйте QR заказа" };
   try {
-    await issueOrderToDriver({ companyId: s.companyId, userId: session.userId, taskId, orderCode, cellCodes: [...codes] });
-    revalidatePath("/warehouse/tasks");
+    await verifyDeliverOrderScan({ companyId: s.companyId, userId: session.userId, taskId, orderCode });
+    return { ok: true };
+  } catch (e) {
+    return { error: msg(e) };
+  }
+}
+
+// ISSUE-003 v1 (Задача O): DELIVER шаг 2 — скан ячейки → атомарная выдача. БЕЗ revalidatePath:
+// финальное окно «Заказ выдан водителю» держится до «Ок», затем клиент router.refresh().
+export async function deliverWholeOrderAction(_prev: IssueActionState, formData: FormData): Promise<IssueActionState> {
+  if (!orderIssueEnabled()) return OFF;
+  const session = await requireUser();
+  const s = scoped(session);
+  const taskId = String(formData.get("taskId") ?? "").trim();
+  const orderCode = String(formData.get("orderCode") ?? "").trim();
+  const cellCode = String(formData.get("cellCode") ?? "").trim();
+  if (!orderCode || !cellCode) return { error: "Отсканируйте QR заказа и ячейку выдачи" };
+  try {
+    await deliverWholeOrder({ companyId: s.companyId, userId: session.userId, taskId, orderCode, cellCode });
     return { ok: true };
   } catch (e) {
     return { error: msg(e) };

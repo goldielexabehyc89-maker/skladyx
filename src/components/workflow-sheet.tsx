@@ -48,7 +48,7 @@ export function WorkflowSheet({
   // (напр. товар · количество · назначенная ячейка при размещении).
   context?: React.ReactNode;
   scanning: boolean; // true — камера вместо списка
-  scanHint?: React.ReactNode; // подсказка под камерой
+  scanHint?: React.ReactNode; // UI-005: подсказка НАД камерой (точное обозначение ожидаемого объекта)
   onScan: (raw: string) => void;
   scanFormats?: ScanFormat[]; // Пакет 9B: форматы текущего шага (ячейка/товар/заказ)
   scanPaused?: boolean;
@@ -111,10 +111,11 @@ export function WorkflowSheet({
           >
             {scanning ? (
               <div className="flex flex-col gap-3">
+                {/* UI-005: подсказка НАД камерой — точно называет ожидаемый объект (товар/ячейка/заказ). */}
+                {scanHint && <p className="min-h-6 text-center text-sm font-semibold text-[#667eea]">{scanHint}</p>}
                 <QrScanner onScan={onScan} formats={scanFormats} paused={!!scanPaused || !!error || !!modal} />
-                <div className="min-h-14 text-center">
-                  {scanHint && <p className="text-sm font-medium text-[#667eea]">{scanHint}</p>}
-                  {busy && <p className="mt-1 text-sm text-neutral-400">Обработка…</p>}
+                <div className="min-h-6 text-center">
+                  {busy && <p className="text-sm text-neutral-400">Проверяем…</p>}
                 </div>
                 {/* UI-004: ручной ввод текущего шага — тот же onScan (одно поле, Enter подтверждает) */}
                 {manualPlaceholder && (

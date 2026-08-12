@@ -276,49 +276,75 @@ export async function placeWholeOrderInIssueCell(input: {
   return { done: true, alreadyDone: out.alreadyDone };
 }
 
-// ── Выдача водителю: скан QR заказа + всех занятых ячеек. Сервер проверяет tenant/склад/заказ и
-// ПОЛНЫЙ набор ячеек. Расход из ячеек → внешний мир через ядро; заказ ISSUED, ячейки RELEASED;
-// OrderShipment (issuedById/issuedAt). Идемпотентно по заказу. Затем — реобработка ожидающих. ──
-export async function issueOrderToDriver(input: {
-  companyId: string; userId: string; taskId: string; orderCode: string; cellCodes: string[];
+// ── ISSUE-003 v1 (Задача O): read-only проверка скана QR заказа выдачи. Задача исполнителя,
+// DELIVER_ORDER IN_PROGRESS, tenant, склад и QR ИМЕННО заказа задачи. Fail-closed: ровно одна активная
+// ячейка выдачи (существует/активна/этот склад/зона ISSUE). БД не меняется. ──
+export async function verifyDeliverOrderScan(input: {
+  companyId: string; userId: string; taskId: string; orderCode: string;
+}): Promise<{ ok: true; cellCode: string }> {
+  return prisma.$transaction(async (tx) => {
+    const task = await tx.workflowTask.findFirst({ where: { id: input.taskId, companyId: input.companyId } });
+    if (!task || task.type !== TASK_TYPES.DELIVER_ORDER) throw new OrderIssueError("Это не задача выдачи");
+    if (task.assignedUserId !== input.userId) throw new OrderIssueError("Это не ваша задача выдачи");
+    if (task.status !== "IN_PROGRESS") throw new OrderIssueError("Задача выдачи не в работе");
+    const order = await tx.externalOrder.findFirst({ where: { id: task.subjectId ?? "", companyId: input.companyId } });
+    if (!order) throw new OrderIssueError("Заказ не найден");
+    const scannedOrderId = await resolveScannedOrder(tx, input.companyId, input.orderCode);
+    if (scannedOrderId !== order.id) throw new OrderIssueError("Отсканирован не тот заказ");
+    const ic = await requireSingleAssignedCell(tx, input.companyId, order.id, order.warehouseId);
+    const cellRow = await tx.cell.findFirst({ where: { id: ic.cellId, companyId: input.companyId }, select: { code: true } });
+    return { ok: true as const, cellCode: cellRow?.code ?? "" };
+  });
+}
+
+// ── ISSUE-003 v1 (Задача O): выдача целого заказа из ЕДИНСТВЕННОЙ ячейки. Скан QR заказа + ячейки.
+// Финальная транзакция повторно проверяет заказ и фактически использованную ячейку, не доверяя клиенту.
+// Атомарно: расход всех долей из ячейки во внешний мир через ядро, ячейка RELEASED, заказ ISSUED,
+// OrderShipment, завершение DELIVER_ORDER, реобработка ожидающих. Точная идемпотентность после
+// завершения: точный QR + историческая ячейка → alreadyIssued без движений; неверный QR или другая
+// ячейка → отказ (не считается точным повтором). ──
+export async function deliverWholeOrder(input: {
+  companyId: string; userId: string; taskId: string; orderCode: string; cellCode: string;
 }): Promise<{ issued: boolean; alreadyIssued: boolean }> {
   const out = await prisma.$transaction(async (tx) => {
     await lockCompany(tx, input.companyId);
     const task = await tx.workflowTask.findFirst({ where: { id: input.taskId, companyId: input.companyId } });
     if (!task || task.type !== TASK_TYPES.DELIVER_ORDER) throw new OrderIssueError("Это не задача выдачи");
     if (task.assignedUserId !== input.userId) throw new OrderIssueError("Это не ваша задача выдачи");
+    if (task.status !== "IN_PROGRESS" && task.status !== "COMPLETED") throw new OrderIssueError("Задача выдачи не в работе");
     const order = await tx.externalOrder.findFirst({ where: { id: task.subjectId ?? "", companyId: input.companyId } });
     if (!order) throw new OrderIssueError("Заказ не найден");
+    // Проверка заказа выполняется ВСЕГДА (в т.ч. после COMPLETED), не доверяя клиенту.
     const scannedOrderId = await resolveScannedOrder(tx, input.companyId, input.orderCode);
     if (scannedOrderId !== order.id) throw new OrderIssueError("Отсканирован не тот заказ");
-    // идемпотентность: уже выдан
-    const shipped = await tx.orderShipment.findUnique({ where: { orderId: order.id }, select: { id: true } });
-    if (shipped) return { alreadyIssued: true, order, unblocked: [] as { id: string; title: string; warehouseId: string }[], created: [] as TaskCreateResult[] };
-    if (task.status !== "IN_PROGRESS") throw new OrderIssueError("Задача выдачи не в работе");
-    // полный набор ячеек: все активные (PLACED) ячейки заказа должны быть отсканированы
-    const cells = await tx.orderIssueCell.findMany({ where: { orderId: order.id, status: { not: "RELEASED" } } });
-    if (cells.length === 0) throw new OrderIssueError("У заказа нет занятых ячеек выдачи");
-    const scannedIds = new Set<string>();
-    for (const raw of input.cellCodes) scannedIds.add(await resolveScannedCell(tx, input.companyId, order.warehouseId, raw));
-    const need = new Set(cells.map((c) => c.cellId));
-    for (const c of need) if (!scannedIds.has(c)) throw new OrderIssueError("Отсканированы не все ячейки выдачи заказа");
-    for (const s of scannedIds) if (!need.has(s)) throw new OrderIssueError("Отсканирована ячейка, не относящаяся к заказу");
-    // расход из каждой ячейки во внешний мир через ядро
-    for (const ic of cells) {
-      await lockCell(tx, input.companyId, ic.cellId);
-      const placements = await tx.orderIssuePlacement.findMany({ where: { issueCellId: ic.id } });
-      for (const p of placements) {
-        await applyLotMovement(tx, {
-          companyId: input.companyId, docType: "ISSUE", docId: order.id, itemId: p.itemId, lotId: p.lotId, qty: p.qty,
-          from: { kind: "cell", warehouseId: order.warehouseId, cellId: ic.cellId }, to: null, createdById: input.userId,
-        });
-      }
-      await tx.orderIssueCell.update({ where: { id: ic.id }, data: { status: "RELEASED", releasedAt: new Date() } });
+    // Точная идемпотентность после завершения: фактически использованную ячейку определяем по
+    // сохранённым OrderIssuePlacement/OrderIssueCell. Точная ячейка → alreadyIssued без записей;
+    // другая ячейка → отказ (не точный повтор). Текущее состояние ячейки не отменяет повтор.
+    if (task.status === "COMPLETED") {
+      const usedCellId = await usedIssueCellId(tx, order.id);
+      if (!usedCellId) throw new OrderIssueError("Нет исторической ячейки выдачи");
+      const scannedCellIdC = await resolveScannedCell(tx, input.companyId, order.warehouseId, input.cellCode);
+      if (scannedCellIdC !== usedCellId) throw new OrderIssueError("Отсканирована не та ячейка выдачи");
+      return { alreadyIssued: true, order, unblocked: [] as { id: string; title: string; warehouseId: string }[], created: [] as TaskCreateResult[] };
     }
+    // IN_PROGRESS: fail-closed — ровно одна активная ячейка + существует/активна/этот склад/зона ISSUE.
+    const ic = await requireSingleAssignedCell(tx, input.companyId, order.id, order.warehouseId);
+    const scannedCellId = await resolveScannedCell(tx, input.companyId, order.warehouseId, input.cellCode);
+    if (scannedCellId !== ic.cellId) throw new OrderIssueError("Отсканирована не та ячейка выдачи");
+    await lockCell(tx, input.companyId, ic.cellId);
+    await assertAssignedIssueCell(tx, input.companyId, ic.cellId, order.warehouseId);
+    // расход всех долей ячейки во внешний мир через ядро
+    const placements = await tx.orderIssuePlacement.findMany({ where: { issueCellId: ic.id } });
+    for (const p of placements) {
+      await applyLotMovement(tx, {
+        companyId: input.companyId, docType: "ISSUE", docId: order.id, itemId: p.itemId, lotId: p.lotId, qty: p.qty,
+        from: { kind: "cell", warehouseId: order.warehouseId, cellId: ic.cellId }, to: null, createdById: input.userId,
+      });
+    }
+    await tx.orderIssueCell.update({ where: { id: ic.id }, data: { status: "RELEASED", releasedAt: new Date() } });
     await tx.externalOrder.update({ where: { id: order.id }, data: { status: "ISSUED" } });
     await tx.orderShipment.create({ data: { companyId: input.companyId, orderId: order.id, warehouseId: order.warehouseId, issuedById: input.userId } });
     const unblocked = await completeWorkflowTaskInTransaction(tx, task.id);
-    // ячейки освободились → реобработка ожидающих заказов
     const created = await reprocessPendingInTx(tx, input.companyId, order.warehouseId);
     return { alreadyIssued: false, order, unblocked, created };
   });
@@ -368,9 +394,16 @@ export async function getDeliverOrderContext(companyId: string, taskId: string) 
   const cells = await prisma.orderIssueCell.findMany({ where: { orderId: order.id, status: { not: "RELEASED" } }, orderBy: { reservedAt: "asc" } });
   const cellRows = await prisma.cell.findMany({ where: { id: { in: cells.map((c) => c.cellId) } }, select: { id: true, code: true } });
   const nameByCell = new Map(cellRows.map((c) => [c.id, c.code]));
+  // ISSUE-003 v1: компактная карточка — N поз. · M шт и единственная ячейка выдачи (ровно одна).
+  const orderLines = await prisma.externalOrderLine.findMany({ where: { orderId: order.id }, select: { requiredQty: true } });
+  const units = orderLines.reduce((s, l) => s.plus(l.requiredQty), new Prisma.Decimal(0));
+  const assignedCellCode = cells.length === 1 ? (nameByCell.get(cells[0].cellId) ?? null) : null;
   return {
     taskId: task.id, orderId: order.id, externalId: order.externalId,
     arrivalAt: order.arrivalAt ? order.arrivalAt.toISOString() : null,
     cells: cells.map((c) => ({ cell: nameByCell.get(c.cellId) ?? c.cellId })),
+    positions: orderLines.length,
+    units: units.toString(),
+    assignedCellCode,
   };
 }

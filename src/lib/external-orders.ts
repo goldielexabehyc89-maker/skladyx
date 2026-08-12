@@ -681,6 +681,40 @@ export async function verifyPickEan(input: { companyId: string; userId: string; 
   return { itemName: next.itemName, qty: next.qty.toString() };
 }
 
+// MOVE (read-only): загрузка активной задачи перестановки + группы (общая для verify-функций).
+async function loadActiveMove(companyId: string, userId: string, taskId: string) {
+  const task = await prisma.workflowTask.findFirst({ where: { id: taskId, companyId, type: TASK_TYPES.MOVE_GROUP } });
+  if (!task) throw new ExternalOrderError("Задача не найдена");
+  if (task.assignedUserId !== userId || task.status !== "IN_PROGRESS")
+    throw new ExternalOrderError("Завершить может только назначенный исполнитель с задачей «в работе»");
+  const group = await prisma.handlingGroup.findFirst({ where: { id: task.subjectId ?? "", companyId } });
+  if (!group) throw new ExternalOrderError("Группа не найдена");
+  const item = await prisma.item.findFirst({ where: { id: group.itemId, companyId }, select: { name: true } });
+  return { task, group, itemName: item?.name ?? "" };
+}
+
+// MOVE (read-only): проверка скана ИСХОДНОЙ ячейки — группа действительно находится в ней. Ничего не двигает.
+export async function verifyMoveFromCell(input: { companyId: string; userId: string; taskId: string; fromCellCode: string }):
+  Promise<{ fromCell: string; itemName: string }> {
+  const { group, itemName } = await loadActiveMove(input.companyId, input.userId, input.taskId);
+  const curBal = await prisma.stockBalance.findFirst({ where: { lotId: group.lotId, companyId: input.companyId, cellId: { not: null }, qty: { gt: 0 } }, select: { cellId: true } });
+  if (!curBal?.cellId) throw new ExternalOrderError("Текущее размещение группы не найдено");
+  const cur = await prisma.cell.findFirst({ where: { id: curBal.cellId, companyId: input.companyId }, select: { code: true } });
+  const scannedFromCellId = await resolveScannedCell(prisma, input.companyId, group.warehouseId, input.fromCellCode);
+  if (scannedFromCellId !== curBal.cellId) throw new ExternalOrderError(`Отсканирована не та исходная ячейка — группа в ${cur?.code ?? ""}`);
+  return { fromCell: cur?.code ?? "", itemName };
+}
+
+// MOVE (read-only): проверка скана EAN — соответствует товару группы задачи. Ничего не двигает.
+export async function verifyMoveEan(input: { companyId: string; userId: string; taskId: string; ean: string }):
+  Promise<{ itemName: string }> {
+  const { group, itemName } = await loadActiveMove(input.companyId, input.userId, input.taskId);
+  const itemId = await eanItemIdInTx(prisma, input.companyId, input.ean);
+  if (!itemId) throw new ExternalOrderError("Неизвестный, неактивный или чужой EAN — перестановка отклонена");
+  if (itemId !== group.itemId) throw new ExternalOrderError(`Отсканирован не тот товар — нужен ${itemName}`);
+  return { itemName };
+}
+
 // ── Геттеры для UI ──
 export async function getPickOrderContext(companyId: string, taskId: string) {
   const task = await prisma.workflowTask.findFirst({ where: { id: taskId, companyId, type: TASK_TYPES.PICK_ORDER } });

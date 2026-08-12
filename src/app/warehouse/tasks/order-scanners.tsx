@@ -3,7 +3,7 @@
 import { useState, useTransition, useRef, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { ScanLine } from "lucide-react";
-import { pickScanAction, verifyPickCellAction, verifyPickEanAction, completeMoveGroupAction } from "@/app/actions/external-orders";
+import { pickScanAction, verifyPickCellAction, verifyPickEanAction, completeMoveGroupAction, verifyMoveFromCellAction, verifyMoveEanAction } from "@/app/actions/external-orders";
 import { completeGroupPlacementAction, verifyPlacementEanAction } from "@/app/actions/group-receiving";
 import { prepareCoolingRetrievalAction, placeCoolingRetrievalAction, verifyCoolingRetrievalEanAction, verifyCoolingRetrievalSourceCellAction } from "@/app/actions/tasks";
 import { Button } from "@/components/ui";
@@ -233,7 +233,7 @@ export function PlaceGroupScanner({ placement, assignedCellCode }: { placement: 
   }
 
   const itemQty = `${placement.itemName} · ${placement.qty} шт`;
-  const cellHint = (<span>Ячейка <b className="font-mono text-lg">{assignedCellCode}</b> (QR/Code 128)</span>);
+  const cellHint = `Сканируйте ячейку ${assignedCellCode}`;
   const modal =
     phase === "checking" ? (slow
         ? { tone: "neutral" as const, title: "Связь работает медленно", body: "Не закрывайте окно, проверка продолжается" }
@@ -254,7 +254,7 @@ export function PlaceGroupScanner({ placement, assignedCellCode }: { placement: 
       title="Размещение группы"
       subtitle={step === "product" ? "Шаг 1 · штрихкод товара (EAN)" : "Шаг 2 · назначенная ячейка"}
       scanning={scanning}
-      scanHint={step === "product" ? "Сканируйте EAN товара" : cellHint}
+      scanHint={step === "product" ? `Сканируйте товар ${placement.itemName}` : cellHint}
       scanFormats={step === "product" ? PRODUCT : CELL}
       manualPlaceholder={step === "product" ? "EAN товара (8/13 цифр)" : `Код назначенной ячейки (${assignedCellCode})`}
       manualInputMode={step === "product" ? "numeric" : "text"}
@@ -449,7 +449,7 @@ export function CoolingRetrievalScanner({ cooling }: { cooling: Cooling }) {
         )
       }
       scanning={scanning}
-      scanHint={isProduct ? "Сканируйте EAN товара" : step === "from" ? "Сканируйте исходную ячейку охлаждения" : "Сканируйте назначенную ячейку"}
+      scanHint={isProduct ? `Сканируйте товар ${cooling.itemName}` : step === "from" ? `Сканируйте ячейку ${cooling.coolingCell}` : `Сканируйте ячейку ${targetCode ?? ""}`}
       scanFormats={isProduct ? PRODUCT : CELL}
       manualPlaceholder={isProduct ? "EAN товара (8/13 цифр)" : step === "from" ? "Код ячейки охлаждения" : "Код назначенной ячейки"}
       manualInputMode={isProduct ? "numeric" : "text"}
@@ -509,6 +509,9 @@ export function CoolingRetrievalScanner({ cooling }: { cooling: Cooling }) {
 }
 
 // ── Перестановка группы ──
+// ── MOVE_GROUP (Задача O): исходная ячейка → товар (EAN) → целевая ячейка. КАЖДЫЙ скан немедленно
+// проверяется сервером (verifyMoveFromCellAction/verifyMoveEanAction), зелёное подтверждение, авто-переход.
+// Камера и ручной ввод — одна машина состояний. Финал держится до «Ок». ──
 export function MoveGroupScanner({ ctx }: { ctx: MoveGroupCtx }) {
   const router = useRouter();
   const [open, setOpen] = useState(false);
@@ -516,31 +519,59 @@ export function MoveGroupScanner({ ctx }: { ctx: MoveGroupCtx }) {
   const [step, setStep] = useState<"from" | "product" | "to">("from");
   const [fromRaw, setFromRaw] = useState("");
   const [eanRaw, setEanRaw] = useState("");
+  const [check, setCheck] = useState<"idle" | "checking" | "confirmed">("idle");
   const [busy, startTransition] = useTransition();
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
   const [finished, setFinished] = useState(false);
+  const advanceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const submitting = useRef(false);
 
-  function reset() { setStep("from"); setFromRaw(""); setEanRaw(""); setNotice(null); }
-  function closeAll() { setOpen(false); setScanning(false); reset(); setError(null); setFinished(false); router.refresh(); }
+  function clearAdvance() { if (advanceTimer.current) { clearTimeout(advanceTimer.current); advanceTimer.current = null; } }
+  function reset() { clearAdvance(); setStep("from"); setFromRaw(""); setEanRaw(""); setCheck("idle"); }
+  function closeAll() { clearAdvance(); submitting.current = false; setOpen(false); setScanning(false); reset(); setError(null); setFinished(false); router.refresh(); }
 
-  function handleScan(raw: string) {
-    if (busy) return;
-    if (step === "from") { setFromRaw(raw); setStep("product"); setNotice("Исходная ячейка — сканируйте EAN товара"); return; }
-    if (step === "product") { setEanRaw(raw); setStep("to"); setNotice("Товар отсканирован — сканируйте целевую ячейку"); return; }
-    // step === "to": финализируем перестановку
+  function verifyFrom(raw: string) {
+    setCheck("checking");
+    startTransition(async () => {
+      const fd = new FormData(); fd.set("taskId", ctx.taskId); fd.set("fromCellCode", raw);
+      const res = await verifyMoveFromCellAction({}, fd);
+      if (res.error) { setError(res.error); setCheck("idle"); return; } // шаг не меняется, БД не мутирует
+      setFromRaw(raw); setScanning(false); setCheck("confirmed");
+      advanceTimer.current = setTimeout(() => { setCheck("idle"); setStep("product"); setScanning(true); }, 900);
+    });
+  }
+  function verifyEan(raw: string) {
+    setCheck("checking");
+    startTransition(async () => {
+      const fd = new FormData(); fd.set("taskId", ctx.taskId); fd.set("ean", raw);
+      const res = await verifyMoveEanAction({}, fd);
+      if (res.error) { setError(res.error); setCheck("idle"); return; }
+      setEanRaw(raw); setScanning(false); setCheck("confirmed");
+      advanceTimer.current = setTimeout(() => { setCheck("idle"); setStep("to"); setScanning(true); }, 900);
+    });
+  }
+  function submitTo(raw: string) {
+    if (submitting.current) return; submitting.current = true;
     startTransition(async () => {
       const fd = new FormData();
       fd.set("taskId", ctx.taskId); fd.set("fromCellCode", fromRaw); fd.set("ean", eanRaw); fd.set("cellCode", raw);
       const res = await completeMoveGroupAction({}, fd);
+      submitting.current = false;
       if (res.error) { setError(res.error); return; }
       setScanning(false); setFinished(true);
     });
   }
+  function handleScan(raw: string) {
+    if (busy || check !== "idle") return;
+    const v = raw.trim(); if (!v) return;
+    if (step === "from") { verifyFrom(v); return; }
+    if (step === "product") { verifyEan(v); return; }
+    submitTo(v);
+  }
 
   if (!open)
     return (
-      <Button type="button" variant="primary" onClick={() => setOpen(true)} className="w-full">
+      <Button type="button" variant="primary" onClick={() => { setOpen(true); setScanning(true); reset(); setError(null); }} className="w-full">
         <ScanLine size={18} /> Переставить (сканирование)
       </Button>
     );
@@ -550,32 +581,34 @@ export function MoveGroupScanner({ ctx }: { ctx: MoveGroupCtx }) {
       title="Перестановка группы"
       subtitle={`${ctx.item} · ${ctx.qty} шт`}
       scanning={scanning}
-      scanHint={step === "from" ? "Сканируйте исходную ячейку" : step === "product" ? "Сканируйте EAN товара" : "Сканируйте целевую ячейку"}
+      scanHint={step === "from" ? `Сканируйте ячейку ${ctx.fromCell}` : step === "product" ? `Сканируйте товар ${ctx.item}` : `Сканируйте ячейку ${ctx.toCell}`}
       scanFormats={step === "product" ? PRODUCT : CELL}
-      manualPlaceholder={step === "from" ? "Код исходной ячейки" : step === "product" ? "EAN товара (8/13 цифр)" : "Код целевой ячейки"}
+      manualPlaceholder={step === "from" ? `Код ячейки ${ctx.fromCell}` : step === "product" ? "EAN товара (8/13 цифр)" : `Код ячейки ${ctx.toCell}`}
       manualInputMode={step === "product" ? "numeric" : "text"}
       onScan={handleScan}
-      scanPaused={busy}
-      busy={busy}
+      scanPaused={busy || check !== "idle"}
+      busy={busy || check === "checking"}
       onBackToList={() => setScanning(false)}
       onClose={closeAll}
       error={error}
-      onErrorRetry={() => setError(null)}
+      onErrorRetry={() => { setError(null); setScanning(true); }}
       onErrorExit={() => { setError(null); setScanning(false); reset(); }}
-      modal={finished ? { title: "Группа переставлена", body: `→ ячейка ${ctx.toCell}`, actions: (<Button type="button" variant="primary" onClick={closeAll} className="w-full">Ок</Button>) } : null}
+      modal={
+        finished
+          ? { title: "Группа переставлена", body: `→ ячейка ${ctx.toCell}`, actions: (<Button type="button" variant="primary" onClick={closeAll} className="w-full">Ок</Button>) }
+          : check === "confirmed"
+            ? { title: "Подтверждено", body: step === "from" ? `Ячейка ${ctx.fromCell} подтверждена` : `Товар подтверждён · ${ctx.item}` }
+            : null
+      }
       footer={
-        <Button type="button" variant="primary" onClick={() => { setScanning(true); reset(); }} className="w-full">
-          <ScanLine size={18} /> Сканировать исходную ячейку
+        <Button type="button" variant="primary" onClick={() => setScanning(true)} className="w-full">
+          <ScanLine size={18} /> {step === "from" ? `Сканировать ${ctx.fromCell}` : step === "product" ? `Сканировать ${ctx.item}` : `Сканировать ${ctx.toCell}`}
         </Button>
       }
     >
-      {notice && <p className="pb-1 text-sm font-medium text-green-600">{notice}</p>}
-      <div className="rounded-xl bg-[#f7f8fc] p-3 text-sm">
-        <div className="font-medium">{ctx.item} · {ctx.qty} шт</div>
-        <div className="mt-1 text-xs text-neutral-500">
-          Из {ctx.fromCell}{ctx.fromLevel != null ? ` (ур.${ctx.fromLevel})` : ""} → в {ctx.toCell}{ctx.toLevel != null ? ` (ур.${ctx.toLevel})` : ""}
-        </div>
-      </div>
+      <p className="text-sm text-neutral-600">
+        {step === "from" ? `Заберите ${ctx.item} · ${ctx.qty} шт из ячейки ${ctx.fromCell}` : step === "product" ? `Подтвердите товар: ${ctx.item}` : `Поставьте в ячейку ${ctx.toCell}`}
+      </p>
     </WorkflowSheet>
   );
 }

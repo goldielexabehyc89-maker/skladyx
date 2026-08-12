@@ -11,6 +11,8 @@ import {
   pickOrderScan,
   verifyPickCell,
   verifyPickEan,
+  verifyMoveFromCell,
+  verifyMoveEan,
   reportPickShortage,
   ExternalOrderError,
   type ImportLine,
@@ -84,7 +86,8 @@ export async function completeMoveGroupAction(_prev: OrderActionState, formData:
   } catch (e) {
     return { error: msg(e) };
   }
-  revalidatePath("/warehouse/tasks");
+  // Задача O: БЕЗ revalidatePath — финальное окно «Группа переставлена» держится до «Ок», затем клиент
+  // (MoveGroupScanner.closeAll) вызывает router.refresh(). Ревалидация мгновенно сняла бы финал.
   return { ok: true };
 }
 
@@ -115,6 +118,38 @@ export async function verifyPickEanAction(_prev: OrderActionState, formData: For
   if (!cellCode || !ean) return { error: "Отсканируйте ячейку и EAN товара" };
   try {
     await verifyPickEan({ companyId: s.companyId, userId: session.userId, taskId, cellCode, ean });
+    return { ok: true };
+  } catch (e) {
+    return { error: msg(e) };
+  }
+}
+
+// MOVE_GROUP (Задача O): read-only проверка скана исходной ячейки (немедленно, до зелёного).
+export async function verifyMoveFromCellAction(_prev: OrderActionState, formData: FormData): Promise<OrderActionState> {
+  if (!externalOrderPickingEnabled()) return OFF;
+  const session = await requireUser();
+  const s = scoped(session);
+  const taskId = String(formData.get("taskId") ?? "").trim();
+  const fromCellCode = String(formData.get("fromCellCode") ?? "").trim();
+  if (!fromCellCode) return { error: "Отсканируйте исходную ячейку" };
+  try {
+    await verifyMoveFromCell({ companyId: s.companyId, userId: session.userId, taskId, fromCellCode });
+    return { ok: true };
+  } catch (e) {
+    return { error: msg(e) };
+  }
+}
+
+// MOVE_GROUP (Задача O): read-only проверка скана EAN товара группы (немедленно, до зелёного).
+export async function verifyMoveEanAction(_prev: OrderActionState, formData: FormData): Promise<OrderActionState> {
+  if (!externalOrderPickingEnabled()) return OFF;
+  const session = await requireUser();
+  const s = scoped(session);
+  const taskId = String(formData.get("taskId") ?? "").trim();
+  const ean = String(formData.get("ean") ?? "").trim();
+  if (!ean) return { error: "Отсканируйте товар (EAN)" };
+  try {
+    await verifyMoveEan({ companyId: s.companyId, userId: session.userId, taskId, ean });
     return { ok: true };
   } catch (e) {
     return { error: msg(e) };

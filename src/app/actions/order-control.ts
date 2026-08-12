@@ -9,6 +9,7 @@ import {
   markOrderControlByScan,
   confirmControlLine,
   finishOrderControl,
+  verifyCorrectionEan,
   resolveControlShortage,
   resolveControlRemoval,
   completeOrderCorrection,
@@ -93,6 +94,23 @@ export async function confirmControlLineAction(_prev: ControlActionState, formDa
   revalidatePath("/warehouse/tasks");
   const ctx = await getControlOrderContext(s.companyId, taskId);
   return { ok: true, allMarked: ctx?.allMarked ?? false };
+}
+
+// CORRECT_ORDER (Задача O): read-only проверка скана EAN расхождения (немедленно, до зелёного). БД не меняется.
+export async function verifyCorrectionEanAction(_prev: ControlActionState, formData: FormData): Promise<ControlActionState> {
+  if (!orderControlEnabled()) return OFF;
+  const session = await requireUser();
+  const s = scoped(session);
+  const taskId = String(formData.get("taskId") ?? "").trim();
+  const checkLineId = String(formData.get("checkLineId") ?? "").trim();
+  const ean = String(formData.get("ean") ?? "").trim();
+  if (!ean) return { error: "Отсканируйте товар (EAN)" };
+  try {
+    await verifyCorrectionEan({ companyId: s.companyId, userId: session.userId, taskId, checkLineId, ean });
+    return { ok: true };
+  } catch (e) {
+    return { error: msg(e) };
+  }
 }
 
 // Сборщик разрешает НЕДОСТАЧУ: скан ожидаемого товара/группы + добавленное количество (без движения).

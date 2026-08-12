@@ -370,6 +370,21 @@ async function loadResolutionCtx(tx: Tx, companyId: string, userId: string, task
   return { order, cl };
 }
 
+// CORRECT_ORDER (Задача O, read-only): немедленная проверка скана EAN — соответствует ожидаемому
+// товару строки расхождения (checkLineId однозначен). Ничего не двигает. Возвращает имя товара.
+export async function verifyCorrectionEan(input: {
+  companyId: string; userId: string; taskId: string; checkLineId: string; ean: string;
+}): Promise<{ itemName: string }> {
+  return prisma.$transaction(async (tx) => {
+    const { cl } = await loadResolutionCtx(tx, input.companyId, input.userId, input.taskId, input.checkLineId);
+    const itemId = await eanItemIdInTx(tx, input.companyId, input.ean);
+    if (!itemId) throw new OrderControlError("Неизвестный, неактивный или чужой EAN — исправление отклонено");
+    if (itemId !== cl.itemId) throw new OrderControlError("Отсканирован не тот товар этого расхождения");
+    const item = await tx.item.findFirst({ where: { id: cl.itemId, companyId: input.companyId }, select: { name: true } });
+    return { itemName: item?.name ?? "" };
+  });
+}
+
 // ── Разрешение НЕДОСТАЧИ: сборщик сканирует ожидаемый товар/группу и подтверждает добавленное
 // количество. Приводит фактический состав к уже проведённому ledger → движение НЕ создаём
 // (ALIGNED). Идемпотентно. ──

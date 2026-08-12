@@ -395,6 +395,22 @@ async function main() {
     let sh = false; for (let i = 0; i < 40; i++) { if (await ev(`!!document.querySelector('[data-workflow-sheet]')`)) { sh = true; break; } await sleep(150); }
     ok("UI-004 CORRECT: открыт пошаговый лист", sh);
     ok("UI-004 CORRECT: на текущем шаге видно ≤1 поля", (await sheetFields()) <= 1, String(await sheetFields()));
+    // Задача O: EAN расхождения проверяется сервером НЕМЕДЛЕННО. Подсказка называет ожидаемый товар.
+    if (ids.ctrlEanA && ids.ctrlEanB && ids.ctrlItemAName) {
+      t = await bodyText();
+      ok("O-CORRECT: подсказка называет ожидаемый товар", has(t, `Сканируйте товар ${ids.ctrlItemAName}`));
+      // неверный EAN (валидный EAN другого товара) → красная ошибка, шаг не меняется (нет поля количества)
+      await setSheetField(ids.ctrlEanB); await clickText("/Ввести/"); await sleep(700);
+      ok("O-CORRECT: неверный EAN → красная ошибка", await ev(`!!document.querySelector('[role=alert]')`));
+      ok("O-CORRECT: шаг не изменился (нет поля количества)", !(await ev(`!!document.querySelector('[data-workflow-sheet] input[type="number"]')`)));
+      await clickText(/Повторить/); await sleep(300);
+      // верный EAN → зелёное «Товар подтверждён» → шаг количества (number)
+      await setSheetField(ids.ctrlEanA); await clickText("/Ввести/");
+      let green = false; for (let i = 0; i < 60; i++) { if (await ev(`document.body.innerText.includes("Товар подтверждён")`)) { green = true; break; } await sleep(60); }
+      ok("O-CORRECT: верный EAN → зелёное подтверждение (UI-005)", green);
+      let atQty = false; for (let i = 0; i < 60; i++) { if (await ev(`!!document.querySelector('[data-workflow-sheet] input[type="number"]')`)) { atQty = true; break; } await sleep(150); }
+      ok("O-CORRECT: авто-переход к шагу количества", atQty);
+    }
   }
   // CONTROL-001 (Задача N): после скана QR — только список строк-кнопок (без EAN/количества/состояния/
   // комментария/мастера). Клик подтверждает строку (галка), завершение заблокировано до подтверждения
@@ -670,6 +686,11 @@ async function main() {
     let btns = await scanBtns();
     ok("J/13: фаза замера начинается с EAN — кнопка «Сканировать товар» (не ячейка)", btns.length === 1 && btns[0] === "Сканировать товар", JSON.stringify(btns));
     ok("J/12: одновременно один шаг (одна scan-кнопка)", btns.length === 1, JSON.stringify(btns));
+    // Задача K/O регрессия: фаза вывоза компактна — старые «Фаза 2»/повтор «Готово к вывозу»/длинные
+    // зелёные инструкции НЕ возвращены; в шторке нет этих строк.
+    const coolSheetTxt = await ev(`document.querySelector('[data-workflow-sheet]')?.innerText || ""`);
+    ok("J/K-регресс: нет «Фаза 2»/«Готово к вывозу»/длинных зелёных инструкций в шторке охлаждения",
+      !coolSheetTxt.includes("Фаза 2") && !coolSheetTxt.includes("Готово к вывозу") && !coolSheetTxt.includes("Разместите товар в хранение и подтвердите"));
 
     // тест 1: неверный/чужой EAN сразу отклонён сервером; температура не показана; БД не меняется.
     await clickScan("/Сканировать товар/");
@@ -1004,6 +1025,85 @@ async function main() {
     await clickText(/^Ок$/);
     let gone = false; for (let i = 0; i < 40; i++) { if (!(await bodyText()).includes("Разместить заказ в выдаче")) { gone = true; break; } await sleep(200); }
     ok("N-ISSUE: после «Ок» размещение завершено (задача больше не текущая)", gone);
+  }
+
+  // ── ISSUE-003 v1 (Задача O): DELIVER — QR заказа → зелёное → ячейка выдачи → атомальная выдача.
+  //    Каждый скан проверяется сервером немедленно; финал до «Ок»; подсказка над камерой. ──
+  if (ids.deliverToken && ids.deliverOrderNQr) {
+    const dOpen = async () => { for (let i = 0; i < 40; i++) { if (await ev(`!!document.querySelector('[data-workflow-sheet]')`)) return true; await sleep(150); } return false; };
+    const dAlert = async () => { for (let i = 0; i < 40; i++) { if (await ev(`!!document.querySelector('[role=alert]')`)) return true; await sleep(150); } return false; };
+    const hintAboveCam = async () => ev(`(()=>{const sh=document.querySelector('[data-workflow-sheet]'); if(!sh) return false; const hint=[...sh.querySelectorAll('p')].find(p=>/Сканируйте/.test(p.textContent)); const inp=sh.querySelector('input'); if(!hint||!inp) return false; return (hint.compareDocumentPosition(inp) & Node.DOCUMENT_POSITION_FOLLOWING)!==0;})()`);
+    await setViewport(true);
+    await setAuth(ids.deliverToken);
+    await goto("/warehouse/tasks", `document.body.innerText.includes("Выдать водителю")`);
+    t = await bodyText();
+    ok("O-DELIVER card: команда/№/маршрут «ячейка → Водитель»", has(t, "Выдать водителю") && has(t, ids.deliverOrderNExt) && has(t, ids.deliverAssignedCellCode) && has(t, "Водитель"));
+    ok("O-DELIVER card: мобайл без переполнения", await ev(`document.documentElement.scrollWidth <= window.innerWidth + 1`));
+    await clickText(/Выдать водителю \(сканирование\)/);
+    ok("O-DELIVER: сканер открыт на шаге QR (одно поле, без EAN)", (await dOpen()) && (await sheetCount()) <= 1 && !(await ev(`!!document.querySelector('[data-workflow-sheet] input[placeholder*="EAN"]')`)));
+    ok("O-DELIVER: подсказка НАД камерой (перед полем ввода)", await hintAboveCam());
+    t = await bodyText();
+    ok("O-DELIVER: подсказка называет заказ", has(t, `Сканируйте QR заказа ${ids.deliverOrderNExt}`));
+    // неверный QR (QR ячейки — не заказ) → красная ошибка, шаг не меняется
+    await setSheetField(ids.deliverWrongCellQr); await clickText("/Ввести/"); await sleep(700);
+    ok("O-DELIVER: неверный QR → красная ошибка", await dAlert());
+    await clickText(/Повторить/); await sleep(300);
+    // верный QR → зелёное → авто-переход к ячейке
+    await setSheetField(ids.deliverOrderNQr); await clickText("/Ввести/");
+    let dGreen = false; for (let i = 0; i < 90; i++) { if (await ev(`document.body.innerText.includes("Заказ подтверждён")`)) { dGreen = true; break; } await sleep(60); }
+    ok("O-DELIVER: верный QR → зелёное подтверждение (UI-005)", dGreen);
+    let dCell = false; for (let i = 0; i < 60; i++) { if (await ev(`!!document.querySelector('[data-workflow-sheet] input[placeholder*="ячейк"]')`)) { dCell = true; break; } await sleep(150); }
+    ok("O-DELIVER: авто-переход к скану ячейки выдачи", dCell);
+    // неверная ячейка → красная ошибка
+    await setSheetField(ids.deliverWrongCellQr); await clickText("/Ввести/"); await sleep(700);
+    ok("O-DELIVER: неверная ячейка → красная ошибка", await dAlert());
+    await clickText(/Повторить/); await sleep(300);
+    // правильная ячейка → финал «Заказ выдан водителю» до «Ок»
+    await setSheetField(ids.deliverAssignedCellQr); await clickText("/Ввести/");
+    let dDone = false; for (let i = 0; i < 90; i++) { if (await ev(`document.body.innerText.includes("Заказ выдан водителю")`)) { dDone = true; break; } await sleep(80); }
+    ok("O-DELIVER: правильная ячейка → финал «Заказ выдан водителю»", dDone);
+    await clickText(/^Ок$/);
+    let dGone = false; for (let i = 0; i < 40; i++) { if (!(await bodyText()).includes("Выдать водителю")) { dGone = true; break; } await sleep(200); }
+    ok("O-DELIVER: после «Ок» выдача завершена (задача больше не текущая)", dGone);
+  }
+
+  // ── MOVE_GROUP (Задача O): исходная ячейка → товар → целевая ячейка. Каждый скан проверяется
+  //    сервером немедленно; неверный скан → красный, шаг не меняется; подсказки точны. ──
+  if (ids.moveToken && ids.moveFromCellQr) {
+    const mOpen = async () => { for (let i = 0; i < 40; i++) { if (await ev(`!!document.querySelector('[data-workflow-sheet]')`)) return true; await sleep(150); } return false; };
+    const mAlert = async () => { for (let i = 0; i < 40; i++) { if (await ev(`!!document.querySelector('[role=alert]')`)) return true; await sleep(150); } return false; };
+    const greenWait = async () => { for (let i = 0; i < 60; i++) { if (await ev(`document.body.innerText.includes("Подтверждено")`)) return true; await sleep(60); } return false; };
+    const hintWait = async (sub) => { for (let i = 0; i < 60; i++) { if ((await bodyText()).includes(sub)) return true; await sleep(150); } return false; };
+    await setViewport(true);
+    await setAuth(ids.moveToken);
+    await goto("/warehouse/tasks", `document.body.innerText.includes("Переставить")`);
+    await clickText(/Переставить \(сканирование\)/);
+    ok("O-MOVE: сканер открыт", await mOpen());
+    ok("O-MOVE: подсказка называет исходную ячейку", (await bodyText()).includes(`Сканируйте ячейку ${ids.moveFromCellCode}`));
+    // неверная исходная ячейка (целевая IN-04 — группы там нет) → красная ошибка, шаг не меняется
+    await setSheetField(ids.moveToCellQr); await clickText("/Ввести/"); await sleep(700);
+    ok("O-MOVE: неверная исходная ячейка → красная ошибка", await mAlert());
+    ok("O-MOVE: шаг не изменился (нет EAN-подсказки)", !(await bodyText()).includes(`Сканируйте товар ${ids.moveItemName}`));
+    await clickText(/Повторить/); await sleep(300);
+    // верная исходная ячейка → зелёное → шаг товара
+    await setSheetField(ids.moveFromCellQr); await clickText("/Ввести/");
+    ok("O-MOVE: верная исходная ячейка → зелёное подтверждение", await greenWait());
+    ok("O-MOVE: авто-переход к товару (подсказка называет товар)", await hintWait(`Сканируйте товар ${ids.moveItemName}`));
+    // неверный EAN → красная ошибка
+    await setSheetField(ids.moveEanWrong); await clickText("/Ввести/"); await sleep(700);
+    ok("O-MOVE: неверный EAN → красная ошибка", await mAlert());
+    await clickText(/Повторить/); await sleep(300);
+    // верный EAN → зелёное → шаг целевой ячейки
+    await setSheetField(ids.moveEan); await clickText("/Ввести/");
+    ok("O-MOVE: верный EAN → зелёное подтверждение", await greenWait());
+    ok("O-MOVE: авто-переход к целевой ячейке (подсказка называет ячейку)", await hintWait(`Сканируйте ячейку ${ids.moveToCellCode}`));
+    // правильная целевая ячейка → финал «Группа переставлена» до «Ок»
+    await setSheetField(ids.moveToCellQr); await clickText("/Ввести/");
+    let mDone = false; for (let i = 0; i < 90; i++) { if (await ev(`document.body.innerText.includes("Группа переставлена")`)) { mDone = true; break; } await sleep(80); }
+    ok("O-MOVE: правильная целевая ячейка → финал «Группа переставлена»", mDone);
+    await clickText(/^Ок$/);
+    let mGone = false; for (let i = 0; i < 40; i++) { if (!(await bodyText()).includes("Переставить")) { mGone = true; break; } await sleep(200); }
+    ok("O-MOVE: после «Ок» перестановка завершена (задача больше не текущая)", mGone);
   }
 
   // ── Задача H: монитор ADMIN — новые задачи сверху (createdAt DESC, id DESC) + серверная пагинация;

@@ -6,7 +6,8 @@ import { ScanLine } from "lucide-react";
 import {
   verifyIssueScanAction,
   placeWholeOrderAction,
-  issueAction,
+  verifyDeliverScanAction,
+  deliverWholeOrderAction,
 } from "@/app/actions/order-issue";
 import { Button } from "@/components/ui";
 import { WorkflowSheet, type ScanFormat } from "@/components/workflow-sheet";
@@ -37,6 +38,9 @@ export interface DeliverOrderCtx {
   externalId: string;
   arrivalAt: string | null;
   cells: { cell: string }[];
+  positions: number;
+  units: string;
+  assignedCellCode: string | null;
 }
 
 // ── ISSUE-002 v1: скан QR заказа → зелёное подтверждение → скан назначенной ячейки → атомарное
@@ -90,7 +94,7 @@ function PlaceScanner({ ctx }: { ctx: IssueOrderCtx }) {
       title="Разместить заказ в выдаче"
       subtitle={confirmed || done ? undefined : step === "order" ? `№ ${ctx.externalId}` : `Ячейка ${ctx.assignedCellCode ?? "—"}`}
       scanning={scanning}
-      scanHint={step === "order" ? "Сканируйте QR заказа" : `Сканируйте назначенную ячейку ${ctx.assignedCellCode ?? ""}`}
+      scanHint={step === "order" ? `Сканируйте QR заказа ${ctx.externalId}` : `Сканируйте ячейку ${ctx.assignedCellCode ?? ""}`}
       scanFormats={step === "order" ? ORDER : CELL}
       manualPlaceholder={step === "order" ? "Код QR заказа" : "Код назначенной ячейки"}
       onScan={handleScan}
@@ -137,87 +141,99 @@ export function IssueOrderPanel({ ctx }: { ctx: IssueOrderCtx }) {
   );
 }
 
-// UI-004: выдача водителю — пошаговый скан: QR заказа → каждая ячейка выдачи по очереди → авто-подтверждение
-// (сервер проверит полный набор ячеек). Камера и ручной ввод — одна машина состояний; не набор полей.
+// ── ISSUE-003 v1 (Задача O): выдача — скан QR заказа → зелёное подтверждение → скан единственной
+// ячейки выдачи → атомарная выдача. Одна машина состояний (камера + ручной ввод). Без EAN и списков. ──
 function DeliverScanner({ ctx }: { ctx: DeliverOrderCtx }) {
-  const total = ctx.cells.length;
   const router = useRouter();
   const [open, setOpen] = useState(false);
   const [scanning, setScanning] = useState(false);
   const [step, setStep] = useState<"order" | "cell">("order");
   const [orderRaw, setOrderRaw] = useState("");
-  const [cells, setCells] = useState<string[]>([]);
   const [busy, startTransition] = useTransition();
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
-  const [finished, setFinished] = useState(false);
+  const [confirmed, setConfirmed] = useState(false); // UI-005: зелёное подтверждение заказа перед ячейкой
+  const [done, setDone] = useState(false);           // финальный успех — держится до «Ок»
 
-  function reset() { setStep("order"); setOrderRaw(""); setCells([]); setNotice(null); }
-  function closeAll() { setOpen(false); setScanning(false); reset(); setError(null); setFinished(false); router.refresh(); }
+  function closeAll() { setOpen(false); setScanning(false); setStep("order"); setOrderRaw(""); setConfirmed(false); setDone(false); setError(null); router.refresh(); }
 
   function handleScan(raw: string) {
-    if (busy) return;
-    if (step === "order") { setOrderRaw(raw.trim()); setStep("cell"); setNotice(`Заказ отсканирован — сканируйте ячейки выдачи (0/${total})`); return; }
-    const v = raw.trim(); if (!v) return;
-    const next = cells.includes(v) ? cells : [...cells, v];
-    setCells(next);
-    if (next.length >= total) {
+    if (busy || confirmed || done) return;
+    if (step === "order") {
       startTransition(async () => {
         const fd = new FormData();
-        fd.set("taskId", ctx.taskId); fd.set("orderCode", orderRaw); fd.set("cellCodes", next.join(","));
-        const res = await issueAction({}, fd);
-        if (res.error) { setError(res.error); return; }
-        setScanning(false); setFinished(true);
+        fd.set("taskId", ctx.taskId); fd.set("orderCode", raw);
+        const res = await verifyDeliverScanAction({}, fd);
+        if (res.error) { setError(res.error); return; } // неверный QR — шаг не меняется, БД не меняется
+        setOrderRaw(raw); setScanning(false); setConfirmed(true);
+        // заметное зелёное подтверждение (UI-005), затем автоматически открывается скан ячейки
+        setTimeout(() => { setConfirmed(false); setStep("cell"); setScanning(true); }, 1200);
       });
-    } else setNotice(`Отсканировано ячеек ${next.length}/${total}`);
+      return;
+    }
+    // step === cell → атомарная выдача из единственной ячейки
+    startTransition(async () => {
+      const fd = new FormData();
+      fd.set("taskId", ctx.taskId); fd.set("orderCode", orderRaw); fd.set("cellCode", raw);
+      const res = await deliverWholeOrderAction({}, fd);
+      if (res.error) { setError(res.error); return; } // неверная ячейка — без движения, шаг не меняется
+      setScanning(false); setDone(true); // финальное уведомление до «Ок»
+    });
   }
 
   if (!open)
     return (
-      <Button type="button" variant="primary" onClick={() => { setOpen(true); setScanning(true); setStep("order"); }} className="w-full">
+      <Button type="button" variant="primary" onClick={() => { setOpen(true); setStep("order"); setScanning(true); setError(null); }} className="w-full">
         <ScanLine size={18} /> Выдать водителю (сканирование)
       </Button>
     );
-
   return (
     <WorkflowSheet
-      title={`Выдача заказа ${ctx.externalId}`}
-      subtitle={step === "order" ? "Сканируйте QR заказа" : `Ячейки выдачи ${cells.length}/${total}`}
+      title="Выдать водителю"
+      subtitle={confirmed || done ? undefined : step === "order" ? `№ ${ctx.externalId}` : `Ячейка ${ctx.assignedCellCode ?? "—"}`}
       scanning={scanning}
-      scanHint={step === "order" ? "Сканируйте QR заказа" : "Сканируйте ячейку выдачи (QR/Code 128)"}
+      scanHint={step === "order" ? `Сканируйте QR заказа ${ctx.externalId}` : `Сканируйте ячейку ${ctx.assignedCellCode ?? ""}`}
       scanFormats={step === "order" ? ORDER : CELL}
       manualPlaceholder={step === "order" ? "Код QR заказа" : "Код ячейки выдачи"}
       onScan={handleScan}
-      scanPaused={busy}
+      scanPaused={busy || confirmed || done}
       busy={busy}
       onBackToList={() => setScanning(false)}
-      onClose={closeAll}
+      onClose={() => { setOpen(false); setScanning(false); setError(null); }}
       error={error}
       onErrorRetry={() => setError(null)}
-      onErrorExit={() => { setError(null); setScanning(false); reset(); }}
-      modal={finished ? { title: "Заказ выдан водителю", body: "Все ячейки подтверждены.", actions: (<Button type="button" variant="primary" onClick={closeAll} className="w-full">Ок</Button>) } : null}
+      onErrorExit={() => { setError(null); setScanning(false); setOpen(false); }}
+      modal={
+        done
+          ? { title: "Заказ выдан водителю", body: `№ ${ctx.externalId} — передан водителю`, actions: (<Button type="button" variant="primary" onClick={closeAll} className="w-full">Ок</Button>) }
+          : confirmed
+            ? { title: "Заказ подтверждён", body: `№ ${ctx.externalId} — сканируйте ячейку ${ctx.assignedCellCode ?? ""}` }
+            : null
+      }
       footer={
-        <Button type="button" variant="primary" onClick={() => { setScanning(true); }} className="w-full">
+        <Button type="button" variant="primary" onClick={() => setScanning(true)} className="w-full">
           <ScanLine size={18} /> {step === "order" ? "Сканировать QR заказа" : "Сканировать ячейку"}
         </Button>
       }
     >
-      {notice && <p className="pb-1 text-sm font-medium text-green-600">{notice}</p>}
-      <p className="text-sm text-neutral-500">Отсканируйте QR заказа, затем поочерёдно все ячейки выдачи. Подтверждение — автоматически после последней ячейки.</p>
+      <p className="text-sm text-neutral-500">
+        {step === "order" ? `Отсканируйте QR заказа ${ctx.externalId}.` : `Отсканируйте ячейку выдачи ${ctx.assignedCellCode ?? ""}.`}
+      </p>
     </WorkflowSheet>
   );
 }
 
 export function DeliverOrderPanel({ ctx }: { ctx: DeliverOrderCtx }) {
+  // Fail-closed v1: у заказа должна быть ровно одна фактическая ячейка выдачи.
+  if (!ctx.assignedCellCode)
+    return (
+      <div role="alert" className="rounded-xl border border-red-200 bg-red-50 p-3">
+        <div className="text-sm font-semibold text-red-700">Ячейка выдачи не определена</div>
+        <div className="mt-0.5 text-sm text-neutral-600">Обновите страницу или обратитесь к администратору — выдать заказ нельзя.</div>
+      </div>
+    );
   return (
     <div className="flex flex-col gap-2">
-      {/* TASK-006 (расширение): технический заголовок убран — заказ/маршрут в компактной карточке. */}
-      <div className="text-xs font-medium text-neutral-500">Ячейки выдачи заказа ({ctx.cells.length}):</div>
-      {ctx.cells.map((c, i) => (
-        <div key={i} className="rounded-xl bg-[#f7f8fc] px-3 py-2 text-sm">{c.cell}</div>
-      ))}
       <DeliverScanner ctx={ctx} />
-      <p className="text-xs text-neutral-400">Сервер проверит полный набор ячеек. Подтверждение водителя не требуется.</p>
     </div>
   );
 }

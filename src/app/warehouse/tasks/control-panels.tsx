@@ -7,6 +7,7 @@ import {
   scanOrderControlAction,
   confirmControlLineAction,
   finishControlAction,
+  verifyCorrectionEanAction,
   resolveShortageAction,
   resolveRemovalAction,
   completeCorrectionAction,
@@ -103,7 +104,7 @@ function ScanOrderCamera({ taskId, externalId }: { taskId: string; externalId: s
       title="Проверить заказ"
       subtitle={confirmed ? undefined : `№ ${externalId}`}
       scanning={scanning}
-      scanHint="Сканируйте QR заказа"
+      scanHint={`Сканируйте QR заказа ${externalId}`}
       scanFormats={ORDERF}
       manualPlaceholder="Код QR заказа"
       onScan={handleScan}
@@ -230,14 +231,24 @@ function ResolveDiscrepancy({ taskId, disc }: { taskId: string; disc: CorrectOrd
   const [comment, setComment] = useState("");
   const [busy, startTransition] = useTransition();
   const [error, setError] = useState<string | null>(null);
+  const [confirmed, setConfirmed] = useState(false); // UI-005: зелёное подтверждение товара расхождения
   const inputCls = "rounded-lg border border-[#e4e4f0] px-3 py-2 text-sm outline-none focus:border-brand";
 
-  function reset() { setStep("product"); setEan(""); setQty(""); setDisposition(isDamaged ? "DISCREPANCY" : "RETURN"); setComment(""); }
+  function reset() { setStep("product"); setEan(""); setQty(""); setDisposition(isDamaged ? "DISCREPANCY" : "RETURN"); setComment(""); setConfirmed(false); }
+  // Задача O: EAN расхождения проверяется сервером НЕМЕДЛЕННО (verifyCorrectionEanAction) — не клиентским
+  // setStep. Неверный товар → красная ошибка, шаг не меняется, БД не мутирует. Верный → зелёное → количество.
   function handleScan(raw: string) {
-    if (busy) return;
+    if (busy || confirmed) return;
     const v = raw.trim();
-    if (!v) { setError(isShortage ? "Отсканируйте EAN добавляемого товара" : "Отсканируйте EAN удаляемого товара"); return; }
-    setEan(v); setScanning(false); setStep("qty");
+    if (!v) { setError(`Отсканируйте товар ${disc.item}`); return; }
+    startTransition(async () => {
+      const fd = new FormData();
+      fd.set("taskId", taskId); fd.set("checkLineId", disc.checkLineId); fd.set("ean", v);
+      const res = await verifyCorrectionEanAction({}, fd);
+      if (res.error) { setError(res.error); return; } // товар не тот — шаг не меняется
+      setEan(v); setScanning(false); setConfirmed(true);
+      setTimeout(() => { setConfirmed(false); setStep("qty"); }, 900);
+    });
   }
   function submitQty() {
     const n = Number(qty.replace(",", "."));
@@ -285,18 +296,19 @@ function ResolveDiscrepancy({ taskId, disc }: { taskId: string; disc: CorrectOrd
           title={isShortage ? "Добавить товар" : "Удалить товар"}
           subtitle={step === "product" ? "Шаг 1 · штрихкод" : step === "qty" ? "Шаг 2 · количество" : step === "method" ? "Шаг 3 · способ" : step === "comment" ? "Комментарий (необязательно)" : "Итог"}
           scanning={scanning}
-          scanHint={isShortage ? "Сканируйте EAN добавляемого товара" : "Сканируйте EAN удаляемого товара"}
+          scanHint={`Сканируйте товар ${disc.item}`}
           scanFormats={PRODUCT}
-          manualPlaceholder={isShortage ? "EAN добавляемого товара" : "EAN удаляемого товара"}
+          manualPlaceholder={`EAN товара ${disc.item}`}
           manualInputMode="numeric"
           onScan={handleScan}
-          scanPaused={busy}
+          scanPaused={busy || confirmed}
           busy={busy}
           onBackToList={() => setScanning(false)}
           onClose={() => { setOpen(false); setScanning(false); reset(); setError(null); }}
           error={error}
-          onErrorRetry={() => setError(null)}
+          onErrorRetry={() => { setError(null); setScanning(true); }}
           onErrorExit={() => { setError(null); setScanning(false); reset(); }}
+          modal={confirmed ? { title: "Товар подтверждён", body: disc.item } : null}
           footer={
             step === "qty" ? (
               <>

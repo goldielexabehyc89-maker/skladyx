@@ -22,6 +22,7 @@ import { createHandlingGroup, completeGroupPlacement, prepareGroupPlacement } fr
 import { startWorkflowTask, rebalanceQueuedTasks, createWorkflowTask } from "@/lib/workflow-tasks";
 import { importExternalOrder, reserveAndPlanOrder, pickOrderScan } from "@/lib/external-orders";
 import { scanOrderForControl, markOrderControlByScan, confirmControlLine, finishOrderControl, createControlTaskInTx } from "@/lib/order-control";
+import { placeWholeOrderInIssueCell } from "@/lib/order-issue";
 import { applyLotMovement } from "@/lib/stock";
 import { createQrIn } from "@/lib/qr";
 import { createSessionToken } from "@/lib/jwt";
@@ -536,6 +537,67 @@ async function main() {
   const issWrongCellQr = (await prisma.qrCode.findFirstOrThrow({ where: { companyId, type: "CELL", refId: issOtherCell.id } })).code;
   const issuePlaceToken = await mkToken(issLo, "LOADER");
 
+  // ── Задача O: реальная фикстура ВЫДАЧИ (DELIVER_ORDER «в работе»). Второй заказ доведён до размещения
+  //    (реальные placements в единственной ячейке), затем DELIVER стартован у своего погрузчика. ──
+  await createCellsInZone({ companyId, warehouseId: issWh.id, zoneId: issStorage.id, codes: ["IN-02", "IN-03", "IN-04"], level: 1 });
+  const seedStorageGroup = async (code: string, qty: number, num: number, dk: string) => {
+    const cellRow = await prisma.cell.findFirstOrThrow({ where: { companyId, warehouseId: issWh.id, code } });
+    const rec = await prisma.receipt.create({ data: { companyId, number: num, warehouseId: issWh.id, status: "POSTED", postedAt: new Date(), createdById: issPk } });
+    const ln = await prisma.receiptLine.create({ data: { companyId, receiptId: rec.id, itemId: issItem.id, qty } });
+    const lot = await prisma.lot.create({ data: { companyId, itemId: issItem.id, receiptLineId: ln.id, qtyReceived: qty } });
+    await prisma.$transaction((tx) => applyLotMovement(tx, { companyId, docType: "RECEIPT", docId: rec.id, itemId: issItem.id, lotId: lot.id, qty, from: null, to: { kind: "cell", warehouseId: issWh.id, cellId: cellRow.id }, createdById: issPk }));
+    const grp = await prisma.handlingGroup.create({ data: { companyId, warehouseId: issWh.id, itemId: issItem.id, lotId: lot.id, qty, temperature: 0, thresholdX: X, status: "IN_STORAGE", dedupeKey: dk, acceptedById: issPk } });
+    await prisma.$transaction((tx) => createQrIn(tx, { companyId, type: "GROUP", refId: grp.id }));
+    return { cellId: cellRow.id, groupId: grp.id, lotId: lot.id };
+  };
+  const issPlaceLo2 = await mkUser(companyId, "+79000009941", "CI Погрузчик разм2 N", "LOADER", "CiIssPl2-9941", issWh.id);
+  const issDelLo = await mkUser(companyId, "+79000009942", "CI Погрузчик выдача2 N", "LOADER", "CiIssDel-9942", issWh.id);
+  const issPlaceLo2Shift = await prisma.workShift.create({ data: { companyId, userId: issPlaceLo2, warehouseId: issWh.id, role: "LOADER" } });
+  const issDelShift = await prisma.workShift.create({ data: { companyId, userId: issDelLo, warehouseId: issWh.id, role: "LOADER" } });
+  await seedStorageGroup("IN-02", 2, 9994002, "ci-del-n-1");
+  const DEL_ORDER_EXT = "EO-CI-DELIVER-N";
+  const impDel = await importExternalOrder({ companyId, warehouseId: issWh.id, externalId: DEL_ORDER_EXT, createdById: issPk, arrivalAt: null, lines: [{ externalLineId: "1", itemId: issItem.id, requiredQty: 2 }] });
+  await reserveAndPlanOrder({ companyId, orderId: impDel.orderId });
+  let delPt = await prisma.workflowTask.findFirst({ where: { type: "PICK_ORDER", subjectId: impDel.orderId } });
+  if (delPt && delPt.status === "QUEUED") { await rebalanceQueuedTasks(companyId, { warehouseId: issWh.id }); delPt = await prisma.workflowTask.findUniqueOrThrow({ where: { id: delPt.id } }); }
+  if (delPt && delPt.status === "ASSIGNED") await startWorkflowTask(delPt.assignedUserId!, companyId, delPt.id);
+  for (let i = 0; i < 10; i++) { const r = await prisma.stockReservation.findFirst({ where: { orderId: impDel.orderId, status: "ACTIVE" } }); if (!r) break; const cq = (await prisma.qrCode.findFirstOrThrow({ where: { type: "CELL", refId: r.cellId! } })).code; await pickOrderScan({ companyId, userId: delPt!.assignedUserId!, taskId: delPt!.id, cellCode: cq, ean: ISS_EAN, qty: r.qty.toNumber() }); }
+  let delCt = await prisma.workflowTask.findFirstOrThrow({ where: { type: "CONTROL_ORDER", subjectId: impDel.orderId }, orderBy: { createdAt: "desc" } });
+  if (delCt.status === "QUEUED") { await rebalanceQueuedTasks(companyId, { warehouseId: issWh.id }); delCt = await prisma.workflowTask.findUniqueOrThrow({ where: { id: delCt.id } }); }
+  if (delCt.status === "ASSIGNED") await startWorkflowTask(issCtl, companyId, delCt.id);
+  const delOrderQr = (await prisma.qrCode.findFirstOrThrow({ where: { companyId, type: "ORDER", refId: impDel.orderId } })).code;
+  await scanOrderForControl({ companyId, userId: issCtl, taskId: delCt.id, orderCode: delOrderQr });
+  for (const l of await prisma.externalOrderLine.findMany({ where: { orderId: impDel.orderId } })) await confirmControlLine({ companyId, userId: issCtl, taskId: delCt.id, lineId: l.id });
+  await finishOrderControl({ companyId, userId: issCtl, taskId: delCt.id });
+  const delIssueTask = await prisma.workflowTask.findFirstOrThrow({ where: { type: "ISSUE_ORDER", subjectId: impDel.orderId }, orderBy: { createdAt: "desc" } });
+  await prisma.workflowTask.update({ where: { id: delIssueTask.id }, data: { status: "ASSIGNED", assignedUserId: issPlaceLo2, assignedShiftId: issPlaceLo2Shift.id, assignedAt: new Date(), startedAt: null } });
+  const rDelPlaceStart = await startWorkflowTask(issPlaceLo2, companyId, delIssueTask.id);
+  if (rDelPlaceStart.error) throw new Error(`CI deliver place start: ${rDelPlaceStart.error}`);
+  const delIssueCell = await prisma.orderIssueCell.findFirstOrThrow({ where: { orderId: impDel.orderId, status: { not: "RELEASED" } } });
+  const delAssignedCellQr = (await prisma.qrCode.findFirstOrThrow({ where: { companyId, type: "CELL", refId: delIssueCell.cellId } })).code;
+  await placeWholeOrderInIssueCell({ companyId, userId: issPlaceLo2, taskId: delIssueTask.id, orderCode: delOrderQr, cellCode: delAssignedCellQr });
+  const delTask = await prisma.workflowTask.findFirstOrThrow({ where: { type: "DELIVER_ORDER", subjectId: impDel.orderId }, orderBy: { createdAt: "desc" } });
+  await prisma.workflowTask.update({ where: { id: delTask.id }, data: { status: "ASSIGNED", assignedUserId: issDelLo, assignedShiftId: issDelShift.id, assignedAt: new Date(), startedAt: null } });
+  const rDelStart = await startWorkflowTask(issDelLo, companyId, delTask.id);
+  if (rDelStart.error) throw new Error(`CI deliver start: ${rDelStart.error}`);
+  const delAssignedCellCode = (await prisma.cell.findUniqueOrThrow({ where: { id: delIssueCell.cellId } })).code;
+  // «неверная ячейка» для выдачи — любая ISSUE-ячейка склада, НЕ назначенная этому заказу
+  const delOtherCell = await prisma.cell.findFirstOrThrow({ where: { companyId, warehouseId: issWh.id, zone: { kind: "ISSUE" }, id: { not: delIssueCell.cellId } } });
+  const delWrongCellQr = (await prisma.qrCode.findFirstOrThrow({ where: { companyId, type: "CELL", refId: delOtherCell.id } })).code;
+  const deliverToken = await mkToken(issDelLo, "LOADER");
+
+  // ── Задача O: реальная фикстура MOVE_GROUP «в работе». Группа в IN-03, бронь на IN-04. Каждый скан
+  //    (исходная ячейка, EAN, целевая ячейка) проверяется сервером немедленно. ──
+  const issMoveLo = await mkUser(companyId, "+79000009943", "CI Погрузчик перест N", "LOADER", "CiIssMv-9943", issWh.id);
+  const issMoveShift = await prisma.workShift.create({ data: { companyId, userId: issMoveLo, warehouseId: issWh.id, role: "LOADER" } });
+  const mvSeed = await seedStorageGroup("IN-03", 3, 9994003, "ci-mv-n-1");
+  const mvToCell = await prisma.cell.findFirstOrThrow({ where: { companyId, warehouseId: issWh.id, code: "IN-04" } });
+  const mvTaskO = await prisma.workflowTask.create({ data: { companyId, warehouseId: issWh.id, type: "MOVE_GROUP", requiredRole: "LOADER", priority: "NORMAL", status: "IN_PROGRESS", title: "Перестановка группы", subjectType: "handlingGroup", subjectId: mvSeed.groupId, dedupeKey: "ci-mv-n-task", assignedUserId: issMoveLo, assignedShiftId: issMoveShift.id, assignedAt: new Date(), startedAt: new Date(), availableAt: new Date(Date.now() - 1000) } });
+  await prisma.cellReservation.create({ data: { companyId, warehouseId: issWh.id, cellId: mvToCell.id, handlingGroupId: mvSeed.groupId, taskId: mvTaskO.id, status: "ACTIVE" } });
+  const moveFromCellQr = (await prisma.qrCode.findFirstOrThrow({ where: { companyId, type: "CELL", refId: mvSeed.cellId } })).code;
+  const moveToCellQr = (await prisma.qrCode.findFirstOrThrow({ where: { companyId, type: "CELL", refId: mvToCell.id } })).code;
+  const moveToken = await mkToken(issMoveLo, "LOADER");
+
   // ── Задача H: монитор ADMIN — новые задачи сверху (createdAt DESC, id DESC). Сентинел создаётся
   //    ПОСЛЕДНИМ → на мониторе он должен идти выше всех ранее созданных задач. QUEUED (не назначается).
   const MONITOR_NEWEST_TITLE = "CI Монитор сентинел (новейшая)";
@@ -654,6 +716,22 @@ async function main() {
     issueAssignedCellCode: issAssignedCellCode, // человекочитаемый код назначенной ячейки
     issueAssignedCellQr: issAssignedCellQr,     // QR назначенной ячейки (скан)
     issueWrongCellQr: issWrongCellQr,           // QR другой (неназначенной) ISSUE-ячейки
+    // Задача O: DELIVER_ORDER «в работе» (реальные placements, единственная ячейка)
+    deliverToken,                    // погрузчик выдачи
+    deliverOrderNExt: DEL_ORDER_EXT, // № заказа выдачи
+    deliverOrderNQr: delOrderQr,     // верный QR заказа
+    deliverAssignedCellCode: delAssignedCellCode, // код ячейки выдачи
+    deliverAssignedCellQr: delAssignedCellQr,     // QR ячейки выдачи (скан)
+    deliverWrongCellQr: delWrongCellQr,           // QR ISSUE-ячейки, НЕ назначенной этому заказу
+    // Задача O: MOVE_GROUP «в работе» — исходная/целевая ячейки, EAN товара группы
+    moveToken,                       // погрузчик перестановки
+    moveItemName: "CI Выдача-товар N",
+    moveFromCellCode: "IN-03",
+    moveToCellCode: "IN-04",
+    moveFromCellQr,                  // верная исходная ячейка
+    moveToCellQr,                    // верная целевая ячейка (и «неверная исходная» для from-шага)
+    moveEan: ISS_EAN,                // верный EAN товара группы
+    moveEanWrong: CTRL_EAN_A,        // валидный EAN другого товара → не тот товар
   }));
   process.exit(0);
 }
