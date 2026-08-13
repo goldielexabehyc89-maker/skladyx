@@ -1,7 +1,6 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
-import { redirect } from "next/navigation";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/db";
 import { requireUser } from "@/lib/auth";
@@ -14,6 +13,11 @@ import type { Role } from "@/lib/jwt";
 
 export interface ShiftState {
   error?: string;
+  // P3A.2: при успехе действие НЕ делает server-action redirect() (встроенный RSC-переход после
+  // action иногда рендерится без корректного tenant/session-контекста → Application error/UNAUTHORIZED,
+  // digest 852039715). Вместо этого возвращаем целевой маршрут, а клиент делает полную навигацию
+  // (window.location.assign) — свежий запрос с актуальными Host и cookie. Тот же приём, что у logout.
+  redirectTo?: string;
 }
 
 class ShiftConflict extends Error {}
@@ -73,10 +77,10 @@ export async function startWorkShiftAction(_prev: ShiftState, formData: FormData
   revalidatePath("/warehouse/tasks");
   revalidatePath("/warehouse/receiving");
   revalidatePath("/warehouse/employees");
-  // ROLE-003: серверный redirect сразу на рабочий экран активной роли (приёмщик → приёмка, остальные
-  // → задачи). Прямо на целевой маршрут (не через /warehouse) и без зависимости от гидрации клиента;
-  // свежий серверный рендер — layout/меню сразу видят новую активную смену.
-  redirect(role === "RECEIVER" ? "/warehouse/receiving" : "/warehouse/tasks");
+  // ROLE-003: целевой рабочий экран активной роли (приёмщик → приёмка, остальные → задачи). Навигацию
+  // выполняет клиент полным запросом (window.location.assign) — свежий серверный рендер по актуальному
+  // Host/cookie, layout/меню сразу видят новую активную смену. Без server-action redirect().
+  return { redirectTo: role === "RECEIVER" ? "/warehouse/receiving" : "/warehouse/tasks" };
 }
 
 // Завершить текущую смену. Пакет 2: назначенные, но не начатые задачи (ASSIGNED) вернуть
@@ -94,7 +98,7 @@ export async function endWorkShiftAction(_prev: ShiftState, _formData: FormData)
     await prisma.workShift.update({ where: { id: shift.id }, data: { endedAt: new Date() } });
     revalidatePath("/warehouse/shift");
     revalidatePath("/warehouse/employees");
-    redirect("/warehouse/shift");
+    return { redirectTo: "/warehouse/shift" };
   }
 
   let returned: { id: string; title: string; warehouseId: string }[] = [];
@@ -137,7 +141,7 @@ export async function endWorkShiftAction(_prev: ShiftState, _formData: FormData)
   revalidatePath("/warehouse/shift");
   revalidatePath("/warehouse/tasks");
   revalidatePath("/warehouse/employees");
-  // SHIFT-002/ROLE-003: после завершения — серверный redirect на экран смены; меню обновится
-  // (рабочий операционный пункт исчезнет).
-  redirect("/warehouse/shift");
+  // SHIFT-002/ROLE-003: после завершения — экран смены (меню обновится, рабочий операционный пункт
+  // исчезнет). Навигацию делает клиент полным запросом, без server-action redirect().
+  return { redirectTo: "/warehouse/shift" };
 }

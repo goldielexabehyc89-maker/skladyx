@@ -666,6 +666,17 @@ async function main() {
   const muBToken = await mkToken(muB, "PICKER");
   const muAdminToken = await mkToken(adminRecv, "ADMIN");
 
+  // ── P3A.2: реальный старт/завершение смены каждой рабочей роли. Изолированный склад без задач
+  //    (rebalance при старте — no-op, без побочных эффектов). У каждого пользователя одна роль и один
+  //    склад → чипы формы выбраны по умолчанию, «Начать смену» сразу отправляет действие. ──
+  const startWh = await prisma.warehouse.create({ data: { companyId, name: `CI-START-${Date.now()}`, isActive: true, coolingRate: 2 } });
+  const startLoad = await mkUser(companyId, "+79000009961", "CI Старт-погрузчик", "LOADER", "CiStL-9961", startWh.id);
+  const startPick = await mkUser(companyId, "+79000009962", "CI Старт-сборщик", "PICKER", "CiStP-9962", startWh.id);
+  const startCtrl = await mkUser(companyId, "+79000009963", "CI Старт-контролёр", "CONTROLLER", "CiStC-9963", startWh.id);
+  const startLoadToken = await mkToken(startLoad, "LOADER");
+  const startPickToken = await mkToken(startPick, "PICKER");
+  const startCtrlToken = await mkToken(startCtrl, "CONTROLLER");
+
   // ── Задача H: монитор ADMIN — новые задачи сверху (createdAt DESC, id DESC). Сентинел создаётся
   //    ПОСЛЕДНИМ → на мониторе он должен идти выше всех ранее созданных задач. QUEUED (не назначается).
   const MONITOR_NEWEST_TITLE = "CI Монитор сентинел (новейшая)";
@@ -819,6 +830,10 @@ async function main() {
     muBName: "P3 Сборщик B",         // имя исполнителя обычной
     muUrgTitle: MU_URG_TITLE,        // заголовок срочной задачи (видимость у A, не у B)
     muNormTitle: MU_NORM_TITLE,      // заголовок обычной задачи (видимость у B, не у A)
+    // P3A.2: реальный старт/завершение смены рабочих ролей (LOADER/PICKER/CONTROLLER → задачи)
+    startLoadToken,                  // погрузчик без смены (старт → /warehouse/tasks)
+    startPickToken,                  // сборщик без смены (старт → /warehouse/tasks)
+    startCtrlToken,                  // контролёр без смены (старт → /warehouse/tasks)
   }));
   process.exit(0);
 }

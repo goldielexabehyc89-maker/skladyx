@@ -317,25 +317,60 @@ async function main() {
     ok("ROLE-003: рабочий без смены home → /warehouse/shift", (await homePath()) === "/warehouse/shift");
   }
 
-  // ── P1: реальный старт/завершение смены → полная навигация на рабочий экран и обновление меню ──
-  if (ids.startToken) {
-    await setViewport(false);
-    await setAuth(ids.startToken); // приёмщик БЕЗ смены (одна роль/склад — выбраны по умолчанию)
-    await goto("/warehouse/shift", `document.body.innerText.includes("Начать смену")`);
-    await sleep(1800); // гидрация формы серверного действия
-    await clickText(/^Начать смену$/);
-    let toRecv = false;
-    for (let i = 0; i < 70; i++) { if ((await pathname()) === "/warehouse/receiving") { toRecv = true; break; } await sleep(200); }
-    ok("SHIFT-001: старт RECEIVER → переход прямо на /warehouse/receiving", toRecv, await pathname());
-    ok("SHIFT-001: после старта в меню появилась «Приёмка»", await navHas("/warehouse/receiving"));
-    // завершить смену → /warehouse/shift, рабочий пункт исчезает
-    await goto("/warehouse/shift", `document.body.innerText.includes("Завершить смену")`);
-    await sleep(1500);
-    await clickText(/Завершить смену/);
-    let ended = false;
-    for (let i = 0; i < 70; i++) { const p = await pathname(); if (p === "/warehouse/shift" && (await bodyText()).includes("Начать смену")) { ended = true; break; } await sleep(200); }
-    ok("SHIFT-002: завершение смены → /warehouse/shift (форма старта)", ended);
-    ok("SHIFT-002: рабочий пункт «Приёмка» исчез из меню", !(await navHas("/warehouse/receiving")));
+  // ── P3A.2: реальный старт/завершение смены каждой рабочей роли. Действие больше НЕ делает
+  //    server-action redirect(); клиент выполняет полную навигацию (window.location.assign) на
+  //    правильный экран — без Application error/UNAUTHORIZED и без ручного reload; ровно одна смена;
+  //    меню сразу по роли; завершение → /warehouse/shift; ошибка оставляет на текущем экране. ──
+  {
+    let spr = null; try { spr = new PrismaClient(); await spr.$queryRaw`SELECT 1`; } catch { spr = null; }
+    const uidOf = (tok) => { try { return JSON.parse(Buffer.from(tok.split(".")[1], "base64url").toString()).userId; } catch { return null; } };
+    const activeShifts = async (uid) => { if (!spr || !uid) return null; try { return await spr.workShift.count({ where: { userId: uid, endedAt: null } }); } catch { return null; } };
+    const menuHas = async (href) => ev(`!!document.querySelector('aside a[href="${href}"], nav a[href="${href}"]')`);
+    const noAppErr = (t) => !has(t, "Application error") && !has(t, "UNAUTHORIZED") && !has(t, "client-side exception");
+
+    const roundTrip = async (label, token, target, menuHref, mobile) => {
+      const uid = uidOf(token);
+      await setViewport(mobile);
+      await setAuth(token);
+      await goto("/warehouse/shift", `document.body.innerText.includes("Начать смену")`);
+      await sleep(1800); // гидрация формы серверного действия
+      await clickText(/^Начать смену$/);
+      let reached = false; for (let i = 0; i < 80; i++) { if ((await pathname()) === target) { reached = true; break; } await sleep(200); }
+      const bt = await bodyText();
+      ok(`SHIFT-001 (${label}): старт → ${target} сразу, без ручного reload`, reached, await pathname());
+      ok(`SHIFT-001 (${label}): нет Application error/UNAUTHORIZED после старта`, noAppErr(bt));
+      ok(`SHIFT-001 (${label}): меню сразу соответствует роли (${menuHref})`, await menuHas(menuHref));
+      const nStart = await activeShifts(uid);
+      ok(`SHIFT-001 (${label}): создана ровно одна смена`, nStart === null ? true : nStart === 1, `n=${nStart}`);
+      await goto("/warehouse/shift", `document.body.innerText.includes("Завершить смену")`);
+      await sleep(1200);
+      await clickText(/Завершить смену/);
+      let ended = false; for (let i = 0; i < 80; i++) { const p = await pathname(); if (p === "/warehouse/shift" && (await bodyText()).includes("Начать смену")) { ended = true; break; } await sleep(200); }
+      const et = await bodyText();
+      ok(`SHIFT-002 (${label}): завершение → /warehouse/shift сразу, без reload`, ended);
+      ok(`SHIFT-002 (${label}): нет Application error/UNAUTHORIZED после завершения`, noAppErr(et));
+      const nEnd = await activeShifts(uid);
+      ok(`SHIFT-002 (${label}): активных смен не осталось`, nEnd === null ? true : nEnd === 0, `n=${nEnd}`);
+    };
+
+    if (ids.startToken) await roundTrip("RECEIVER→приёмка, desktop", ids.startToken, "/warehouse/receiving", "/warehouse/receiving", false);
+    if (ids.startLoadToken) await roundTrip("LOADER→задачи, mobile", ids.startLoadToken, "/warehouse/tasks", "/warehouse/tasks", true);
+    if (ids.startPickToken) await roundTrip("PICKER→задачи, desktop", ids.startPickToken, "/warehouse/tasks", "/warehouse/tasks", false);
+    if (ids.startCtrlToken) await roundTrip("CONTROLLER→задачи, mobile", ids.startCtrlToken, "/warehouse/tasks", "/warehouse/tasks", true);
+    if (ids.startLoadToken) await roundTrip("LOADER повтор, desktop", ids.startLoadToken, "/warehouse/tasks", "/warehouse/tasks", false);
+
+    // ошибка завершения (IN_PROGRESS блокирует) НЕ вызывает навигацию — остаёмся на текущем экране
+    if (ids.blkPickerToken) {
+      await setViewport(false);
+      await setAuth(ids.blkPickerToken); // активная смена + IN_PROGRESS (сборка заполнителя)
+      await goto("/warehouse/shift", `document.body.innerText.includes("Завершить смену")`);
+      await sleep(1200);
+      await clickText(/Завершить смену/);
+      let stayed = false; for (let i = 0; i < 40; i++) { const b = await bodyText(); if ((await pathname()) === "/warehouse/shift" && b.includes("Есть задача в работе")) { stayed = true; break; } await sleep(200); }
+      const eb = await bodyText();
+      ok("SHIFT-002 (ошибка завершения): остаёмся на /warehouse/shift с ошибкой, без навигации", stayed && has(eb, "Завершить смену") && noAppErr(eb));
+    }
+    if (spr) await spr.$disconnect().catch(() => {});
   }
 
   // ── P2: ADMIN — операционные пункты по активной смене; монитор всех задач — отдельный пункт ──

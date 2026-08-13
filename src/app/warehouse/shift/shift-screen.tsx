@@ -1,12 +1,10 @@
 "use client";
 
-import { useActionState, useEffect, useState } from "react";
-import { startWorkShiftAction, endWorkShiftAction, type ShiftState } from "@/app/actions/shifts";
+import { useEffect, useState } from "react";
+import { startWorkShiftAction, endWorkShiftAction } from "@/app/actions/shifts";
 import { Button, Card, CardTitle, ChipSelect, Badge } from "@/components/ui";
 import { ROLE_LABEL, ROLE_TONE } from "@/lib/role-labels";
 import type { Role } from "@/lib/jwt";
-
-const initial: ShiftState = {};
 
 // Живая длительность смены (обновляется раз в секунду на клиенте).
 function useDuration(startIso: string): string {
@@ -31,9 +29,27 @@ export function ShiftStart({
   workRoles: Role[];
   warehouses: { id: string; name: string }[];
 }) {
-  // ROLE-003: при успехе startWorkShiftAction сам делает серверный redirect на рабочий экран
-  // активной роли (RECEIVER→/warehouse/receiving, иначе →/warehouse/tasks); клиенту навигация не нужна.
-  const [state, formAction, pending] = useActionState(startWorkShiftAction, initial);
+  // P3A.2/ROLE-003: действие вызывается ИМПЕРАТИВНО (не через <form action>/useActionState), затем клиент
+  // делает полную навигацию window.location.assign(redirectTo). Так исключён server-action redirect()
+  // (Application error/UNAUTHORIZED, digest 852039715) И гонка, при которой авто-refresh маршрута после
+  // action размонтирует ShiftStart до навигации. Тот же приём, что у logout. Ошибка → остаёмся на экране.
+  const [error, setError] = useState<string>();
+  const [pending, setPending] = useState(false);
+  async function onSubmit(e: React.FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    if (pending) return;
+    setPending(true);
+    setError(undefined);
+    const fd = new FormData(e.currentTarget);
+    try {
+      const res = await startWorkShiftAction({}, fd);
+      if (res.redirectTo) { window.location.assign(res.redirectTo); return; } // уходим со страницы — pending не снимаем
+      setError(res.error ?? "Не удалось начать смену");
+    } catch {
+      setError("Не удалось начать смену");
+    }
+    setPending(false);
+  }
 
   if (workRoles.length === 0) {
     return (
@@ -55,7 +71,7 @@ export function ShiftStart({
   return (
     <Card>
       <CardTitle>Начать смену</CardTitle>
-      <form action={formAction} className="flex flex-col gap-4">
+      <form onSubmit={onSubmit} className="flex flex-col gap-4">
         <fieldset className="flex flex-col gap-2">
           <span className="text-sm font-medium text-[#555]">Склад</span>
           <ChipSelect
@@ -74,7 +90,7 @@ export function ShiftStart({
             required
           />
         </fieldset>
-        {state.error && <p className="text-sm text-red-600">{state.error}</p>}
+        {error && <p className="text-sm text-red-600">{error}</p>}
         <Button type="submit" disabled={pending}>
           {pending ? "Начинаем…" : "Начать смену"}
         </Button>
@@ -94,8 +110,25 @@ export function ShiftActive({
   warehouseName: string;
   startedAtIso: string;
 }) {
-  // SHIFT-002: при успехе endWorkShiftAction сам делает серверный redirect на /warehouse/shift.
-  const [state, formAction, pending] = useActionState(endWorkShiftAction, initial);
+  // P3A.2/SHIFT-002: действие вызывается императивно, затем клиент делает полную навигацию
+  // window.location.assign(redirectTo=/warehouse/shift). Без server-action redirect() и без гонки
+  // авто-refresh маршрута. Ошибка (IN_PROGRESS блокирует) → остаёмся на экране, без навигации.
+  const [error, setError] = useState<string>();
+  const [pending, setPending] = useState(false);
+  async function onEnd(e: React.FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    if (pending) return;
+    setPending(true);
+    setError(undefined);
+    try {
+      const res = await endWorkShiftAction({}, new FormData());
+      if (res.redirectTo) { window.location.assign(res.redirectTo); return; }
+      setError(res.error ?? "Не удалось завершить смену");
+    } catch {
+      setError("Не удалось завершить смену");
+    }
+    setPending(false);
+  }
   const duration = useDuration(startedAtIso);
   const started = new Date(startedAtIso);
   const startedLabel = `${String(started.getHours()).padStart(2, "0")}:${String(started.getMinutes()).padStart(2, "0")}`;
@@ -130,8 +163,8 @@ export function ShiftActive({
           <dd className="font-mono text-base font-semibold tabular-nums">{duration}</dd>
         </div>
       </dl>
-      <form action={formAction} className="mt-4">
-        {state.error && <p className="mb-2 text-sm text-red-600">{state.error}</p>}
+      <form onSubmit={onEnd} className="mt-4">
+        {error && <p className="mb-2 text-sm text-red-600">{error}</p>}
         <Button type="submit" variant="ghost" disabled={pending} className="w-full">
           {pending ? "Завершаем…" : "Завершить смену"}
         </Button>
