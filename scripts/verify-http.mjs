@@ -185,32 +185,36 @@ async function main() {
     let html = await (await get("/warehouse/items/new")).text();
     let forms = parseForms(html);
     const itemForm = forms.find((f) => f.html.includes('name="ean"'));
-    const res1 = await submitForm("/warehouse/items/new", itemForm, {
+    // P3B-FIX-1: createItemAction больше НЕ делает server-redirect() (клиент навигирует
+    // window.location.assign(redirectTo)). Поэтому факт создания проверяем по списку /warehouse/items.
+    await submitForm("/warehouse/items/new", itemForm, {
       name: "Цемент М500 50кг",
       ean: cementEan,
       sku: "CEM500",
     });
-    ok("цемент создан по EAN", (await followRedirect(res1)) === "/warehouse/items");
+    const itemsAfter1 = await (await get("/warehouse/items")).text();
+    ok("цемент создан по EAN", itemsAfter1.includes(cementEan));
 
     html = await (await get("/warehouse/items/new")).text();
     forms = parseForms(html);
     const itemForm2 = forms.find((f) => f.html.includes('name="ean"'));
-    const res2 = await submitForm("/warehouse/items/new", itemForm2, {
+    await submitForm("/warehouse/items/new", itemForm2, {
       name: "Перфоратор Bosch GBH 2-26",
       ean: boschEan,
       sku: "BOSCH226",
     });
-    ok("перфоратор создан по EAN", (await followRedirect(res2)) === "/warehouse/items");
+    const itemsAfter2 = await (await get("/warehouse/items")).text();
+    ok("перфоратор создан по EAN", itemsAfter2.includes(boschEan));
 
-    // Неверная контрольная цифра — отказ, товар не создаётся.
+    // Неверная контрольная цифра — отказ, товар не создаётся (в списке его нет).
     html = await (await get("/warehouse/items/new")).text();
     const badForm = parseForms(html).find((f) => f.html.includes('name="ean"'));
-    const resBad = await submitForm("/warehouse/items/new", badForm, {
+    await submitForm("/warehouse/items/new", badForm, {
       name: "Бракованный EAN",
       ean: "4607750000019", // неверная контрольная цифра
     });
-    const badLoc = await followRedirect(resBad);
-    ok("EAN с неверной контрольной цифрой отклонён", badLoc !== "/warehouse/items");
+    const itemsAfterBad = await (await get("/warehouse/items")).text();
+    ok("EAN с неверной контрольной цифрой отклонён", !itemsAfterBad.includes("Бракованный EAN"));
 
     const listHtml = await (await get("/warehouse/items")).text();
     ok("оба товара в списке", listHtml.includes("Цемент М500") && listHtml.includes("Перфоратор"));
