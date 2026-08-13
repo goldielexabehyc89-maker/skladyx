@@ -1106,6 +1106,56 @@ async function main() {
     ok("O-MOVE: после «Ок» перестановка завершена (задача больше не текущая)", mGone);
   }
 
+  // ── ORDER-003 (Задача P2): авто-возобновление BLOCKED-заказа планировщиком. ADMIN видит BLOCKED;
+  //    сборщик собирает заполнитель (штатно освобождает нижнюю ячейку); БЕЗ реимпорта планировщик
+  //    (SCHEDULER_INTERVAL_MS=3000) ≤30с возобновляет заказ → READY_TO_PICK + MOVE_GROUP/PICK в мониторе. ──
+  if (ids.blkAdminToken && ids.blkOrderId && ids.blkPickerToken) {
+    // 1) ADMIN видит целевой заказ BLOCKED
+    await setViewport(false);
+    await setAuth(ids.blkAdminToken);
+    await goto(`/warehouse/external-orders/${ids.blkOrderId}`, `document.body.innerText.includes("${ids.blkOrderExt}")`);
+    ok("O-BLK: ADMIN видит заказ BLOCKED", has(await bodyText(), "Заблокирован"));
+    await goto(`/warehouse/tasks?view=monitor&warehouse=${encodeURIComponent(ids.blkWhId)}`, `document.body.innerText.length > 0`);
+    ok("O-BLK: до освобождения — нет задач для склада BLOCKED-заказа", !(await bodyText()).includes(ids.blkOrderExt) && !(await bodyText()).includes("Перестанов"));
+
+    // 2) сборщик собирает заполнитель → освобождает нижнюю ячейку (штатная операция)
+    await setViewport(true);
+    await setAuth(ids.blkPickerToken);
+    await goto("/warehouse/tasks", `document.body.innerText.includes("Собрать заказ")`);
+    const bOpen = async () => { for (let i = 0; i < 40; i++) { if (await ev(`!!document.querySelector('[data-workflow-sheet]')`)) return true; await sleep(150); } return false; };
+    const bField = async () => { for (let i = 0; i < 30; i++) { if (await sheetCount()) return true; await sleep(150); } return false; };
+    const bScan = async (re) => { await clickText(re); await sleep(300); await bField(); };
+    const bManual = async (v) => { await setSheetField(v); await clickText("/Ввести/"); await sleep(700); };
+    const bNum = (v) => ev(`(()=>{const el=[...document.querySelectorAll('[data-workflow-sheet] input[type="number"]')].find(e=>e.offsetParent!==null); if(!el) return 0; const s=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el),'value').set; s.call(el,${JSON.stringify(v)}); el.dispatchEvent(new Event('input',{bubbles:true})); return 1;})()`);
+    // Надёжный сигнал завершения сборки — не только текст «Заказ собран», но и фактическое движение остатка
+    // в blkWh (сборка заполнителя создаёт StockMovement и освобождает нижнюю ячейку). Мирроринг проверки M/8.
+    let bpr = null; try { bpr = new PrismaClient(); await bpr.$queryRaw`SELECT 1`; } catch { bpr = null; }
+    const movB = async () => { if (!bpr || !ids.blkWhId) return null; try { return await bpr.stockMovement.count({ where: { OR: [{ fromWarehouseId: ids.blkWhId }, { toWarehouseId: ids.blkWhId }] } }); } catch { return null; } };
+    const bMov0 = await movB();
+    await clickText(/Собрать \(сканирование\)/);
+    await bOpen();
+    await bScan(/Сканировать/); await bManual(ids.blkFillCellQr);   // ячейка
+    for (let i = 0; i < 40; i++) { const ph = await ev(`document.querySelector('[data-workflow-sheet] input[placeholder]')?.getAttribute('placeholder') || ""`); if (ph.includes("EAN")) break; await sleep(150); }
+    await bScan(/Сканировать/); await bManual(ids.blkFillEan);      // товар
+    for (let i = 0; i < 50; i++) { if (await ev(`!!document.querySelector('[data-workflow-sheet] input[type="number"]')`)) break; await sleep(150); }
+    await bNum(String(ids.blkFillQty)); await clickText(/^Собрать$/);
+    let picked = false; for (let i = 0; i < 100; i++) { if ((await bodyText()).includes("Заказ собран")) { picked = true; break; } const mn = await movB(); if (mn !== null && bMov0 !== null && mn > bMov0) { picked = true; break; } await sleep(200); }
+    if (bpr) await bpr.$disconnect().catch(() => {});
+    ok("O-BLK: заполнитель собран — нижняя ячейка освобождена (штатная операция)", picked);
+
+    // 3) БЕЗ реимпорта: планировщик авто-возобновляет заказ ≤30с (статус меняется на «Готов к сборке»)
+    await setViewport(false);
+    await setAuth(ids.blkAdminToken);
+    let revived = false; for (let i = 0; i < 12; i++) { await goto(`/warehouse/external-orders/${ids.blkOrderId}`, `document.body.innerText.includes("${ids.blkOrderExt}")`); const b = await bodyText(); if (!b.includes("Заблокирован") && b.includes("Готов к сборке")) { revived = true; break; } await sleep(2500); }
+    ok("O-BLK: БЕЗ реимпорта заказ авто-вышел из BLOCKED → «Готов к сборке» (≤30с, планировщик)", revived);
+    // 4) READY_TO_PICK создаётся только после MOVE_GROUP + зависимой PICK_ORDER → они появились в мониторе
+    let monTasks = false; for (let i = 0; i < 12; i++) { await goto(`/warehouse/tasks?view=monitor&warehouse=${encodeURIComponent(ids.blkWhId)}`, `document.body.innerText.length > 0`); if ((await bodyText()).includes(ids.blkOrderExt)) { monTasks = true; break; } await sleep(2500); }
+    ok("O-BLK: в мониторе появились задачи заказа (MOVE_GROUP + зависимая PICK_ORDER)", monTasks);
+    t = await bodyText();
+    ok("O-BLK: без дублей перестановки", (t.match(/Перестанов/g) || []).length <= 1);
+    ok("O-BLK: без технических ошибок на странице", !has(t, "Application error") && !has(t, "UNAUTHORIZED"));
+  }
+
   // ── Задача H: монитор ADMIN — новые задачи сверху (createdAt DESC, id DESC) + серверная пагинация;
   //    порядок держится и под фильтром. ──
   if (ids.adminToken && ids.monitorNewestTitle) {

@@ -1,5 +1,4 @@
 import "server-only";
-import { createHash } from "node:crypto";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/db";
 import { applyLotMovement } from "@/lib/stock";
@@ -90,6 +89,10 @@ function hashPayload(p: ImportPayload): string {
       .map((l) => ({ externalLineId: l.externalLineId, itemId: l.itemId, requiredQty: D(l.requiredQty).toFixed(3) }))
       .sort((a, b) => (a.externalLineId < b.externalLineId ? -1 : a.externalLineId > b.externalLineId ? 1 : 0)),
   };
+  // node:crypto подключаем через runtime-require (webpack не анализирует eval), чтобы модуль
+  // external-orders не тянул node:-схему в бандл instrumentation-планировщика (он импортирует
+  // reserveAndPlanOrder из этого модуля). В nodejs-рантайме require('crypto') доступен.
+  const { createHash } = (eval("require") as NodeRequire)("crypto");
   return createHash("sha256").update(JSON.stringify(norm)).digest("hex");
 }
 

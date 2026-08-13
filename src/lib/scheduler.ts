@@ -1,7 +1,8 @@
 import "server-only";
 import { prisma } from "@/lib/db";
 import { rebalanceQueuedTasks } from "@/lib/workflow-tasks";
-import { workflowTasksEnabled } from "@/lib/roles";
+import { reserveAndPlanOrder } from "@/lib/external-orders";
+import { workflowTasksEnabled, externalOrderPickingEnabled } from "@/lib/roles";
 
 // TASK-007: серверная активация отложенных задач. Долгоживущий фоновый цикл app-процесса находит все
 // организации с QUEUED-задачами, чей срок наступил (availableAt <= now или availableAt = null), и
@@ -41,6 +42,44 @@ export async function runSchedulerOnce(): Promise<number> {
   return assigned;
 }
 
+// ORDER-003: один проход авто-возобновления BLOCKED-заказов. Находит организации с незавершёнными
+// BLOCKED-заказами и повторно вызывает штатное reserveAndPlanOrder (под lockCompany, идемпотентно):
+// причина устранена (освободилась нижняя ячейка) → ровно одна MOVE_GROUP + зависимая PICK_ORDER; причина
+// не устранена → заказ остаётся BLOCKED без побочных изменений. Порядок детерминирован, пакет ограничен;
+// состояние читается из БД (рестарт-безопасно), ошибка одного заказа/организации не рушит остальные.
+const BLOCKED_BATCH = 50; // ограниченный пакет BLOCKED-заказов на организацию за тик
+export async function replanBlockedOnce(): Promise<number> {
+  if (!externalOrderPickingEnabled()) return 0;
+  const companies = await prisma.externalOrder.findMany({
+    where: { status: "BLOCKED" },
+    select: { companyId: true },
+    distinct: ["companyId"],
+  });
+  let replanned = 0;
+  for (const c of companies) {
+    try {
+      // Детерминированный стабильный порядок: arrivalAt ASC (nulls last) → createdAt ASC → id ASC.
+      const blocked = await prisma.externalOrder.findMany({
+        where: { companyId: c.companyId, status: "BLOCKED" },
+        orderBy: [{ arrivalAt: { sort: "asc", nulls: "last" } }, { createdAt: "asc" }, { id: "asc" }],
+        take: BLOCKED_BATCH,
+        select: { id: true },
+      });
+      for (const o of blocked) {
+        try {
+          const r = await reserveAndPlanOrder({ companyId: c.companyId, orderId: o.id });
+          if (r.status !== "BLOCKED") replanned++;
+        } catch (e) {
+          console.error("[scheduler] replan order error:", e instanceof Error ? e.message : "unknown");
+        }
+      }
+    } catch (e) {
+      console.error("[scheduler] replan company error:", e instanceof Error ? e.message : "unknown");
+    }
+  }
+  return replanned;
+}
+
 let started = false;
 let timer: ReturnType<typeof setInterval> | null = null;
 
@@ -50,6 +89,8 @@ export function startCoolingScheduler(): void {
   const period = schedulerIntervalMs();
   const tick = () => {
     void runSchedulerOnce().catch((e) => console.error("[scheduler] tick error:", e instanceof Error ? e.message : "unknown"));
+    // ORDER-003: авто-возобновление BLOCKED-заказов — отдельный безопасный проход в том же тике.
+    void replanBlockedOnce().catch((e) => console.error("[scheduler] replan tick error:", e instanceof Error ? e.message : "unknown"));
   };
   tick(); // сразу после старта
   timer = setInterval(tick, period);

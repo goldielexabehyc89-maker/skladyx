@@ -39,6 +39,7 @@ jobs:
       SEED_ADMIN_EMAIL: "ci@skladyx.ru"
       SEED_ADMIN_PASSWORD: "ci-admin-pass-01"
       VERIFY_HOST: "rostagro.skladyx.ru"
+      INTEGRATION_API_TOKEN: "ci-int-token-blocking-01"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -82,11 +83,36 @@ jobs:
           WORKFLOW_TASKS_ENABLED=true EXTERNAL_ORDER_PICKING_ENABLED=true $V scripts/verify-order-control.ts
           WORKFLOW_TASKS_ENABLED=true EXTERNAL_ORDER_PICKING_ENABLED=true $V scripts/verify-order-issue.ts
           WORKFLOW_TASKS_ENABLED=true EXTERNAL_ORDER_PICKING_ENABLED=true $V scripts/verify-order-n.ts
+          WORKFLOW_TASKS_ENABLED=true EXTERNAL_ORDER_PICKING_ENABLED=true $V scripts/verify-blocked-replanning.ts
           WORKFLOW_TASKS_ENABLED=true $V scripts/verify-scheduler.ts
           $V scripts/verify-launch-readiness.ts
 
       - name: Build
         run: npm run build
+
+      # P2: перенос в блокирующий профиль — распределение задач, роли, Integration API и смены.
+      # Две фазы сервера: ROLES_DUAL_READ off (task/roles/integration) и on (навигация по набору ролей смен).
+      - name: Release blocking — task/roles/integration/shift HTTP verifies
+        run: |
+          set -e
+          V="npx tsx --tsconfig scripts/tsconfig.verify.json"
+          # Фаза 1 (ROLES_DUAL_READ off): распределение задач, роли S2 (legacy), Integration API.
+          TENANT_AUTH=false WAREHOUSE_ZONES_ENABLED=false WORKFLOW_TASKS_ENABLED=true \
+            INTEGRATION_API_ENABLED=true INTEGRATION_API_TOKEN="$INTEGRATION_API_TOKEN" INTEGRATION_API_ORG_SLUG=rostagro \
+            node_modules/.bin/next start -p 3000 >/tmp/srvHV1.log 2>&1 &
+          SRV=$!
+          for i in $(seq 1 40); do code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/login || echo 000); [ "$code" = "200" ] && break; sleep 2; done
+          VERIFY_BASE=http://localhost:3000 $V scripts/verify-workflow-tasks.ts || { echo '--- srvHV1 ---'; tail -60 /tmp/srvHV1.log; kill $SRV 2>/dev/null; false; }
+          VERIFY_BASE=http://localhost:3000 $V scripts/verify-roles-s2.ts || { echo '--- srvHV1 ---'; tail -60 /tmp/srvHV1.log; kill $SRV 2>/dev/null; false; }
+          VERIFY_BASE=http://localhost:3000 $V scripts/verify-integration-api.ts || { echo '--- srvHV1 ---'; tail -60 /tmp/srvHV1.log; kill $SRV 2>/dev/null; false; }
+          kill $SRV 2>/dev/null || true; sleep 2
+          # Фаза 2 (ROLES_DUAL_READ on): завершение/возврат смены и навигация по набору ролей.
+          TENANT_AUTH=false ROLES_DUAL_READ=true WAREHOUSE_ZONES_ENABLED=false WORKFLOW_TASKS_ENABLED=true \
+            node_modules/.bin/next start -p 3000 >/tmp/srvHV2.log 2>&1 &
+          SRV=$!
+          for i in $(seq 1 40); do code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/login || echo 000); [ "$code" = "200" ] && break; sleep 2; done
+          EXPECT_DUAL_READ=1 VERIFY_BASE=http://localhost:3000 $V scripts/verify-work-shifts.ts || { echo '--- srvHV2 ---'; tail -60 /tmp/srvHV2.log; kill $SRV 2>/dev/null; false; }
+          kill $SRV 2>/dev/null || true
 
       - name: Ensure Chrome for e2e
         run: |

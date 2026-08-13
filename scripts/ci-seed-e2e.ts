@@ -598,6 +598,53 @@ async function main() {
   const moveToCellQr = (await prisma.qrCode.findFirstOrThrow({ where: { companyId, type: "CELL", refId: mvToCell.id } })).code;
   const moveToken = await mkToken(issMoveLo, "LOADER");
 
+  // ── ORDER-003 (Задача P2): фикстура авто-возобновления BLOCKED-заказа. Изолированный склад: нижняя
+  //    ячейка занята зарезервированным заказом-заполнителем (PICK «в работе» у сборщика), целевой товар —
+  //    на уровне 3 → целевой заказ BLOCKED. e2e собирает заполнитель (освобождает нижнюю ячейку), затем
+  //    планировщик (SCHEDULER_INTERVAL_MS=3000) авто-возобновляет заказ → MOVE_GROUP + зависимая PICK. ──
+  const blkWh = await prisma.warehouse.create({ data: { companyId, name: `CI-BLK-${Date.now()}`, isActive: true, coolingRate: 2 } });
+  // ADMIN-монитор (adminRecv) должен видеть склад блок-сценария: детальная страница заказа и монитор
+  // требуют доступ к складу (isWhAllowed). adminRecv не allWarehouses → явно добавляем доступ к blkWh.
+  await prisma.userWarehouse.create({ data: { userId: adminRecv, warehouseId: blkWh.id } });
+  await ensureStandardZones(companyId, blkWh.id);
+  const blkStorage = await prisma.warehouseZone.findFirstOrThrow({ where: { companyId, warehouseId: blkWh.id, kind: "STORAGE" } });
+  await createCellsInZone({ companyId, warehouseId: blkWh.id, zoneId: blkStorage.id, codes: ["BLK-L1"], level: 1 });
+  await createCellsInZone({ companyId, warehouseId: blkWh.id, zoneId: blkStorage.id, codes: ["BLK-U1"], level: 3 });
+  const blkItem = await prisma.item.create({ data: { companyId, name: "CI Блок-товар", uomId: uom.id, tracking: "LOT" } });
+  const BLK_EAN = ean13("460000009401");
+  await prisma.itemBarcode.create({ data: { companyId, itemId: blkItem.id, code: BLK_EAN, symbology: "EAN13", source: "MANUAL", isActive: true } });
+  const blkPk = await mkUser(companyId, "+79000009944", "CI Сборщик блок", "PICKER", "CiBlkPk-9944", blkWh.id);
+  const blkLo = await mkUser(companyId, "+79000009945", "CI Погрузчик блок", "LOADER", "CiBlkLo-9945", blkWh.id);
+  await prisma.workShift.create({ data: { companyId, userId: blkPk, warehouseId: blkWh.id, role: "PICKER" } });
+  await prisma.workShift.create({ data: { companyId, userId: blkLo, warehouseId: blkWh.id, role: "LOADER" } });
+  const blkSeed = async (code: string, qty: number, num: number, dk: string, createdAt: Date) => {
+    const cellRow = await prisma.cell.findFirstOrThrow({ where: { companyId, warehouseId: blkWh.id, code } });
+    const rec = await prisma.receipt.create({ data: { companyId, number: num, warehouseId: blkWh.id, status: "POSTED", postedAt: new Date(), createdById: blkPk } });
+    const ln = await prisma.receiptLine.create({ data: { companyId, receiptId: rec.id, itemId: blkItem.id, qty } });
+    const lot = await prisma.lot.create({ data: { companyId, itemId: blkItem.id, receiptLineId: ln.id, qtyReceived: qty, createdAt } });
+    await prisma.$transaction((tx) => applyLotMovement(tx, { companyId, docType: "RECEIPT", docId: rec.id, itemId: blkItem.id, lotId: lot.id, qty, from: null, to: { kind: "cell", warehouseId: blkWh.id, cellId: cellRow.id }, createdById: blkPk }));
+    const grp = await prisma.handlingGroup.create({ data: { companyId, warehouseId: blkWh.id, itemId: blkItem.id, lotId: lot.id, qty, temperature: 0, thresholdX: X, status: "IN_STORAGE", dedupeKey: dk, acceptedById: blkPk } });
+    await prisma.$transaction((tx) => createQrIn(tx, { companyId, type: "GROUP", refId: grp.id }));
+    return { cellId: cellRow.id };
+  };
+  await blkSeed("BLK-L1", 2, 9994004, "ci-blk-fill", new Date(Date.now() - 9000)); // заполнитель нижней ячейки
+  await blkSeed("BLK-U1", 3, 9994005, "ci-blk-top", new Date(Date.now() - 8000));  // целевой товар на ур.3
+  // заполнитель: полностью резервирует нижнюю группу → PICK «в работе» у сборщика
+  const BLK_FILL_EXT = "EO-CI-BLK-FILL";
+  const impFill = await importExternalOrder({ companyId, warehouseId: blkWh.id, externalId: BLK_FILL_EXT, createdById: blkPk, arrivalAt: null, lines: [{ externalLineId: "1", itemId: blkItem.id, requiredQty: 2 }] });
+  await reserveAndPlanOrder({ companyId, orderId: impFill.orderId });
+  let blkFillPt = await prisma.workflowTask.findFirstOrThrow({ where: { type: "PICK_ORDER", subjectId: impFill.orderId } });
+  if (blkFillPt.status === "QUEUED") { await rebalanceQueuedTasks(companyId, { warehouseId: blkWh.id }); blkFillPt = await prisma.workflowTask.findUniqueOrThrow({ where: { id: blkFillPt.id } }); }
+  if (blkFillPt.status === "ASSIGNED") await startWorkflowTask(blkPk, companyId, blkFillPt.id);
+  const blkFillResv = await prisma.stockReservation.findFirstOrThrow({ where: { orderId: impFill.orderId, status: "ACTIVE" } });
+  const blkFillCellQr = (await prisma.qrCode.findFirstOrThrow({ where: { companyId, type: "CELL", refId: blkFillResv.cellId! } })).code;
+  // целевой заказ: только верхний товар доступен → BLOCKED
+  const BLK_ORDER_EXT = "EO-CI-BLK-TARGET";
+  const impBlk = await importExternalOrder({ companyId, warehouseId: blkWh.id, externalId: BLK_ORDER_EXT, createdById: blkPk, arrivalAt: null, lines: [{ externalLineId: "1", itemId: blkItem.id, requiredQty: 3 }] });
+  await reserveAndPlanOrder({ companyId, orderId: impBlk.orderId });
+  const blkAdminToken = await mkToken(adminRecv, "ADMIN"); // ADMIN-монитор (уже существующий admin-пользователь)
+  const blkPickerToken = await mkToken(blkPk, "PICKER");
+
   // ── Задача H: монитор ADMIN — новые задачи сверху (createdAt DESC, id DESC). Сентинел создаётся
   //    ПОСЛЕДНИМ → на мониторе он должен идти выше всех ранее созданных задач. QUEUED (не назначается).
   const MONITOR_NEWEST_TITLE = "CI Монитор сентинел (новейшая)";
@@ -732,6 +779,16 @@ async function main() {
     moveToCellQr,                    // верная целевая ячейка (и «неверная исходная» для from-шага)
     moveEan: ISS_EAN,                // верный EAN товара группы
     moveEanWrong: CTRL_EAN_A,        // валидный EAN другого товара → не тот товар
+    // ORDER-003 (Задача P2): авто-возобновление BLOCKED-заказа планировщиком
+    blkAdminToken,                   // ADMIN для монитора
+    blkPickerToken,                  // сборщик заполнителя (освобождает нижнюю ячейку)
+    blkWhId: blkWh.id,               // фильтр монитора по складу
+    blkOrderExt: BLK_ORDER_EXT,      // № целевого BLOCKED-заказа
+    blkOrderId: impBlk.orderId,      // id целевого заказа (для detail-страницы статуса)
+    blkFillExt: BLK_FILL_EXT,        // № заказа-заполнителя (собрать → освободить ячейку)
+    blkFillCellQr,                   // QR нижней ячейки заполнителя
+    blkFillEan: BLK_EAN,             // EAN товара заполнителя
+    blkFillQty: 2,                   // количество заполнителя
   }));
   process.exit(0);
 }
