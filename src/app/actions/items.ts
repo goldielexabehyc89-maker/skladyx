@@ -71,8 +71,10 @@ export async function createItemAction(_prev: FormState, formData: FormData): Pr
     companyId: s.companyId,
     actorUserId: session.userId,
   });
-  revalidatePath("/warehouse/items");
-  redirect("/warehouse/items");
+  // P3B-FIX-1: без server-action redirect() и без revalidatePath — клиент делает полную навигацию
+  // window.location.assign("/warehouse/items"). Хардовый переход берёт свежий рендер списка по актуальным
+  // Host/session/tenant, а ревалидация текущего маршрута тут не нужна (и провоцирует тот же класс дефекта).
+  return { redirectTo: "/warehouse/items" };
 }
 
 export async function updateItemAction(_prev: FormState, formData: FormData): Promise<FormState> {

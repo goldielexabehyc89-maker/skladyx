@@ -522,6 +522,48 @@ async function main() {
     ok("home ADMIN+LOADER → mine подсвечен (mobile)", await anyAria(`nav a[href="${MINE}"]`));
   }
 
+  // ── P3B-FIX-1: создание товара → полная навигация на /warehouse/items (не промежуточный монитор);
+  //    невалидный EAN сохраняет поля без навигации; первый клик «Номенклатура» с монитора → список.
+  //    desktop + mobile. ──
+  if (ids.adminToken) {
+    let ipr = null; try { ipr = new PrismaClient(); await ipr.$queryRaw`SELECT 1`; } catch { ipr = null; }
+    const itemCount = async () => { if (!ipr) return null; try { return await ipr.item.count(); } catch { return null; } };
+    const bcCount = async () => { if (!ipr) return null; try { return await ipr.itemBarcode.count(); } catch { return null; } };
+    const eanCheck = (b12) => { let s = 0; for (let i = 0; i < 12; i++) s += (+b12[i]) * (i % 2 === 0 ? 1 : 3); return (10 - (s % 10)) % 10; };
+    const validEan = (b12) => b12 + eanCheck(b12);
+    const itemsHref = "/warehouse/items";
+    const runItemCreate = async (label, mobile, base12, name) => {
+      await setViewport(mobile);
+      await setAuth(ids.adminToken); // ADMIN без смены → домашний экран монитор
+      await goto("/warehouse/items/new", `!!document.querySelector('input[name="ean"]')`);
+      await sleep(700); // гидрация управляемой формы серверного действия
+      // 1) невалидный EAN → ошибка, поля сохранены, навигации нет
+      await setInput("name", name); await setInput("ean", "1234567890123"); await setInput("sku", "SKU-" + label);
+      await clickText(/^Создать товар$/);
+      let errShown = false; for (let i = 0; i < 40; i++) { if ((await bodyText()).includes("Неверный EAN")) { errShown = true; break; } await sleep(150); }
+      const kept = await ev(`document.querySelector('input[name="name"]').value===${JSON.stringify(name)} && document.querySelector('input[name="ean"]').value==="1234567890123" && document.querySelector('input[name="sku"]').value===${JSON.stringify("SKU-" + label)}`);
+      ok(`P3B-FIX (${label}): невалидный EAN → ошибка, поля сохранены, без навигации`, errShown && kept && (await pathname()) === "/warehouse/items/new", await pathname());
+      // 2) валидный товар → сразу /warehouse/items, БЕЗ промежуточного монитора; Item+1, ItemBarcode+1
+      const ic0 = await itemCount(), bc0 = await bcCount();
+      await setInput("ean", validEan(base12));
+      await clickText(/^Создать товар$/);
+      let toItems = false, viaMonitor = false;
+      for (let i = 0; i < 80; i++) { const p = await pathname(); if (p === "/warehouse/tasks" || p.includes("view=monitor")) viaMonitor = true; if (p === itemsHref) { toItems = true; break; } await sleep(150); }
+      ok(`P3B-FIX (${label}): создание → сразу /warehouse/items (без промежуточного монитора)`, toItems && !viaMonitor, await pathname());
+      ok(`P3B-FIX (${label}): созданный товар виден в списке`, has(await bodyText(), name));
+      const ic1 = await itemCount(), bc1 = await bcCount();
+      ok(`P3B-FIX (${label}): Item +1 и ItemBarcode +1`, ic0 === null ? true : (ic1 === ic0 + 1 && bc1 === bc0 + 1), `item ${ic0}->${ic1} bc ${bc0}->${bc1}`);
+      // 3) с монитора один клик «Номенклатура» → сразу список
+      await goto("/warehouse/tasks?view=monitor", `!!document.querySelector('aside a[href="${itemsHref}"], nav a[href="${itemsHref}"]')`);
+      const clicked = await ev(`(()=>{const a=[...document.querySelectorAll('aside a[href="${itemsHref}"], nav a[href="${itemsHref}"]')][0]; if(!a) return 'no'; a.click(); return 'ok';})()`);
+      let navOk = false; for (let i = 0; i < 40; i++) { if ((await pathname()) === itemsHref) { navOk = true; break; } await sleep(150); }
+      ok(`P3B-FIX (${label}): первый клик «Номенклатура» с монитора → /warehouse/items`, clicked === "ok" && navOk, await pathname());
+    };
+    await runItemCreate("desktop", false, "260000000010", "E2E Товар DESK");
+    await runItemCreate("mobile", true, "260000000020", "E2E Товар MOB");
+    if (ipr) await ipr.$disconnect().catch(() => {});
+  }
+
   // ── TASK-007/008/009: монитор — «Запланирована» + МСК + живой таймер; выделение срочных (мобайл) ──
   const timers = async () => JSON.parse(await ev(`JSON.stringify([...document.querySelectorAll('[role=timer]')].map(e=>e.innerText.replace(/\\s+/g,' ').trim()))`));
   const redUrgentCard = () => ev(`[...document.querySelectorAll('div')].some(d=>getComputedStyle(d).backgroundColor==="rgb(254, 242, 242)" && d.textContent.includes("Срочно"))`);

@@ -24,6 +24,11 @@ import {
 export interface FormState {
   error?: string;
   ok?: string;
+  // P3B-FIX-1: при успехе действие может вернуть целевой маршрут вместо server-action redirect()
+  // (встроенный RSC-переход после action иногда рендерится без корректного Host/session/tenant →
+  // навигация в /warehouse/tasks?view=monitor вместо целевой страницы; тот же класс, что logout/смены).
+  // Клиент делает window.location.assign(redirectTo) — свежий HTTP-рендер по актуальным Host/cookie.
+  redirectTo?: string;
 }
 
 const warehouseSchema = z.object({

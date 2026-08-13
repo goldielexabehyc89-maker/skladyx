@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useActionState } from "react";
 import { createItemAction } from "@/app/actions/items";
 import { Button } from "@/components/ui";
@@ -8,12 +8,18 @@ import type { FormState } from "@/app/actions/warehouses";
 
 // Пакет 10 (коррекция): управляемая форма создания товара. React 19 сбрасывает НЕуправляемую форму
 // после server action — из-за этого при ошибке терялись введённые поля. Управляемое состояние (useState)
-// сохраняет наименование, EAN и SKU при ошибке. При успехе createItemAction делает redirect на сервере.
+// сохраняет наименование, EAN и SKU при ошибке.
+// P3B-FIX-1: при успехе createItemAction возвращает redirectTo="/warehouse/items" (без server-action
+// redirect()). Клиент делает полную навигацию window.location.assign — свежий HTTP-рендер списка по
+// актуальным Host/session/tenant, без промежуточного перехода в монитор. Ошибка → навигации нет, поля целы.
 export function ItemCreateForm() {
   const [state, action, pending] = useActionState<FormState, FormData>(createItemAction, {});
   const [name, setName] = useState("");
   const [ean, setEan] = useState("");
   const [sku, setSku] = useState("");
+  useEffect(() => {
+    if (state.redirectTo) window.location.assign(state.redirectTo);
+  }, [state.redirectTo]);
   const input = "rounded-lg border border-[#e4e4f0] px-3 py-2 text-sm";
 
   return (
