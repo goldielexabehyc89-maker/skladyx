@@ -1156,6 +1156,67 @@ async function main() {
     ok("O-BLK: без технических ошибок на странице", !has(t, "Application error") && !has(t, "UNAUTHORIZED"));
   }
 
+  // ── P3A (многопользовательское распределение): два PICKER одной роли на одном складе. muA (ранняя
+  //    смена) — срочная задача, muB — обычная. Проверяем: каждый видит ТОЛЬКО свою (изоляция); ADMIN-
+  //    монитор показывает правильных исполнителей; срочная визуально выделена (бейдж «Срочно» + красная
+  //    карточка) и назначена; после завершения смены muA его ASSIGNED-срочная возвращается и
+  //    переназначается второму (muB) ≤30с без реимпорта/действий администратора. desktop + mobile. ──
+  if (ids.muAToken && ids.muBToken && ids.muAdminToken) {
+    // карточка монитора: подняться от текста заголовка к div-карточке (border-*) и проверить наличие имени
+    const cardHas = (title, name) => ev(`(()=>{const leaf=[...document.querySelectorAll('div')].find(d=>d.textContent.includes(${JSON.stringify(title)})&&[...d.children].every(c=>!c.textContent.includes(${JSON.stringify(title)})));let card=leaf;while(card&&!/border-/.test(card.className))card=card.parentElement;return !!card&&card.textContent.includes(${JSON.stringify(name)});})()`);
+    const urgCardRed = (title) => ev(`(()=>{const leaf=[...document.querySelectorAll('div')].find(d=>d.textContent.includes(${JSON.stringify(title)})&&[...d.children].every(c=>!c.textContent.includes(${JSON.stringify(title)})));let card=leaf;while(card&&!/border-/.test(card.className))card=card.parentElement;return !!card&&(/bg-red-50/.test(card.className)||getComputedStyle(card).backgroundColor==='rgb(254, 242, 242)');})()`);
+
+    // 1) muA (mobile) видит свою СРОЧНУЮ и НЕ видит чужую обычную
+    await setViewport(true);
+    await setAuth(ids.muAToken);
+    await goto("/warehouse/tasks", `document.body.innerText.includes("${ids.muUrgTitle}")||document.body.innerText.includes("Задач пока нет")`);
+    let ta = await bodyText();
+    ok("MU: muA (моб) видит свою срочную задачу с бейджем «Срочно»", has(ta, ids.muUrgTitle) && has(ta, "Срочно"));
+    ok("MU: muA НЕ видит чужую (обычную) задачу", !has(ta, ids.muNormTitle));
+
+    // 2) muB (mobile) видит свою ОБЫЧНУЮ, без «Срочно», и НЕ видит чужую срочную
+    await setAuth(ids.muBToken);
+    await goto("/warehouse/tasks", `document.body.innerText.includes("${ids.muNormTitle}")||document.body.innerText.includes("Задач пока нет")`);
+    let tb = await bodyText();
+    ok("MU: muB (моб) видит свою обычную задачу", has(tb, ids.muNormTitle));
+    ok("MU: muB НЕ видит чужую срочную и бейдж «Срочно»", !has(tb, ids.muUrgTitle) && !has(tb, "Срочно"));
+
+    // 3) ADMIN-монитор (desktop): обе задачи с ПРАВИЛЬНЫМИ исполнителями; срочная выделена и назначена
+    await setViewport(false);
+    await setAuth(ids.muAdminToken);
+    await goto(`/warehouse/tasks?view=monitor&warehouse=${encodeURIComponent(ids.muWhId)}`, `document.body.innerText.includes("${ids.muUrgTitle}")`);
+    let tm = await bodyText();
+    ok("MU: монитор — срочная задача у исполнителя A", await cardHas(ids.muUrgTitle, ids.muAName));
+    ok("MU: монитор — обычная задача у исполнителя B", await cardHas(ids.muNormTitle, ids.muBName));
+    ok("MU: монитор — бейдж «Срочно» (не только цвет)", has(tm, "Срочно"));
+    ok("MU: монитор — срочная выделена красной карточкой", await urgCardRed(ids.muUrgTitle));
+    ok("MU: монитор — срочная назначена (статус «Назначена»)", has(tm, "Назначена"));
+
+    // 4) muA (mobile) завершает смену — его ASSIGNED-срочная (не начата) не блокирует завершение
+    await setViewport(true);
+    await setAuth(ids.muAToken);
+    await goto("/warehouse/shift", `document.body.innerText.includes("Завершить смену")`);
+    await clickText(/Завершить смену/);
+    let shiftEnded = false;
+    for (let i = 0; i < 70; i++) { const p = await pathname(); if (p === "/warehouse/shift" && (await bodyText()).includes("Начать смену")) { shiftEnded = true; break; } await sleep(200); }
+    ok("MU: muA завершил смену (форма старта вернулась, ASSIGNED не блокировала)", shiftEnded);
+
+    // 5) без реимпорта/действий админа: срочная переназначена muB (монитор ≤30с, планировщик 3с)
+    await setViewport(false);
+    await setAuth(ids.muAdminToken);
+    let reassigned = false, urgToB = false, urgToA = true;
+    for (let i = 0; i < 12; i++) {
+      await goto(`/warehouse/tasks?view=monitor&warehouse=${encodeURIComponent(ids.muWhId)}`, `document.body.innerText.includes("${ids.muUrgTitle}")`);
+      urgToB = await cardHas(ids.muUrgTitle, ids.muBName);
+      urgToA = await cardHas(ids.muUrgTitle, ids.muAName);
+      if (urgToB && !urgToA) { reassigned = true; break; }
+      await sleep(2500);
+    }
+    ok("MU: после завершения смены muA срочная переназначена muB (≤30с, без реимпорта)", reassigned, `toB=${urgToB} toA=${urgToA}`);
+    const tmz = await bodyText();
+    ok("MU: переназначение без технических ошибок", !has(tmz, "Application error") && !has(tmz, "UNAUTHORIZED"));
+  }
+
   // ── Задача H: монитор ADMIN — новые задачи сверху (createdAt DESC, id DESC) + серверная пагинация;
   //    порядок держится и под фильтром. ──
   if (ids.adminToken && ids.monitorNewestTitle) {

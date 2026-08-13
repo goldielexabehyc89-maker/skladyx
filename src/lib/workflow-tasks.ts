@@ -225,7 +225,8 @@ export async function rebalanceQueuedTasks(
         ...(filter?.role ? { requiredRole: filter.role } : {}),
       },
       // Пакет 6: URGENT раньше обычных, затем ближайший срок (dueAt, nulls last), затем createdAt.
-      orderBy: [{ priority: "desc" }, { dueAt: { sort: "asc", nulls: "last" } }, { createdAt: "asc" }],
+      // TASK-002: id ASC — финальный детерминированный tiebreaker при равных приоритете/сроке/времени.
+      orderBy: [{ priority: "desc" }, { dueAt: { sort: "asc", nulls: "last" } }, { createdAt: "asc" }, { id: "asc" }],
     });
     const events: { companyId: string; warehouseId: string; title: string; to: string }[] = [];
     for (const t of queued) {
@@ -261,7 +262,8 @@ export async function startWorkflowTask(
       // пропуск доступной срочной — только с причиной
       const recommended = await tx.workflowTask.findFirst({
         where: { assignedUserId: userId, status: "ASSIGNED" },
-        orderBy: [{ priority: "desc" }, { dueAt: { sort: "asc", nulls: "last" } }, { createdAt: "asc" }],
+        // TASK-002: тот же детерминированный порядок персональной очереди (id ASC — финальный tiebreaker).
+        orderBy: [{ priority: "desc" }, { dueAt: { sort: "asc", nulls: "last" } }, { createdAt: "asc" }, { id: "asc" }],
       });
       const skipsUrgent = !!recommended && recommended.id !== task.id && recommended.priority === "URGENT";
       if (skipsUrgent && !skipReason?.trim())

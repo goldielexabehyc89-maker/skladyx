@@ -322,6 +322,90 @@ async function main() {
   ok("task_returned записан (возврат при завершении смены)", (await prisma.event.count({ where: { companyId, type: "task_returned" } })) >= 1);
   ok("task_unblocked записан (разблокировка зависимости)", (await prisma.event.count({ where: { companyId, type: "task_unblocked" } })) >= 1);
   ok("push движком не создаётся (аудит только Event+realtime)", (await prisma.pushSubscription.count({ where: { userId: { in: UIDS } } })) === 0);
+
+  // ── P3A: многопользовательское распределение (TASK-001/002, SHIFT-002) ──
+  const closeW1 = () => prisma.workShift.updateMany({ where: { companyId, warehouseId: W1, endedAt: null }, data: { endedAt: new Date() } });
+
+  console.log("15) CONTROLLER: два контролёра на смене, нагрузка = сумма loadUnits, tie → ранняя смена");
+  await resetTasks(); await closeW1();
+  const cA = await mkUser("p3_cA", companyId, "+79997001010", "CONTROLLER", W1);
+  await new Promise((r) => setTimeout(r, 10));
+  const cB = await mkUser("p3_cB", companyId, "+79997001011", "CONTROLLER", W1);
+  await mkShift(cA, companyId, W1, "CONTROLLER", new Date(Date.now() - 60000));
+  await mkShift(cB, companyId, W1, "CONTROLLER", new Date());
+  const c1 = (await task(W1, "CONTROLLER", { loadUnits: 5 })).task; // оба 0 → tie → ранняя (cA)
+  const c2 = (await task(W1, "CONTROLLER", { loadUnits: 2 })).task; // A:5,B:0 → cB
+  const c3 = (await task(W1, "CONTROLLER", { loadUnits: 1 })).task; // A:5,B:2 → cB
+  ok("c1 → cA (tie: ранняя смена)", (await assignee(c1.id)) === cA, `got ${await assignee(c1.id)}`);
+  ok("c2 → cB (нагрузка Σ loadUnits)", (await assignee(c2.id)) === cB, `got ${await assignee(c2.id)}`);
+  ok("c3 → cB (5 vs 2 → меньший)", (await assignee(c3.id)) === cB, `got ${await assignee(c3.id)}`);
+
+  console.log("16) равные load + равный startedAt → tiebreaker userId ASC");
+  await resetTasks(); await closeW1();
+  const sameStart = new Date(Date.now() - 30000);
+  const uA = await mkUser("p3_uA", companyId, "+79997001012", "LOADER", W1); // "p3_uA" < "p3_uB"
+  const uB = await mkUser("p3_uB", companyId, "+79997001013", "LOADER", W1);
+  await mkShift(uA, companyId, W1, "LOADER", sameStart);
+  await mkShift(uB, companyId, W1, "LOADER", sameStart); // тот же startedAt
+  const tieTask = (await task(W1, "LOADER")).task;
+  ok("равные нагрузка и старт смены → меньший userId (uA)", (await assignee(tieTask.id)) === uA, `got ${await assignee(tieTask.id)}`);
+
+  console.log("17) сотрудник с IN_PROGRESS НЕ исключается из кандидатов, но его нагрузка учитывается");
+  await resetTasks(); await closeW1();
+  const pHeavy = await mkUser("p3_heavy", companyId, "+79997001014", "PICKER", W1);
+  await mkShift(pHeavy, companyId, W1, "PICKER", new Date(Date.now() - 60000));
+  const heavyTask = (await task(W1, "PICKER", { loadUnits: 10 })).task; // единственный кандидат → pHeavy (load=10)
+  ok("тяжёлая задача (loadUnits=10) назначена pHeavy", (await assignee(heavyTask.id)) === pHeavy);
+  const pBusy = await mkUser("p3_pbusy", companyId, "+79997001015", "PICKER", W1);
+  await mkShift(pBusy, companyId, W1, "PICKER", new Date());
+  const lightStart = (await task(W1, "PICKER", { loadUnits: 1 })).task; // pHeavy:10 vs pBusy:0 → pBusy
+  await startWorkflowTask(pBusy, companyId, lightStart.id); // pBusy IN_PROGRESS, load=1
+  const nextT = (await task(W1, "PICKER", { loadUnits: 1 })).task; // pHeavy:10 vs pBusy:1 → pBusy (наименьшая)
+  ok("IN_PROGRESS не исключён: наименее загруженный (pBusy) снова выбран", (await assignee(nextT.id)) === pBusy, `got ${await assignee(nextT.id)}`);
+
+  console.log("18) завершение смены возвращает ASSIGNED и переназначает ВТОРОМУ сотруднику");
+  await resetTasks(); await closeW1();
+  const rA = await mkUser("p3_rA", companyId, "+79997001016", "LOADER", W1);
+  await mkShift(rA, companyId, W1, "LOADER");
+  const retTask = (await task(W1, "LOADER")).task; // единственный кандидат → rA, ASSIGNED (не начата)
+  ok("задача ASSIGNED у rA", (await statusOf(retTask.id)) === "ASSIGNED" && (await assignee(retTask.id)) === rA);
+  const rB = await mkUser("p3_rB", companyId, "+79997001017", "LOADER", W1); // второй выходит на смену
+  await mkShift(rB, companyId, W1, "LOADER");
+  const ckA = await login("+79997001016");
+  await endShiftHttp(ckA); // rA завершает смену → неначатая ASSIGNED возвращается в QUEUED
+  await rebalanceQueuedTasks(companyId, { warehouseId: W1 }); // идемпотентно, если endShift уже переназначил
+  const rAsg = await assignee(retTask.id), rSt = await statusOf(retTask.id);
+  ok("задача снята с завершившего смену rA", rAsg !== rA, `asg=${rAsg}`);
+  ok("возвращённая ASSIGNED переназначена второму сотруднику rB", rAsg === rB && rSt === "ASSIGNED", `asg=${rAsg} st=${rSt}`);
+
+  console.log("19) параллельные тики планировщика: одно назначение, одно событие task_assigned");
+  await resetTasks(); await closeW1(); await resetTaskEvents();
+  const eU = await mkUser("p3_eU", companyId, "+79997001018", "LOADER", W1);
+  await mkShift(eU, companyId, W1, "LOADER");
+  const parTask = (await task(W1, "LOADER", { key: dk("par") })).task;
+  await prisma.workflowTask.update({ where: { id: parTask.id }, data: { status: "QUEUED", assignedUserId: null, assignedShiftId: null, assignedAt: null } });
+  await resetTaskEvents(); // считаем только события параллельных тиков
+  await Promise.all([
+    rebalanceQueuedTasks(companyId, { warehouseId: W1 }),
+    rebalanceQueuedTasks(companyId, { warehouseId: W1 }),
+  ]);
+  ok("параллельные тики: задача назначена ровно один раз (eU)", (await statusOf(parTask.id)) === "ASSIGNED" && (await assignee(parTask.id)) === eU);
+  ok("параллельные тики: ровно одно событие task_assigned", (await prisma.event.count({ where: { companyId, type: "task_assigned" } })) === 1, `events=${await prisma.event.count({ where: { companyId, type: "task_assigned" } })}`);
+
+  console.log("20) RECEIVER: две активные смены сосуществуют; RECEIVE_GROUP распределяется; повтор идемпотентен");
+  await resetTasks(); await closeW1();
+  const recA = await mkUser("p3_recA", companyId, "+79997001019", "RECEIVER", W1);
+  await new Promise((r) => setTimeout(r, 10));
+  const recB = await mkUser("p3_recB", companyId, "+79997001020", "RECEIVER", W1);
+  await mkShift(recA, companyId, W1, "RECEIVER", new Date(Date.now() - 60000));
+  await mkShift(recB, companyId, W1, "RECEIVER", new Date());
+  ok("два приёмщика имеют активные смены одновременно", (await prisma.workShift.count({ where: { companyId, warehouseId: W1, role: "RECEIVER", endedAt: null } })) === 2);
+  const rt1 = (await task(W1, "RECEIVER", { type: "RECEIVE_GROUP" })).task; // → recA
+  const rt2 = (await task(W1, "RECEIVER", { type: "RECEIVE_GROUP" })).task; // A:1,B:0 → recB
+  ok("две RECEIVE_GROUP распределены по одному на приёмщика (нет дублей)", (await assignee(rt1.id)) === recA && (await assignee(rt2.id)) === recB, `${await assignee(rt1.id)}/${await assignee(rt2.id)}`);
+  const rd1 = await task(W1, "RECEIVER", { type: "RECEIVE_GROUP", key: dk("rec-idem") });
+  const rd2 = await task(W1, "RECEIVER", { type: "RECEIVE_GROUP", key: dk("rec-idem") });
+  ok("повтор приёмки (dedupeKey) не создаёт вторую задачу", rd1.created && !rd2.created && rd1.task.id === rd2.task.id);
 }
 
 main()

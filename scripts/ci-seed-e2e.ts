@@ -645,6 +645,27 @@ async function main() {
   const blkAdminToken = await mkToken(adminRecv, "ADMIN"); // ADMIN-монитор (уже существующий admin-пользователь)
   const blkPickerToken = await mkToken(blkPk, "PICKER");
 
+  // ── P3A: многопользовательское распределение — два PICKER одной роли на одном складе. Срочная
+  //    задача → раннему muA, обычная → muB. e2e проверяет изоляцию видимости (каждый видит только свои),
+  //    монитор с исполнителями, выделение срочной и возврат ASSIGNED при завершении смены (второму). ──
+  const muWh = await prisma.warehouse.create({ data: { companyId, name: `CI-MU-${Date.now()}`, isActive: true, coolingRate: 2 } });
+  await prisma.userWarehouse.create({ data: { userId: adminRecv, warehouseId: muWh.id } }); // ADMIN-монитор видит склад
+  const muA = await mkUser(companyId, "+79000009951", "P3 Сборщик A", "PICKER", "CiMuA-9951", muWh.id);
+  const muB = await mkUser(companyId, "+79000009952", "P3 Сборщик B", "PICKER", "CiMuB-9952", muWh.id);
+  await prisma.workShift.create({ data: { companyId, userId: muA, warehouseId: muWh.id, role: "PICKER", startedAt: new Date(Date.now() - 60_000) } }); // ранняя смена
+  await prisma.workShift.create({ data: { companyId, userId: muB, warehouseId: muWh.id, role: "PICKER", startedAt: new Date() } });
+  const MU_URG_TITLE = "P3 Срочная сборка A";
+  const MU_NORM_TITLE = "P3 Обычная сборка B";
+  await createWorkflowTask({ companyId, warehouseId: muWh.id, type: "PICK_ORDER", requiredRole: "PICKER", priority: "URGENT", title: MU_URG_TITLE, dedupeKey: "ci-mu-urg" });
+  await createWorkflowTask({ companyId, warehouseId: muWh.id, type: "PICK_ORDER", requiredRole: "PICKER", priority: "NORMAL", title: MU_NORM_TITLE, dedupeKey: "ci-mu-norm" });
+  await rebalanceQueuedTasks(companyId, { warehouseId: muWh.id }); // детерминированно: URGENT→muA (ранняя), NORMAL→muB
+  const muUrgAssignee = (await prisma.workflowTask.findFirstOrThrow({ where: { companyId, dedupeKey: "ci-mu-urg" } })).assignedUserId;
+  const muNormAssignee = (await prisma.workflowTask.findFirstOrThrow({ where: { companyId, dedupeKey: "ci-mu-norm" } })).assignedUserId;
+  if (muUrgAssignee !== muA || muNormAssignee !== muB) throw new Error(`MU seed: ожидалось URGENT→muA, NORMAL→muB; получено urg=${muUrgAssignee} norm=${muNormAssignee}`);
+  const muAToken = await mkToken(muA, "PICKER");
+  const muBToken = await mkToken(muB, "PICKER");
+  const muAdminToken = await mkToken(adminRecv, "ADMIN");
+
   // ── Задача H: монитор ADMIN — новые задачи сверху (createdAt DESC, id DESC). Сентинел создаётся
   //    ПОСЛЕДНИМ → на мониторе он должен идти выше всех ранее созданных задач. QUEUED (не назначается).
   const MONITOR_NEWEST_TITLE = "CI Монитор сентинел (новейшая)";
@@ -789,6 +810,15 @@ async function main() {
     blkFillCellQr,                   // QR нижней ячейки заполнителя
     blkFillEan: BLK_EAN,             // EAN товара заполнителя
     blkFillQty: 2,                   // количество заполнителя
+    // P3A: многопользовательское распределение
+    muWhId: muWh.id,                 // склад мультипользовательского сценария (фильтр монитора)
+    muAToken,                        // PICKER A (ранняя смена, срочная задача)
+    muBToken,                        // PICKER B (обычная задача)
+    muAdminToken,                    // ADMIN-монитор с доступом к muWh
+    muAName: "P3 Сборщик A",         // имя исполнителя срочной (видно в мониторе)
+    muBName: "P3 Сборщик B",         // имя исполнителя обычной
+    muUrgTitle: MU_URG_TITLE,        // заголовок срочной задачи (видимость у A, не у B)
+    muNormTitle: MU_NORM_TITLE,      // заголовок обычной задачи (видимость у B, не у A)
   }));
   process.exit(0);
 }
