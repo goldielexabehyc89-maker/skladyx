@@ -73,13 +73,11 @@ export async function startWorkShiftAction(_prev: ShiftState, formData: FormData
   }
   // Пакет 2: раздать подходящие QUEUED-задачи новой смене.
   if (workflowTasksEnabled()) await rebalanceQueuedTasks(s.companyId, { warehouseId, role });
-  revalidatePath("/warehouse/shift");
-  revalidatePath("/warehouse/tasks");
-  revalidatePath("/warehouse/receiving");
-  revalidatePath("/warehouse/employees");
   // ROLE-003: целевой рабочий экран активной роли (приёмщик → приёмка, остальные → задачи). Навигацию
   // выполняет клиент полным запросом (window.location.assign) — свежий серверный рендер по актуальному
-  // Host/cookie, layout/меню сразу видят новую активную смену. Без server-action redirect().
+  // Host/cookie; layout/меню/список сотрудников подтянутся этим же полным запросом. Без server-action
+  // redirect(). revalidatePath НЕ вызываем намеренно: он ре-рендерит /warehouse/shift в ShiftActive до
+  // навигации (гонка размонтирования), а хардовый переход и так берёт свежие данные с сервера.
   return { redirectTo: role === "RECEIVER" ? "/warehouse/receiving" : "/warehouse/tasks" };
 }
 

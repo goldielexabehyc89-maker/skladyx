@@ -31,27 +31,16 @@ export function ShiftStart({
   workRoles: Role[];
   warehouses: { id: string; name: string }[];
 }) {
-  // P3A.2/ROLE-003: действие вызывается ИМПЕРАТИВНО (не через <form action>/useActionState), затем клиент
-  // делает полную навигацию window.location.assign(redirectTo). Так исключён server-action redirect()
-  // (Application error/UNAUTHORIZED, digest 852039715) И гонка, при которой авто-refresh маршрута после
-  // action размонтирует ShiftStart до навигации. Тот же приём, что у logout. Ошибка → остаёмся на экране.
-  const [error, setError] = useState<string>();
-  const [pending, setPending] = useState(false);
-  async function onSubmit(e: React.FormEvent<HTMLFormElement>) {
-    e.preventDefault();
-    if (pending) return;
-    setPending(true);
-    setError(undefined);
-    const fd = new FormData(e.currentTarget);
-    try {
-      const res = await startWorkShiftAction({}, fd);
-      if (res.redirectTo) { window.location.assign(res.redirectTo); return; } // уходим со страницы — pending не снимаем
-      setError(res.error ?? "Не удалось начать смену");
-    } catch {
-      setError("Не удалось начать смену");
-    }
-    setPending(false);
-  }
+  // P3A.2/ROLE-003: форма остаётся <form action> (server-action-поля на месте — совместимость с HTTP-
+  // проверками смен и прогрессивным улучшением). Успех БЕЗ redirect() возвращает redirectTo, клиент делает
+  // полную навигацию window.location.assign в useEffect — свежий рендер целевого экрана по актуальным
+  // Host/cookie (исключает Application error/UNAUTHORIZED, digest 852039715). startWorkShiftAction НЕ
+  // ревалидирует маршрут, поэтому /warehouse/shift не ре-рендерится в ShiftActive до навигации, и useEffect
+  // успевает уйти на рабочий экран. Ошибка → state.error на месте, навигации нет.
+  const [state, formAction, pending] = useActionState(startWorkShiftAction, initial);
+  useEffect(() => {
+    if (state.redirectTo) window.location.assign(state.redirectTo);
+  }, [state.redirectTo]);
 
   if (workRoles.length === 0) {
     return (
@@ -73,7 +62,7 @@ export function ShiftStart({
   return (
     <Card>
       <CardTitle>Начать смену</CardTitle>
-      <form onSubmit={onSubmit} className="flex flex-col gap-4">
+      <form action={formAction} className="flex flex-col gap-4">
         <fieldset className="flex flex-col gap-2">
           <span className="text-sm font-medium text-[#555]">Склад</span>
           <ChipSelect
@@ -92,7 +81,7 @@ export function ShiftStart({
             required
           />
         </fieldset>
-        {error && <p className="text-sm text-red-600">{error}</p>}
+        {state.error && <p className="text-sm text-red-600">{state.error}</p>}
         <Button type="submit" disabled={pending}>
           {pending ? "Начинаем…" : "Начать смену"}
         </Button>
