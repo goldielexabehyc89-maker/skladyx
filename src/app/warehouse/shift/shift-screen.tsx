@@ -1,10 +1,12 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { startWorkShiftAction, endWorkShiftAction } from "@/app/actions/shifts";
+import { useActionState, useEffect, useState } from "react";
+import { startWorkShiftAction, endWorkShiftAction, type ShiftState } from "@/app/actions/shifts";
 import { Button, Card, CardTitle, ChipSelect, Badge } from "@/components/ui";
 import { ROLE_LABEL, ROLE_TONE } from "@/lib/role-labels";
 import type { Role } from "@/lib/jwt";
+
+const initial: ShiftState = {};
 
 // Живая длительность смены (обновляется раз в секунду на клиенте).
 function useDuration(startIso: string): string {
@@ -110,25 +112,11 @@ export function ShiftActive({
   warehouseName: string;
   startedAtIso: string;
 }) {
-  // P3A.2/SHIFT-002: действие вызывается императивно, затем клиент делает полную навигацию
-  // window.location.assign(redirectTo=/warehouse/shift). Без server-action redirect() и без гонки
-  // авто-refresh маршрута. Ошибка (IN_PROGRESS блокирует) → остаёмся на экране, без навигации.
-  const [error, setError] = useState<string>();
-  const [pending, setPending] = useState(false);
-  async function onEnd(e: React.FormEvent<HTMLFormElement>) {
-    e.preventDefault();
-    if (pending) return;
-    setPending(true);
-    setError(undefined);
-    try {
-      const res = await endWorkShiftAction({}, new FormData());
-      if (res.redirectTo) { window.location.assign(res.redirectTo); return; }
-      setError(res.error ?? "Не удалось завершить смену");
-    } catch {
-      setError("Не удалось завершить смену");
-    }
-    setPending(false);
-  }
+  // P3A.2/SHIFT-002: завершение ведёт на /warehouse/shift — ТОТ ЖЕ маршрут, поэтому сохраняем
+  // <form action>/useActionState: успешное действие БЕЗ redirect() штатно ре-рендерит /warehouse/shift
+  // (смена закрыта → показывается форма старта). Ошибка (IN_PROGRESS блокирует) → state.error на месте,
+  // навигации нет. Форма сохраняет server-action-поля (совместимость с HTTP-проверками смен).
+  const [state, formAction, pending] = useActionState(endWorkShiftAction, initial);
   const duration = useDuration(startedAtIso);
   const started = new Date(startedAtIso);
   const startedLabel = `${String(started.getHours()).padStart(2, "0")}:${String(started.getMinutes()).padStart(2, "0")}`;
@@ -163,8 +151,8 @@ export function ShiftActive({
           <dd className="font-mono text-base font-semibold tabular-nums">{duration}</dd>
         </div>
       </dl>
-      <form onSubmit={onEnd} className="mt-4">
-        {error && <p className="mb-2 text-sm text-red-600">{error}</p>}
+      <form action={formAction} className="mt-4">
+        {state.error && <p className="mb-2 text-sm text-red-600">{state.error}</p>}
         <Button type="submit" variant="ghost" disabled={pending} className="w-full">
           {pending ? "Завершаем…" : "Завершить смену"}
         </Button>
