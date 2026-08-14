@@ -564,6 +564,34 @@ async function main() {
     if (ipr) await ipr.$disconnect().catch(() => {});
   }
 
+  // ── P3B-FIX-2: старт PLACE_GROUP при 0 свободных ячейках — «Начать» показывает бизнес-ошибку,
+  //    задача остаётся в очереди (не текущая), смена завершаема, без 500. desktop + mobile. ──
+  if (ids.phLoaderToken) {
+    const phReject = async (mobile) => {
+      const lbl = mobile ? "mobile" : "desktop";
+      await setViewport(mobile);
+      await setAuth(ids.phLoaderToken);
+      await goto("/warehouse/tasks", `document.body.innerText.includes("Разместить")`);
+      await sleep(700);
+      await clickText(/^Начать$/);
+      let err = false; for (let i = 0; i < 50; i++) { if ((await bodyText()).includes("Нет свободной ячейки")) { err = true; break; } await sleep(150); }
+      const t = await bodyText();
+      ok(`PH-FIX (${lbl}): 0 ячеек → понятная ошибка «Нет свободной ячейки»`, err);
+      ok(`PH-FIX (${lbl}): задача осталась в очереди, не стала текущей`, !has(t, "Текущая задача") && has(t, "Разместить"));
+      ok(`PH-FIX (${lbl}): без 500/Application error/UNAUTHORIZED`, !has(t, "Application error") && !has(t, "client-side exception") && !has(t, "UNAUTHORIZED"));
+    };
+    await phReject(false);
+    await phReject(true);
+    // после отказа сотрудник НЕ заблокирован невыполнимой задачей: смена штатно завершается.
+    await setViewport(false);
+    await setAuth(ids.phLoaderToken);
+    await goto("/warehouse/shift", `document.body.innerText.includes("Завершить смену")`);
+    await sleep(1000);
+    await clickText(/Завершить смену/);
+    let ended = false; for (let i = 0; i < 70; i++) { const p = await pathname(); if (p === "/warehouse/shift" && (await bodyText()).includes("Начать смену")) { ended = true; break; } await sleep(200); }
+    ok("PH-FIX: после отказа смена завершается (невыполнимая задача не блокирует)", ended);
+  }
+
   // ── TASK-007/008/009: монитор — «Запланирована» + МСК + живой таймер; выделение срочных (мобайл) ──
   const timers = async () => JSON.parse(await ev(`JSON.stringify([...document.querySelectorAll('[role=timer]')].map(e=>e.innerText.replace(/\\s+/g,' ').trim()))`));
   const redUrgentCard = () => ev(`[...document.querySelectorAll('div')].some(d=>getComputedStyle(d).backgroundColor==="rgb(254, 242, 242)" && d.textContent.includes("Срочно"))`);

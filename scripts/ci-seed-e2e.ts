@@ -677,6 +677,30 @@ async function main() {
   const startPickToken = await mkToken(startPick, "PICKER");
   const startCtrlToken = await mkToken(startCtrl, "CONTROLLER");
 
+  // ── P3B-FIX-2: PLACE_GROUP при 0 свободных STORAGE-ячейках. Единственная ячейка PH-1 занята стоком →
+  //    старт размещения атомарно отклоняется: понятная ошибка, задача остаётся ASSIGNED (не текущая),
+  //    сотрудник может завершить смену. Проверяем без 500. ──
+  const phWh = await prisma.warehouse.create({ data: { companyId, name: `CI-PH-${Date.now()}`, isActive: true, coolingRate: 2 } });
+  await ensureStandardZones(companyId, phWh.id);
+  const phStorage = await prisma.warehouseZone.findFirstOrThrow({ where: { companyId, warehouseId: phWh.id, kind: "STORAGE" } });
+  await createCellsInZone({ companyId, warehouseId: phWh.id, zoneId: phStorage.id, codes: ["PH-1"], level: 1 });
+  const phItem = await prisma.item.create({ data: { companyId, name: "CI PH-товар", uomId: uom.id, tracking: "LOT" } });
+  await prisma.itemBarcode.create({ data: { companyId, itemId: phItem.id, code: ean13("460000009501"), symbology: "EAN13", source: "MANUAL", isActive: true } });
+  const phLoader = await mkUser(companyId, "+79000009971", "CI Погрузчик PH", "LOADER", "CiPhLo-9971", phWh.id);
+  await prisma.workShift.create({ data: { companyId, userId: phLoader, warehouseId: phWh.id, role: "LOADER" } });
+  // занять единственную ячейку PH-1 стоком (без пика) → 0 свободных ячеек хранения
+  const phCell = await prisma.cell.findFirstOrThrow({ where: { companyId, warehouseId: phWh.id, code: "PH-1" } });
+  const phRec = await prisma.receipt.create({ data: { companyId, number: 9995001, warehouseId: phWh.id, status: "POSTED", postedAt: new Date(), createdById: phLoader } });
+  const phLn = await prisma.receiptLine.create({ data: { companyId, receiptId: phRec.id, itemId: phItem.id, qty: 2 } });
+  const phLot = await prisma.lot.create({ data: { companyId, itemId: phItem.id, receiptLineId: phLn.id, qtyReceived: 2 } });
+  await prisma.$transaction((tx) => applyLotMovement(tx, { companyId, docType: "RECEIPT", docId: phRec.id, itemId: phItem.id, lotId: phLot.id, qty: 2, from: null, to: { kind: "cell", warehouseId: phWh.id, cellId: phCell.id }, createdById: phLoader }));
+  await prisma.handlingGroup.create({ data: { companyId, warehouseId: phWh.id, itemId: phItem.id, lotId: phLot.id, qty: 2, temperature: 0, thresholdX: X, status: "IN_STORAGE", dedupeKey: "ci-ph-fill", acceptedById: phLoader } });
+  // целевая группа ждёт размещения → PLACE_GROUP ASSIGNED phLoader (но свободной ячейки нет)
+  const phTarget = await createHandlingGroup({ companyId, warehouseId: phWh.id, itemId: phItem.id, qty: 1, temperature: 0, acceptedById: phLoader, dedupeKey: "ci-ph-target" });
+  let phTask = await prisma.workflowTask.findFirstOrThrow({ where: { type: "PLACE_GROUP", subjectId: phTarget.groupId } });
+  if (phTask.status === "QUEUED") { await rebalanceQueuedTasks(companyId, { warehouseId: phWh.id }); phTask = await prisma.workflowTask.findUniqueOrThrow({ where: { id: phTask.id } }); }
+  const phLoaderToken = await mkToken(phLoader, "LOADER");
+
   // ── Задача H: монитор ADMIN — новые задачи сверху (createdAt DESC, id DESC). Сентинел создаётся
   //    ПОСЛЕДНИМ → на мониторе он должен идти выше всех ранее созданных задач. QUEUED (не назначается).
   const MONITOR_NEWEST_TITLE = "CI Монитор сентинел (новейшая)";
@@ -831,6 +855,9 @@ async function main() {
     muUrgTitle: MU_URG_TITLE,        // заголовок срочной задачи (видимость у A, не у B)
     muNormTitle: MU_NORM_TITLE,      // заголовок обычной задачи (видимость у B, не у A)
     // P3A.2: реальный старт/завершение смены рабочих ролей (LOADER/PICKER/CONTROLLER → задачи)
+    phLoaderToken,                   // P3B-FIX-2: погрузчик с PLACE_GROUP при 0 свободных ячейках
+    phWhId: phWh.id,                 // склад PH (0 свободных ячеек)
+    phTargetName: "CI PH-товар",     // товар целевой группы (карточка «Разместить»)
     startLoadToken,                  // погрузчик без смены (старт → /warehouse/tasks)
     startPickToken,                  // сборщик без смены (старт → /warehouse/tasks)
     startCtrlToken,                  // контролёр без смены (старт → /warehouse/tasks)

@@ -1,9 +1,10 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
+import { prisma } from "@/lib/db";
 import { requireUser } from "@/lib/auth";
 import { scoped } from "@/lib/tenant";
-import { workflowTasksEnabled, coolingWorkflowEnabled } from "@/lib/roles";
+import { workflowTasksEnabled, coolingWorkflowEnabled, groupReceivingEnabled } from "@/lib/roles";
 import {
   startWorkflowTask,
   requestTaskHandoff,
@@ -11,6 +12,7 @@ import {
   rejectTaskHandoff,
   rebalanceQueuedTasks,
 } from "@/lib/workflow-tasks";
+import { startGroupPlacement, GroupError } from "@/lib/group-receiving";
 import { prepareCoolingRetrieval, placeCoolingRetrieval, verifyCoolingRetrievalEan, verifyCoolingRetrievalSourceCell, CoolingError } from "@/lib/cooling";
 
 export interface TaskActionState {
@@ -28,6 +30,22 @@ export async function startTaskAction(_prev: TaskActionState, formData: FormData
   const s = scoped(session);
   const taskId = String(formData.get("taskId") ?? "");
   const skipReason = String(formData.get("skipReason") ?? "").trim();
+  // P3B-FIX-2: PLACE_GROUP стартует АТОМАРНО (резерв целевой ячейки + IN_PROGRESS + task_started одной
+  // транзакцией). Нет свободной ячейки → бизнес-ошибка, задача остаётся ASSIGNED без единой записи —
+  // сотрудник не заблокирован невыполнимой задачей. Прочие типы — штатный старт очереди.
+  if (groupReceivingEnabled()) {
+    const task = await prisma.workflowTask.findFirst({ where: { id: taskId, companyId: s.companyId }, select: { type: true } });
+    if (task?.type === "PLACE_GROUP") {
+      try {
+        await startGroupPlacement({ companyId: s.companyId, userId: session.userId, taskId, skipReason: skipReason || undefined });
+      } catch (e) {
+        if (e instanceof GroupError) { revalidatePath("/warehouse/tasks"); return { error: e.message }; }
+        throw e;
+      }
+      revalidatePath("/warehouse/tasks");
+      return { ok: true };
+    }
+  }
   const res = await startWorkflowTask(session.userId, s.companyId, taskId, skipReason || undefined);
   revalidatePath("/warehouse/tasks");
   return res;

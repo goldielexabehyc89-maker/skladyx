@@ -10,7 +10,7 @@
 /* eslint-disable no-console */
 import { PrismaClient, type Role } from "@prisma/client";
 import bcrypt from "bcryptjs";
-import { createHandlingGroup, prepareGroupPlacement, completeGroupPlacement, verifyGroupPlacementEan } from "@/lib/group-receiving";
+import { createHandlingGroup, prepareGroupPlacement, startGroupPlacement, completeGroupPlacement, verifyGroupPlacementEan } from "@/lib/group-receiving";
 import { ensureStandardZones, createCellsInZone, assertCellNotHeldByGroup, lockCell } from "@/lib/cells";
 import { startWorkflowTask, cancelWorkflowTask } from "@/lib/workflow-tasks";
 import { updateSettings } from "@/lib/settings";
@@ -250,6 +250,80 @@ async function main() {
     ok("создана сессия охлаждения ACTIVE", session.status === "ACTIVE");
     ok("верхний резерв CoolingSession СОХРАНЁН (ACTIVE, sessionId задан, без handlingGroupId)",
       (await prisma.cellReservation.count({ where: { sessionId: session.id, status: "ACTIVE" } })) === 1);
+
+    // ── P3B-FIX-2: атомарный старт PLACE_GROUP (резерв ячейки + IN_PROGRESS + task_started одной tx) ──
+    const mkWh = async (name: string, codes: string[]) => {
+      const w = (await prisma.warehouse.create({ data: { companyId, name, isActive: true } })).id;
+      await ensureStandardZones(companyId, w);
+      const z = (await prisma.warehouseZone.findFirstOrThrow({ where: { warehouseId: w, kind: "STORAGE" } })).id;
+      await createCellsInZone({ companyId, warehouseId: w, zoneId: z, codes, level: 1 });
+      return w;
+    };
+    const startedCount = () => prisma.event.count({ where: { companyId, type: "task_started" } });
+
+    console.log("10) АТОМАРНЫЙ старт: резерв ячейки + IN_PROGRESS + ровно один task_started");
+    const Wa = await mkWh("PG Wa", ["WA-1"]);
+    const La = await mkUser("pg_la", "+79996660010", "LOADER", Wa); await mkShift(La, Wa);
+    const gA = await G(Wa, 0); const tA = await taskOf(gA.groupId);
+    const ev10 = await startedCount();
+    const rA = await startGroupPlacement({ companyId, userId: La, taskId: tA!.id });
+    const tAafter = await prisma.workflowTask.findUniqueOrThrow({ where: { id: tA!.id } });
+    ok("старт назначил ячейку WA-1", rA.cellCode === "WA-1", rA.cellCode);
+    ok("задача IN_PROGRESS + startedAt установлен", tAafter.status === "IN_PROGRESS" && !!tAafter.startedAt);
+    ok("ровно одна активная бронь по задаче", (await prisma.cellReservation.count({ where: { taskId: tA!.id, status: "ACTIVE" } })) === 1);
+    ok("ровно одно событие task_started", (await startedCount()) === ev10 + 1);
+
+    console.log("11) 0 свободных ячеек → отказ АТОМАРНО: ASSIGNED, startedAt=null, без брони/события/движения");
+    const La2 = await mkUser("pg_la2", "+79996660011", "LOADER", Wa); await mkShift(La2, Wa);
+    const gB = await G(Wa, 0); const tB = await taskOf(gB.groupId); // WA-1 занята бронью gA → 0 свободных
+    const ev11 = await startedCount(); const mv11 = await prisma.stockMovement.count({ where: { companyId } });
+    const failB = await err(() => startGroupPlacement({ companyId, userId: tB!.assignedUserId!, taskId: tB!.id }));
+    const tBafter = await prisma.workflowTask.findUniqueOrThrow({ where: { id: tB!.id } });
+    ok("0 ячеек → «Нет свободной ячейки»", failB.includes("Нет свободной ячейки"), failB);
+    ok("задача осталась ASSIGNED, startedAt=null", tBafter.status === "ASSIGNED" && tBafter.startedAt === null);
+    ok("брони по задаче нет", (await prisma.cellReservation.count({ where: { taskId: tB!.id } })) === 0);
+    ok("task_started не создан, движения нет", (await startedCount()) === ev11 && (await prisma.stockMovement.count({ where: { companyId } })) === mv11);
+
+    console.log("12) параллельные старты ОДНОЙ задачи → одна бронь и одно событие");
+    const Wc = await mkWh("PG Wc", ["WC-1"]);
+    const Lc = await mkUser("pg_lc", "+79996660012", "LOADER", Wc); await mkShift(Lc, Wc);
+    const gC = await G(Wc, 0); const tC = await taskOf(gC.groupId);
+    const ev12 = await startedCount();
+    const par = await Promise.allSettled([
+      startGroupPlacement({ companyId, userId: Lc, taskId: tC!.id }),
+      startGroupPlacement({ companyId, userId: Lc, taskId: tC!.id }),
+      startGroupPlacement({ companyId, userId: Lc, taskId: tC!.id }),
+    ]);
+    ok("ровно один старт успешен", par.filter((r) => r.status === "fulfilled").length === 1, `ok=${par.filter((r) => r.status === "fulfilled").length}`);
+    ok("ровно одна активная бронь", (await prisma.cellReservation.count({ where: { taskId: tC!.id, status: "ACTIVE" } })) === 1);
+    ok("ровно одно событие task_started", (await startedCount()) === ev12 + 1);
+    ok("задача IN_PROGRESS", (await prisma.workflowTask.findUniqueOrThrow({ where: { id: tC!.id } })).status === "IN_PROGRESS");
+
+    console.log("13) две группы стартуют → разные ячейки (нет двойного назначения)");
+    const Wd = await mkWh("PG Wd", ["WD-B", "WD-A"]);
+    const Ld1 = await mkUser("pg_ld1", "+79996660013", "LOADER", Wd); await mkShift(Ld1, Wd);
+    const Ld2 = await mkUser("pg_ld2", "+79996660014", "LOADER", Wd); await mkShift(Ld2, Wd);
+    const gD1 = await G(Wd, 0); const gD2 = await G(Wd, 0);
+    const tD1 = await taskOf(gD1.groupId); const tD2 = await taskOf(gD2.groupId);
+    const [rD1, rD2] = await Promise.all([
+      startGroupPlacement({ companyId, userId: tD1!.assignedUserId!, taskId: tD1!.id }),
+      startGroupPlacement({ companyId, userId: tD2!.assignedUserId!, taskId: tD2!.id }),
+    ]);
+    ok("две группы → разные ячейки WD-A и WD-B", [rD1.cellCode, rD2.cellCode].sort().join(",") === "WD-A,WD-B", `${rD1.cellCode}/${rD2.cellCode}`);
+
+    console.log("14) recovery: legacy IN_PROGRESS без брони → prepareGroupPlacement создаёт одну бронь без второго task_started");
+    const We = await mkWh("PG We", ["WE-1"]);
+    const Le = await mkUser("pg_le", "+79996660015", "LOADER", We); await mkShift(Le, We);
+    const gE = await G(We, 0); const tE = await taskOf(gE.groupId);
+    await startWorkflowTask(Le, companyId, tE!.id); // имитация legacy: IN_PROGRESS + task_started, без брони
+    const ev14 = await startedCount();
+    ok("legacy: IN_PROGRESS без брони", (await prisma.workflowTask.findUniqueOrThrow({ where: { id: tE!.id } })).status === "IN_PROGRESS" && (await prisma.cellReservation.count({ where: { taskId: tE!.id, status: "ACTIVE" } })) === 0);
+    const rE = await prepareGroupPlacement({ companyId, userId: Le, taskId: tE!.id });
+    ok("recovery: назначена ячейка WE-1", rE.cellCode === "WE-1", rE.cellCode);
+    ok("recovery: одна активная бронь, второго task_started нет", (await prisma.cellReservation.count({ where: { taskId: tE!.id, status: "ACTIVE" } })) === 1 && (await startedCount()) === ev14);
+    const eCellQr = await cellQr(rE.cellId);
+    const dE = await err(() => completeGroupPlacement({ companyId, userId: Le, taskId: tE!.id, cellCode: eCellQr, ean }));
+    ok("recovery: размещение завершается штатно (IN_STORAGE)", dE === "" && (await grp(gE.groupId)).status === "IN_STORAGE", dE);
 
     console.log(failures === 0 ? "\nPLACE-GROUP OK ✓" : `\nПРОВАЛЕНО: ${failures}`);
   } finally {

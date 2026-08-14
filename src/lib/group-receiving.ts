@@ -260,6 +260,79 @@ export async function prepareGroupPlacement(input: {
   });
 }
 
+// P3B-FIX-2 (TASK-001 / PLACE-001 / PLACE-003): АТОМАРНЫЙ старт размещения. Резерв целевой ячейки и
+// перевод задачи ASSIGNED→IN_PROGRESS (+ startedAt, + task_started) — ОДНА транзакция. Порядок: проверки
+// исполнителя/статуса/скипа срочной → под lockCompany выбрать кандидата (STORAGE: level ASC, code ASC;
+// COOLING: code ASC) под lockCell, пропуская конкурентно занятых → создать ОДНУ CellReservation → только
+// затем перевести задачу в IN_PROGRESS. Нет кандидата → GroupError и ПОЛНЫЙ откат: бронь не создана,
+// задача остаётся ASSIGNED, startedAt=null, task_started НЕ пишется — сотрудник не заблокирован.
+// Идемпотентно по taskId (повтор при существующей броне возвращает ту же ячейку без второго события).
+export async function startGroupPlacement(input: {
+  companyId: string;
+  userId: string;
+  taskId: string;
+  skipReason?: string;
+}): Promise<{ cellId: string; cellCode: string }> {
+  const res = await prisma.$transaction(async (tx) => {
+    await lockCompany(tx, input.companyId);
+    const task = await tx.workflowTask.findFirst({ where: { id: input.taskId, companyId: input.companyId } });
+    if (!task) throw new GroupError("Задача не найдена");
+    if (task.type !== "PLACE_GROUP") throw new GroupError("Это не задача размещения группы");
+    if (task.assignedUserId !== input.userId || task.status !== "ASSIGNED")
+      throw new GroupError("Эту задачу нельзя начать");
+    // TASK-001: нельзя иметь вторую физически активную (IN_PROGRESS/HANDOFF_PENDING) задачу.
+    const busy = await tx.workflowTask.findFirst({
+      where: { assignedUserId: input.userId, status: { in: ["IN_PROGRESS", "HANDOFF_PENDING"] } },
+      select: { id: true },
+    });
+    if (busy) throw new GroupError("У вас уже есть задача в работе — завершите или передайте её");
+    // TASK-002/009: пропуск доступной срочной — только с причиной.
+    const recommended = await tx.workflowTask.findFirst({
+      where: { assignedUserId: input.userId, status: "ASSIGNED" },
+      orderBy: [{ priority: "desc" }, { dueAt: { sort: "asc", nulls: "last" } }, { createdAt: "asc" }, { id: "asc" }],
+    });
+    const skipsUrgent = !!recommended && recommended.id !== task.id && recommended.priority === "URGENT";
+    if (skipsUrgent && !input.skipReason?.trim())
+      throw new GroupError("Впереди есть срочная задача. Укажите причину пропуска или начните срочную.");
+    const group = await tx.handlingGroup.findFirst({ where: { id: task.subjectId ?? "", companyId: input.companyId } });
+    if (!group) throw new GroupError("Группа не найдена");
+    if (group.status !== "AWAITING_STORAGE" && group.status !== "AWAITING_COOLING")
+      throw new GroupError("Группа уже размещена");
+    const kind = group.status === "AWAITING_STORAGE" ? "STORAGE" : "COOLING";
+
+    // Сначала бронь: идемпотентность по taskId, иначе — первый свободный кандидат под lockCell.
+    let cell: { id: string; code: string } | null = null;
+    const existing = await tx.cellReservation.findFirst({ where: { taskId: task.id, status: "ACTIVE" } });
+    if (existing) {
+      const c = await tx.cell.findFirst({ where: { id: existing.cellId, companyId: input.companyId }, select: { code: true } });
+      cell = { id: existing.cellId, code: c?.code ?? "" };
+    } else {
+      const candidates = await candidatePlacementCellsInTx(tx, input.companyId, group.warehouseId, kind);
+      for (const cand of candidates) {
+        await lockCell(tx, input.companyId, cand.id);
+        if (await cellIsBusy(tx, cand.id)) continue;
+        const taken = await tx.cellReservation.findFirst({ where: { cellId: cand.id, status: "ACTIVE" }, select: { id: true } });
+        if (taken) continue;
+        await tx.cellReservation.create({
+          data: { companyId: input.companyId, warehouseId: group.warehouseId, cellId: cand.id, handlingGroupId: group.id, taskId: task.id, status: "ACTIVE" },
+        });
+        cell = { id: cand.id, code: cand.code };
+        break;
+      }
+      if (!cell)
+        throw new GroupError(kind === "STORAGE" ? "Нет свободной ячейки хранения для размещения" : "Нет свободной ячейки охлаждения для размещения");
+    }
+    // Только ПОСЛЕ успешного резерва — перевод в IN_PROGRESS (в той же транзакции, что и бронь).
+    await tx.workflowTask.update({ where: { id: task.id }, data: { status: "IN_PROGRESS", startedAt: new Date() } });
+    return { cellId: cell.id, cellCode: cell.code, warehouseId: task.warehouseId, skipsUrgent, skippedTitle: skipsUrgent ? recommended!.title : null };
+  });
+  // task_started — вне транзакции с идемпотентным ключом (одно событие даже при повторе/гонке).
+  await logEvent({ companyId: input.companyId, type: "task_started", title: "Задача взята в работу", body: input.taskId, url: "/warehouse/tasks", userIds: [input.userId], key: `task:${input.taskId}:started` });
+  if (res.skipsUrgent)
+    await logEvent({ companyId: input.companyId, type: "task_skipped", title: "Пропущена срочная задача", body: `Причина: ${input.skipReason}`, url: "/warehouse/tasks", warehouseIds: [res.warehouseId], userIds: [input.userId], actorId: input.userId });
+  return { cellId: res.cellId, cellCode: res.cellCode };
+}
+
 // ── Авторитетная серверная сверка EAN на ПЕРВОМ скане размещения (UI-005) ──
 // Read-only: НЕ создаёт движения, событий или брони. Проверяет: задача принадлежит исполнителю и
 // IN_PROGRESS; активная бронь относится к ЭТОЙ задаче; группа существует и ожидает размещения; EAN
