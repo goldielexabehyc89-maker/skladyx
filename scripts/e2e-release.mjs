@@ -415,6 +415,42 @@ async function main() {
     ok("ROLE-003 (моб): ADMIN без смены — таб «Монитор»", await tabHas("/warehouse/tasks?view=monitor"));
   }
 
+  // ── P3B-FIX-3: ADMIN всегда видит «Внешние заказы» (независимо от смены); рабочие роли — нет ──
+  const EO = "/warehouse/external-orders";
+  const ariaPage = (sel) => ev(`[...document.querySelectorAll('${sel}')].some(e=>e.getAttribute('aria-current')==="page")`);
+  if (ids.adminToken) {
+    await setViewport(false);
+    await setAuth(ids.adminToken); // ADMIN без смены
+    await homePath();
+    ok("P3B-FIX-3: ADMIN без смены — в меню «Внешние заказы» (desktop)", await navHas(EO));
+    await goto(EO, `location.pathname === "${EO}"`);
+    const eo = await bodyText();
+    ok("P3B-FIX-3: один клик открыл список внешних заказов (без 404/500)", (await pathname()) === EO && !has(eo, "Application error") && !has(eo, "client-side exception") && !has(eo, "UNAUTHORIZED") && !has(eo, "This page could not be found"));
+    ok("P3B-FIX-3: aria-current только у «Внешние заказы» (desktop)", (await ariaPage(`aside a[href="${EO}"]`)) && !(await ariaPage(`aside a[href="/warehouse/tasks?view=monitor"]`)));
+    ok("P3B-FIX-3: из списка ссылка навигации доступна повторно", await navHas(EO));
+  }
+  if (ids.adminLoadToken) {
+    await setViewport(false);
+    await setAuth(ids.adminLoadToken); // ADMIN + активная смена LOADER
+    await homePath();
+    ok("P3B-FIX-3: ADMIN c активной сменой LOADER — «Внешние заказы» всё равно виден", await navHas(EO));
+  }
+  if (ids.workToken) {
+    await setViewport(false);
+    await setAuth(ids.workToken); // RECEIVER без ADMIN
+    await homePath();
+    ok("P3B-FIX-3: рабочая роль без ADMIN — «Внешние заказы» НЕ виден", !(await navHas(EO)));
+  }
+  if (ids.adminToken) {
+    await setViewport(true);
+    await setAuth(ids.adminToken);
+    await goto("/warehouse", `location.pathname.startsWith("/warehouse")`);
+    ok("P3B-FIX-3 (моб): «Внешние заказы» не в нижнем таб-баре (а в «Ещё»)", !(await tabHas(EO)));
+    await clickText(/Ещё/);
+    let inDrawer = false; for (let i = 0; i < 30; i++) { if (await tabHas(EO)) { inDrawer = true; break; } await sleep(150); }
+    ok("P3B-FIX-3 (моб): «Внешние заказы» доступен в меню «Ещё»", inDrawer);
+  }
+
   // ── P3 (UI-004): операционные панели — пошаговые, без набора полей сразу ──
   const visIn = async (sel) => ev(`[...document.querySelectorAll('${sel}')].filter(e=>e.type!=="hidden" && e.offsetParent!==null).length`);
   const sheetFields = () => visIn('[data-workflow-sheet] input, [data-workflow-sheet] select, [data-workflow-sheet] textarea');

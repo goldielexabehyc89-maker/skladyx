@@ -19,6 +19,7 @@ import {
   ListTodo,
   Menu,
   Package,
+  PackageCheck,
   PackagePlus,
   ScanLine,
   Settings,
@@ -73,6 +74,9 @@ const TASKS: NavItem = { href: "/warehouse/tasks", label: "Задачи", icon: 
 // рабочей смене LOADER/PICKER/CONTROLLER (ROLE-003).
 const TASKS_MINE: NavItem = { href: "/warehouse/tasks?view=mine", label: "Мои задачи", icon: ListTodo };
 const TASKS_MONITOR: NavItem = { href: "/warehouse/tasks?view=monitor", label: "Монитор задач", icon: ListTodo };
+// P3B-FIX-3: административный список внешних заказов (импорт/сборка/контроль/выдача). Постоянное
+// полномочие ADMIN — виден независимо от активной смены (гейт только по флагу externalOrderPicking).
+const EXTERNAL_ORDERS: NavItem = { href: "/warehouse/external-orders", label: "Внешние заказы", icon: PackageCheck };
 const RECEIVING_GROUP: NavItem = { href: "/warehouse/receiving", label: "Приёмка группами", icon: PackagePlus };
 
 const WORK_ROLES = ["RECEIVER", "LOADER", "PICKER", "CONTROLLER"] as const;
@@ -107,6 +111,7 @@ function groupsFor(
   canReceive: boolean,
   groupReceiving: boolean,
   legacyUi: boolean,
+  externalOrdersEnabled: boolean,
 ): NavGroup[] {
   // ROLE-003: операционный рабочий пункт определяется АКТИВНОЙ сменой, а не назначенными ролями.
   // RECEIVER-смена → «Приёмка»; LOADER/PICKER/CONTROLLER-смена → задачи (для ADMIN — «Мои задачи»
@@ -123,7 +128,7 @@ function groupsFor(
       { title: "Работа", items: [ACTIVE, SCAN, RECEIPTS, STAGING, ...opItems(TASKS_MINE), ...(canStartShift ? [SHIFT] : [])] },
       { title: "Документы", items: [ORDERS, PICKLISTS, TRANSFERS, ISSUES, WRITEOFFS, INVENTORIES] },
       { title: "Справочники", items: [STOCK, ITEMS, WAREHOUSES, SUPPLIERS, EMPLOYEES] },
-      { title: "Контроль", items: [...(tasksEnabled ? [TASKS_MONITOR] : []), HISTORY, FEED, SETTINGS] },
+      { title: "Контроль", items: [...(tasksEnabled ? [TASKS_MONITOR] : []), ...(externalOrdersEnabled ? [EXTERNAL_ORDERS] : []), HISTORY, FEED, SETTINGS] },
       { title: "Моё", items: [MY] },
     ];
   else if (role === "STOREKEEPER")
@@ -162,6 +167,7 @@ function NavContent({
   canReceive,
   groupReceiving,
   legacyUi,
+  externalOrdersEnabled,
   homeHref,
   name,
   collapsed,
@@ -175,6 +181,7 @@ function NavContent({
   canReceive: boolean;
   groupReceiving: boolean;
   legacyUi: boolean;
+  externalOrdersEnabled: boolean;
   homeHref: string;
   name: string;
   collapsed: boolean;
@@ -183,7 +190,7 @@ function NavContent({
 }) {
   const pathname = usePathname();
   const view = useSearchParams().get("view");
-  const groups = groupsFor(role, activeShiftRole, canStartShift, tasksEnabled, canReceive, groupReceiving, legacyUi);
+  const groups = groupsFor(role, activeShiftRole, canStartShift, tasksEnabled, canReceive, groupReceiving, legacyUi, externalOrdersEnabled);
   const [loggingOut, setLoggingOut] = useState(false);
   // Пакет 10 (fix): server-logout очищает cookie, затем ПОЛНАЯ навигация на /login (window.location) —
   // свежий серверный рендер по актуальному Host, без встроенного/закэшированного RSC другого host.
@@ -367,6 +374,7 @@ export function AppNav({
   tasksEnabled,
   groupReceivingEnabled = false,
   legacyUi = true,
+  externalOrdersEnabled = false,
   homeHref = "/warehouse",
 }: {
   role: Role;
@@ -376,6 +384,7 @@ export function AppNav({
   tasksEnabled: boolean;
   groupReceivingEnabled?: boolean;
   legacyUi?: boolean;
+  externalOrdersEnabled?: boolean;
   homeHref?: string;
 }) {
   const [mobileOpen, setMobileOpen] = useState(false);
@@ -402,6 +411,7 @@ export function AppNav({
           canReceive={canReceive}
           groupReceiving={groupReceivingEnabled}
           legacyUi={legacyUi}
+          externalOrdersEnabled={externalOrdersEnabled}
           homeHref={homeHref}
           name={name}
           collapsed={collapsed}
@@ -450,6 +460,7 @@ export function AppNav({
               canReceive={canReceive}
               groupReceiving={groupReceivingEnabled}
               legacyUi={legacyUi}
+              externalOrdersEnabled={externalOrdersEnabled}
               homeHref={homeHref}
               name={name}
               collapsed={false}
