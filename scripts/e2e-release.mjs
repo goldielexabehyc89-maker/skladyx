@@ -1415,10 +1415,17 @@ async function main() {
       started0 === ((await taskRow())?.startedAt?.toISOString() ?? null) && resv0 === JSON.stringify(await resvActive()) && mov0 === (await movCountHo()));
     ok("HO: ровно одна PENDING-передача (повтор не плодит)", (await pendingHo()) === 1 || (await pendingHo()) === null);
 
-    // 3) завершение смены hoA заблокировано (HANDOFF_PENDING)
+    // 3) завершение смены hoA заблокировано (HANDOFF_PENDING). Даём странице догидратироваться перед
+    //    кликом (как в PH-FIX), иначе клик по невзведённой кнопке иногда не запускает server-action.
     await goto("/warehouse/shift", `document.body.innerText.includes("Завершить смену")`);
-    await clickText(/Завершить смену/);
-    let blocked = false; for (let i = 0; i < 40; i++) { const b = await bodyText(); if ((await pathname()) === "/warehouse/shift" && b.includes("Есть задача в работе")) { blocked = true; break; } await sleep(200); }
+    await sleep(1000);
+    let blocked = false;
+    for (let i = 0; i < 40; i++) {
+      if (i === 0 || i === 12 || i === 24) await clickText(/Завершить смену/); // клик + пара повторов на случай негидратированной кнопки
+      const b = await bodyText();
+      if ((await pathname()) === "/warehouse/shift" && b.includes("Есть задача в работе")) { blocked = true; break; }
+      await sleep(250);
+    }
     ok("HO: завершение смены заблокировано при HANDOFF_PENDING", blocked);
 
     // 4) hoB видит одну входящую передачу без техданных, принимает
