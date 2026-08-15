@@ -238,6 +238,46 @@ async function main() {
   const rej = await rejectTaskHandoff(companyId, h2.id, other2);
   ok("отклонение → задача снова IN_PROGRESS у исходного", !rej.error && (await assignee(ht2.id)) === o2 && (await statusOf(ht2.id)) === "IN_PROGRESS");
 
+  console.log("8b) передача: негативы и инварианты (P3C-FIX-1)");
+  await resetTasks();
+  await prisma.workShift.updateMany({ where: { userId: { in: [lA, lB, pA, pB] }, endedAt: null }, data: { endedAt: new Date() } });
+  await mkShift(lA, companyId, W1, "LOADER", new Date(Date.now() - 60000));
+  await mkShift(lB, companyId, W1, "LOADER", new Date());
+  await mkShift(pA, companyId, W1, "PICKER"); // коллега ДРУГОЙ роли на том же складе
+  const hA = (await task(W1, "LOADER", { key: dk("ho-a") })).task;
+  if ((await assignee(hA.id)) !== lA)
+    await prisma.workflowTask.update({ where: { id: hA.id }, data: { assignedUserId: lA, assignedShiftId: (await prisma.workShift.findFirstOrThrow({ where: { userId: lA, endedAt: null } })).id } });
+  await startWorkflowTask(lA, companyId, hA.id);
+  const hAStarted = (await prisma.workflowTask.findUniqueOrThrow({ where: { id: hA.id } })).startedAt;
+  // wrong-role: передать коллеге ДРУГОЙ роли (PICKER pA) — отказ, задача не тронута
+  const wrRole = await requestTaskHandoff(companyId, hA.id, lA, pA);
+  ok("передача коллеге другой роли отклонена", !!wrRole.error && (await statusOf(hA.id)) === "IN_PROGRESS");
+  // wrong-warehouse: получатель на другом складе (W2) — отказ
+  const lW2 = await mkUser("p2_lW2", companyId, "+79997009099", "LOADER", W2);
+  await mkShift(lW2, companyId, W2, "LOADER");
+  const wrWh = await requestTaskHandoff(companyId, hA.id, lA, lW2);
+  ok("передача на чужой склад отклонена", !!wrWh.error && (await statusOf(hA.id)) === "IN_PROGRESS");
+  // busy: получатель lB занят своей IN_PROGRESS — отказ
+  const hB = (await task(W1, "LOADER", { key: dk("ho-b") })).task;
+  if ((await assignee(hB.id)) !== lB)
+    await prisma.workflowTask.update({ where: { id: hB.id }, data: { assignedUserId: lB, assignedShiftId: (await prisma.workShift.findFirstOrThrow({ where: { userId: lB, endedAt: null } })).id } });
+  await startWorkflowTask(lB, companyId, hB.id);
+  const busyRej = await requestTaskHandoff(companyId, hA.id, lA, lB);
+  ok("передача занятому получателю отклонена", !!busyRej.error && (await statusOf(hA.id)) === "IN_PROGRESS");
+  await completeWorkflowTask(hB.id); // освободим lB
+  // корректная передача lA→lB
+  const okReq = await requestTaskHandoff(companyId, hA.id, lA, lB);
+  ok("корректная передача → HANDOFF_PENDING", !okReq.error && (await statusOf(hA.id)) === "HANDOFF_PENDING");
+  // duplicate: повторный запрос по той же задаче не создаёт вторую передачу
+  const dupReq = await requestTaskHandoff(companyId, hA.id, lA, lB);
+  ok("повторный запрос отклонён — ровно одна PENDING-передача", !!dupReq.error && (await prisma.taskHandoff.count({ where: { taskId: hA.id, status: "PENDING" } })) === 1);
+  // accept: startedAt сохранён, ровно один активный исполнитель
+  const hOff = await prisma.taskHandoff.findFirstOrThrow({ where: { taskId: hA.id, status: "PENDING" } });
+  const accOk = await acceptTaskHandoff(companyId, hOff.id, lB);
+  const hAfter = await prisma.workflowTask.findUniqueOrThrow({ where: { id: hA.id } });
+  ok("принятие: IN_PROGRESS у получателя, startedAt НЕ изменён", !accOk.error && hAfter.status === "IN_PROGRESS" && hAfter.assignedUserId === lB && String(hAfter.startedAt) === String(hAStarted), `started ${hAStarted?.toISOString()} -> ${hAfter.startedAt?.toISOString()}`);
+  ok("после передачи ровно один активный исполнитель задачи", (await prisma.workflowTask.count({ where: { id: hA.id, assignedUserId: lB, status: "IN_PROGRESS" } })) === 1);
+
   console.log("9) push не создаётся движком");
   ok("нет push-подписок у тест-пользователей", (await prisma.pushSubscription.count({ where: { userId: { in: UIDS } } })) === 0);
 

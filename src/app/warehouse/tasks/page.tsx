@@ -226,6 +226,10 @@ export default async function TasksPage({
   });
   const current = mine.find((t) => t.status === "IN_PROGRESS" || t.status === "HANDOFF_PENDING") ?? null;
   const assigned = mine.filter((t) => t.status === "ASSIGNED");
+  // P3C-FIX-1: структурированные контексты компактной карточки строим и в работе, и при ожидании
+  // передачи — чтобы HANDOFF_PENDING рендерил ту же компактную карточку (без сканеров/действий),
+  // а не технический fallback. Операционные действия в UI гейтятся отдельно (только IN_PROGRESS).
+  const currentLive = !!current && (current.status === "IN_PROGRESS" || current.status === "HANDOFF_PENDING");
 
   // TASK-006 (расширение): компактные карточки всех физических задач погрузчика — структурированные
   // контексты (товар/количество/маршрут) грузим ПАКЕТНО, без отдельного запроса на каждую карточку.
@@ -327,7 +331,7 @@ export default async function TasksPage({
   // TASK-006: операционные поля из СТРУКТУРИРОВАННЫХ данных (HandlingGroup + Item), без парсинга
   // title/description. source — фактическая зона ожидающей группы (приёмка); targetZone — целевая зона.
   let placement: { taskId: string; itemName: string; qty: number; source: string; targetZone: string } | null = null;
-  if (current && current.type === "PLACE_GROUP" && current.status === "IN_PROGRESS" && groupReceivingEnabled()) {
+  if (current && current.type === "PLACE_GROUP" && currentLive && groupReceivingEnabled()) {
     const group = await prisma.handlingGroup.findFirst({ where: { id: current.subjectId ?? "", companyId: s.companyId } });
     if (group && (group.status === "AWAITING_STORAGE" || group.status === "AWAITING_COOLING")) {
       const item = await prisma.item.findFirst({ where: { id: group.itemId, companyId: s.companyId }, select: { name: true } });
@@ -343,7 +347,7 @@ export default async function TasksPage({
 
   // Пакет 5: для текущей RETRIEVE_COOLING-задачи в работе — контекст сессии для ввода температуры.
   let cooling: { taskId: string; thresholdX: number; itemName: string; qty: number; coolingCell: string } | null = null;
-  if (current && current.type === "RETRIEVE_COOLING" && current.status === "IN_PROGRESS" && coolingWorkflowEnabled()) {
+  if (current && current.type === "RETRIEVE_COOLING" && currentLive && coolingWorkflowEnabled()) {
     const session = await prisma.coolingSession.findFirst({ where: { id: current.subjectId ?? "", companyId: s.companyId, status: "ACTIVE" } });
     if (session) {
       // Структурированные поля (товар/количество/исходная ячейка) — из группы/товара/ячейки, без парсинга title.
@@ -357,7 +361,7 @@ export default async function TasksPage({
   // Пакет 6: контекст текущей задачи сборки (PICK_ORDER) и перестановки (MOVE_GROUP).
   let pickOrder = null as Awaited<ReturnType<typeof getPickOrderContext>> | null;
   let moveGroup = null as Awaited<ReturnType<typeof getMoveGroupContext>> | null;
-  if (current && current.status === "IN_PROGRESS" && externalOrderPickingEnabled()) {
+  if (current && currentLive && externalOrderPickingEnabled()) {
     if (current.type === "PICK_ORDER") pickOrder = await getPickOrderContext(s.companyId, current.id);
     else if (current.type === "MOVE_GROUP") moveGroup = await getMoveGroupContext(s.companyId, current.id);
   }
@@ -365,7 +369,7 @@ export default async function TasksPage({
   // Пакет 7: контекст текущей задачи контроля (CONTROL_ORDER) и исправления (CORRECT_ORDER).
   let controlOrder = null as Awaited<ReturnType<typeof getControlOrderContext>> | null;
   let correctOrder = null as Awaited<ReturnType<typeof getCorrectOrderContext>> | null;
-  if (current && current.status === "IN_PROGRESS" && orderControlEnabled()) {
+  if (current && currentLive && orderControlEnabled()) {
     if (current.type === "CONTROL_ORDER") controlOrder = await getControlOrderContext(s.companyId, current.id);
     else if (current.type === "CORRECT_ORDER") correctOrder = await getCorrectOrderContext(s.companyId, current.id);
   }
@@ -394,7 +398,7 @@ export default async function TasksPage({
   // Пакет 8: контекст текущей задачи размещения (ISSUE_ORDER) и выдачи (DELIVER_ORDER).
   let issueOrder = null as Awaited<ReturnType<typeof getIssueOrderContext>> | null;
   let deliverOrder = null as Awaited<ReturnType<typeof getDeliverOrderContext>> | null;
-  if (current && current.status === "IN_PROGRESS" && orderIssueEnabled()) {
+  if (current && currentLive && orderIssueEnabled()) {
     if (current.type === "ISSUE_ORDER") issueOrder = await getIssueOrderContext(s.companyId, current.id);
     else if (current.type === "DELIVER_ORDER") deliverOrder = await getDeliverOrderContext(s.companyId, current.id);
   }

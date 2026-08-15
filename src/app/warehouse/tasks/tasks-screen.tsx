@@ -191,28 +191,43 @@ function StartTaskForm({ task }: { task: TaskDTO }) {
   );
 }
 
-function HandoffForm({ taskId, mates }: { taskId: string; mates: Mate[] }) {
+// P3C-FIX-1 (SHIFT-002/TASK-006): единое компактное вторичное действие «Передать задачу» для ВСЕХ
+// структурированных карточек текущей задачи (PLACE_GROUP, RETRIEVE_COOLING, MOVE_GROUP, PICK_ORDER,
+// CONTROL_ORDER, ISSUE_ORDER, DELIVER_ORDER, CORRECT_ORDER). Свёрнуто по умолчанию (<details>), не
+// перегружает рабочую карточку. Требует выбора получателя и явного подтверждения (submit).
+// • IN_PROGRESS без подходящего коллеги (той же роли/склада на смене) → ничего не рендерит
+//   (карточку не занимаем постоянным текстом).
+// • HANDOFF_PENDING → только компактная строка «Ожидает принятия передачи», без действий и сканеров.
+function HandoffControl({ taskId, mates, status }: { taskId: string; mates: Mate[]; status: string }) {
+  if (status === "HANDOFF_PENDING")
+    return <p className="mt-3 text-xs font-medium text-orange-600">Ожидает принятия передачи получателем.</p>;
+  if (status !== "IN_PROGRESS" || mates.length === 0) return null;
+  return <HandoffDetails taskId={taskId} mates={mates} />;
+}
+
+function HandoffDetails({ taskId, mates }: { taskId: string; mates: Mate[] }) {
   const [state, action, pending] = useActionState<TaskActionState, FormData>(requestHandoffAction, {});
-  if (mates.length === 0)
-    return <p className="mt-2 text-xs text-neutral-400">Нет коллег той же роли на смене для передачи.</p>;
   return (
-    <form action={action} className="mt-2 flex flex-col gap-2">
-      <input type="hidden" name="taskId" value={taskId} />
-      <div className="flex gap-2">
-        <select name="toUserId" required className="min-w-0 flex-1 rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm">
-          <option value="">Кому передать…</option>
-          {mates.map((m) => (
-            <option key={m.userId} value={m.userId}>
-              {m.name}
-            </option>
-          ))}
-        </select>
-        <Button type="submit" variant="ghost" disabled={pending}>
-          {pending ? "…" : "Передать"}
-        </Button>
-      </div>
-      {state.error && <p className="text-xs text-red-600">{state.error}</p>}
-    </form>
+    <details className="mt-3 text-xs text-neutral-500">
+      <summary className="cursor-pointer select-none">Передать задачу</summary>
+      <form action={action} className="mt-2 flex flex-col gap-2">
+        <input type="hidden" name="taskId" value={taskId} />
+        <div className="flex gap-2">
+          <select name="toUserId" required className="min-w-0 flex-1 rounded-lg border border-[#e4e4f0] px-3 py-1.5 text-sm">
+            <option value="">Кому передать…</option>
+            {mates.map((m) => (
+              <option key={m.userId} value={m.userId}>
+                {m.name}
+              </option>
+            ))}
+          </select>
+          <Button type="submit" variant="ghost" disabled={pending}>
+            {pending ? "…" : "Передать"}
+          </Button>
+        </div>
+        {state.error && <p className="text-xs text-red-600">{state.error}</p>}
+      </form>
+    </details>
   );
 }
 
@@ -247,7 +262,9 @@ function HandoffResponse({ handoffId }: { handoffId: string }) {
 // «Начать размещение» идемпотентно возвращает ту же бронь. Ручной fallback использует ту же бронь.
 // TASK-006: компактная физическая задача — только команда «Разместить» и маршрут «<откуда> → <куда>».
 // Ни типа/статуса/времени задачи, ни title/description. Код целевой ячейки — самый заметный элемент.
-function PlacementBlock({ placement }: { placement: Placement }) {
+// P3C-FIX-1: canOperate=false (HANDOFF_PENDING) — только компактный заголовок (команда/товар/маршрут),
+// без «Начать размещение» и сканера. Операционные действия недоступны, пока задача ожидает передачи.
+function PlacementBlock({ placement, canOperate = true }: { placement: Placement; canOperate?: boolean }) {
   const [prep, prepareAct, preparing] = useActionState<PreparePlacementState, FormData>(prepareGroupPlacementAction, {});
   const assigned = !!prep.cellCode;
   const target = prep.cellCode ?? placement.targetZone;
@@ -268,7 +285,7 @@ function PlacementBlock({ placement }: { placement: Placement }) {
             : "min-w-0 truncate text-lg font-semibold text-[#1a1a1a]"}>{target}</span>
         </div>
       </div>
-      {!assigned ? (
+      {!canOperate ? null : !assigned ? (
         <form action={prepareAct} className="flex flex-col gap-2">
           <input type="hidden" name="taskId" value={placement.taskId} />
           {prep.error && <p role="alert" className="text-sm font-medium text-red-600">{prep.error}</p>}
@@ -424,6 +441,12 @@ export function WorkerTasks({
   issueOrder?: IssueOrderCtx | null;
   deliverOrder?: DeliverOrderCtx | null;
 }) {
+  // P3C-FIX-1: компактную карточку текущей задачи показываем и в работе, и при ожидании передачи.
+  // `active` — можно оперировать (сканеры/панели/старт размещения); `live` — карточка отображается
+  // (IN_PROGRESS или HANDOFF_PENDING). При HANDOFF_PENDING рендерим ту же компактную карточку без
+  // сканеров и основных действий; вторичное «Передать задачу»/«Ожидает принятия» — через HandoffControl.
+  const active = current?.status === "IN_PROGRESS";
+  const live = current?.status === "IN_PROGRESS" || current?.status === "HANDOFF_PENDING";
   return (
     <div className="flex flex-col gap-4">
       {incoming.length > 0 && (
@@ -446,42 +469,47 @@ export function WorkerTasks({
           title/description/TaskMeta/типа/статуса/времени. Остальные типы — прежний вид. */}
       {/* TASK-006 (расширение): все физические задачи погрузчика — компактная карточка (команда/деталь/
           маршрут) + действия сканирования, без title/description/TaskMeta. */}
-      {current && placement && current.status === "IN_PROGRESS" ? (
+      {current && placement && live ? (
         <Card>
           <CardTitle>Текущая задача</CardTitle>
           <div className="rounded-xl border border-[#eee] p-3">
-            <PlacementBlock placement={placement} />
+            <PlacementBlock placement={placement} canOperate={active} />
+            <HandoffControl taskId={current.id} mates={mates} status={current.status} />
           </div>
         </Card>
-      ) : current && cooling && loaderCards[current.id] && current.status === "IN_PROGRESS" ? (
+      ) : current && cooling && loaderCards[current.id] && live ? (
         <Card>
           <CardTitle>Текущая задача</CardTitle>
           <LoaderTaskCard card={loaderCards[current.id]} task={current} serverNow={serverNow}>
-            <CoolingBlock cooling={cooling} />
+            {active && <CoolingBlock cooling={cooling} />}
+            <HandoffControl taskId={current.id} mates={mates} status={current.status} />
           </LoaderTaskCard>
         </Card>
-      ) : current && moveGroup && loaderCards[current.id] && current.status === "IN_PROGRESS" ? (
+      ) : current && moveGroup && loaderCards[current.id] && live ? (
         <Card>
           <CardTitle>Текущая задача</CardTitle>
           <LoaderTaskCard card={loaderCards[current.id]} task={current} serverNow={serverNow}>
-            <MoveGroupScanner ctx={moveGroup} />
+            {active && <MoveGroupScanner ctx={moveGroup} />}
+            <HandoffControl taskId={current.id} mates={mates} status={current.status} />
           </LoaderTaskCard>
         </Card>
-      ) : current && issueOrder && loaderCards[current.id] && current.status === "IN_PROGRESS" ? (
+      ) : current && issueOrder && loaderCards[current.id] && live ? (
         <Card>
           <CardTitle>Текущая задача</CardTitle>
           <LoaderTaskCard card={loaderCards[current.id]} task={current} serverNow={serverNow}>
-            <IssueOrderPanel ctx={issueOrder} />
+            {active && <IssueOrderPanel ctx={issueOrder} />}
+            <HandoffControl taskId={current.id} mates={mates} status={current.status} />
           </LoaderTaskCard>
         </Card>
-      ) : current && deliverOrder && loaderCards[current.id] && current.status === "IN_PROGRESS" ? (
+      ) : current && deliverOrder && loaderCards[current.id] && live ? (
         <Card>
           <CardTitle>Текущая задача</CardTitle>
           <LoaderTaskCard card={loaderCards[current.id]} task={current} serverNow={serverNow}>
-            <DeliverOrderPanel ctx={deliverOrder} />
+            {active && <DeliverOrderPanel ctx={deliverOrder} />}
+            <HandoffControl taskId={current.id} mates={mates} status={current.status} />
           </LoaderTaskCard>
         </Card>
-      ) : current && pickOrder && current.status === "IN_PROGRESS" ? (
+      ) : current && pickOrder && live ? (
         // PICK-001: компактная карточка сборщика — команда/номер/позиции·количество/прогресс/текущее
         // действие. Без title/description/типа/статуса/времени и повторяющихся инструкций.
         <Card>
@@ -496,13 +524,16 @@ export function WorkerTasks({
               </div>
               <span className="text-xs text-neutral-500">{pickOrder.linesDone}/{pickOrder.linesTotal}</span>
             </div>
-            <div className="mt-2 flex flex-col gap-2">
-              <PickOrderScanner ctx={pickOrder} taskId={current.id} />
-              <ShortageForm taskId={current.id} />
-            </div>
+            {active && (
+              <div className="mt-2 flex flex-col gap-2">
+                <PickOrderScanner ctx={pickOrder} taskId={current.id} />
+                <ShortageForm taskId={current.id} />
+              </div>
+            )}
+            <HandoffControl taskId={current.id} mates={mates} status={current.status} />
           </div>
         </Card>
-      ) : current && controlOrder && current.status === "IN_PROGRESS" ? (
+      ) : current && controlOrder && live ? (
         // CONTROL-001 (Задача M Этап2): компактная карточка контролёра — команда/номер/позиции·единицы/
         // прогресс/текущее действие. Без title/description/типа/статуса/времени и повторяющихся инструкций.
         <Card>
@@ -517,25 +548,29 @@ export function WorkerTasks({
               </div>
               <span className="text-xs text-neutral-500">{controlOrder.marked}/{controlOrder.positions}</span>
             </div>
-            <div className="mt-2">
-              <ControlOrderPanel ctx={controlOrder} />
-            </div>
+            {active && (
+              <div className="mt-2">
+                <ControlOrderPanel ctx={controlOrder} />
+              </div>
+            )}
+            <HandoffControl taskId={current.id} mates={mates} status={current.status} />
           </div>
         </Card>
-      ) : current && current.type === "CONTROL_ORDER" && current.status === "IN_PROGRESS" ? (
+      ) : current && current.type === "CONTROL_ORDER" && active ? (
         // CONTROL_ORDER без структурированного controlOrder (нет subjectId / заказ не найден / контекст
         // не загрузился) — fail-closed: без title/description/статуса/времени/ID и без операционных действий.
         <Card>
           <CardTitle>Текущая задача</CardTitle>
           <ControlErrorCard />
         </Card>
-      ) : current && LOADER_PHYSICAL_TYPES.has(current.type) && current.status === "IN_PROGRESS" ? (
+      ) : current && LOADER_PHYSICAL_TYPES.has(current.type) && active ? (
         // Известная физическая задача погрузчика с повреждённым контекстом — ошибка, без метаданных.
         <Card>
           <CardTitle>Текущая задача</CardTitle>
           <LoaderErrorCard task={current} />
         </Card>
       ) : current && (
+        // Прочие текущие задачи (в т.ч. CORRECT_ORDER) и запасной путь для HANDOFF_PENDING без контекста.
         <Card>
           <CardTitle>Текущая задача</CardTitle>
           <div className={"rounded-xl border p-3 " + (isUrgentActive(current) ? "border-red-200 bg-red-50" : "border-[#eee]")}>
@@ -545,17 +580,14 @@ export function WorkerTasks({
               <TaskMeta task={current} serverNow={serverNow} />
             </div>
             <div className="mt-2 flex flex-col gap-2">
-              {current.actionUrl && (
+              {active && current.actionUrl && (
                 <Link href={current.actionUrl}>
                   <Button className="w-full">Открыть</Button>
                 </Link>
               )}
-              {correctOrder && current.status === "IN_PROGRESS" && <CorrectOrderPanel ctx={correctOrder} />}
-              {current.status === "IN_PROGRESS" && <HandoffForm taskId={current.id} mates={mates} />}
-              {current.status === "HANDOFF_PENDING" && (
-                <p className="text-xs text-orange-600">Ожидает принятия передачи получателем.</p>
-              )}
+              {active && correctOrder && <CorrectOrderPanel ctx={correctOrder} />}
             </div>
+            <HandoffControl taskId={current.id} mates={mates} status={current.status} />
           </div>
         </Card>
       )}

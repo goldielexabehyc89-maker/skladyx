@@ -347,6 +347,10 @@ async function main() {
   await mkOrderTask({ ...izWh, externalId: ISSUE_WIP_EXT, qtys: [4, 6, 5], cellCodes: ["IZ-01", "IZ-02"], type: "ISSUE_ORDER", status: "IN_PROGRESS", cellStatus: "PLACED" });
   await mkOrderTask({ ...izWh, externalId: DELIVER_WAIT_EXT, qtys: [3, 7], cellCodes: ["IZ-09"], type: "DELIVER_ORDER", status: "ASSIGNED", cellStatus: "PLACED" });
   const izLoaderToken = await mkToken(izWh.loaderId, "LOADER");
+  // P3C-FIX-1: коллега-погрузчик той же роли/склада — чтобы у izLoader (ISSUE_ORDER «в работе»)
+  //   рендерилось компактное действие «Передать задачу» (проверка наличия у representative LOADER-задачи).
+  const izMate = await mkUser(companyId, "+79000009974", "CI Погрузчик-выдача-IZ-2", "LOADER", "CiIzMate-9974", izWh.whId);
+  await prisma.workShift.create({ data: { companyId, userId: izMate, warehouseId: izWh.whId, role: "LOADER" } });
   // Склад DV: DELIVER_ORDER «в работе» (1 ячейка) + ISSUE_ORDER «до начала» (1 ячейка).
   const dvWh = await mkIssueWh("CI-DELIVER", "+79000009922", "CI Погрузчик-выдача-DV");
   const DELIVER_WIP_EXT = "EO-DEL-801", ISSUE_WAIT_EXT = "EO-ISS-802";
@@ -437,6 +441,38 @@ async function main() {
   const pickCellAQr = await pickCellQr("PK-01"), pickCellBQr = await pickCellQr("PK-02"), pickWrongCellQr = await pickCellQr("PK-09");
   const pickOrderQrCode = (await prisma.qrCode.findFirstOrThrow({ where: { companyId, type: "ORDER", refId: impPick.orderId } })).code;
   const pickToken = await mkToken(pickE2E, "PICKER");
+
+  // ── P3C-FIX-1: изолированная фикстура ПЕРЕДАЧИ задачи. Отдельный склад hoWh, два PICKER: hoA (ранняя
+  //    смена — исполнитель) и hoB (коллега-получатель той же роли/склада). Один реальный PICK_ORDER
+  //    «в работе» с активным резервом. e2e свободно мутирует эту задачу (запрос → ожидание → принятие /
+  //    отклонение), не задевая основную фикстуру сборки (pickWh). Компактная карточка + компактное
+  //    действие «Передать задачу» должны рендериться; при HANDOFF_PENDING — та же карточка без сканера. ──
+  const hoWh = await prisma.warehouse.create({ data: { companyId, name: `CI-HANDOFF-${Date.now()}`, isActive: true, coolingRate: 2 } });
+  await ensureStandardZones(companyId, hoWh.id);
+  const hoStorage = await prisma.warehouseZone.findFirstOrThrow({ where: { companyId, warehouseId: hoWh.id, kind: "STORAGE" } });
+  await createCellsInZone({ companyId, warehouseId: hoWh.id, zoneId: hoStorage.id, codes: ["HO-01"], level: 1 });
+  const HO_EAN = ean13("460000009051"), HO_ITEM_NAME = "CI Передача-товар";
+  const hoItem = await prisma.item.create({ data: { companyId, name: HO_ITEM_NAME, uomId: uom.id, tracking: "LOT" } });
+  await prisma.itemBarcode.create({ data: { companyId, itemId: hoItem.id, code: HO_EAN, symbology: "EAN13", source: "MANUAL", isActive: true } });
+  const hoA = await mkUser(companyId, "+79000009972", "CI Передача A", "PICKER", "CiHoA-9972", hoWh.id);
+  const hoB = await mkUser(companyId, "+79000009973", "CI Передача B", "PICKER", "CiHoB-9973", hoWh.id);
+  await prisma.workShift.create({ data: { companyId, userId: hoA, warehouseId: hoWh.id, role: "PICKER", startedAt: new Date(Date.now() - 60_000) } }); // ранняя → задача hoA
+  await prisma.workShift.create({ data: { companyId, userId: hoB, warehouseId: hoWh.id, role: "PICKER", startedAt: new Date() } });
+  const hoCell = await prisma.cell.findFirstOrThrow({ where: { companyId, warehouseId: hoWh.id, code: "HO-01" } });
+  const hoReceipt = await prisma.receipt.create({ data: { companyId, number: 9965001, warehouseId: hoWh.id, status: "POSTED", postedAt: new Date(), createdById: hoA } });
+  const hoRLine = await prisma.receiptLine.create({ data: { companyId, receiptId: hoReceipt.id, itemId: hoItem.id, qty: 1 } });
+  const hoLot = await prisma.lot.create({ data: { companyId, itemId: hoItem.id, receiptLineId: hoRLine.id, qtyReceived: 1 } });
+  await prisma.$transaction((tx) => applyLotMovement(tx, { companyId, docType: "RECEIPT", docId: hoReceipt.id, itemId: hoItem.id, lotId: hoLot.id, qty: 1, from: null, to: { kind: "cell", warehouseId: hoWh.id, cellId: hoCell.id }, createdById: hoA }));
+  await prisma.handlingGroup.create({ data: { companyId, warehouseId: hoWh.id, itemId: hoItem.id, lotId: hoLot.id, qty: 1, temperature: 0, thresholdX: X, status: "IN_STORAGE", dedupeKey: "ci-ho-1", acceptedById: hoA } });
+  const HO_ORDER_EXT = "EO-CI-HANDOFF";
+  const impHo = await importExternalOrder({ companyId, warehouseId: hoWh.id, externalId: HO_ORDER_EXT, createdById: hoA, arrivalAt: null, lines: [{ externalLineId: "1", itemId: hoItem.id, requiredQty: 1 }] });
+  await reserveAndPlanOrder({ companyId, orderId: impHo.orderId });
+  let hoPt = await prisma.workflowTask.findFirst({ where: { type: "PICK_ORDER", subjectId: impHo.orderId } });
+  if (hoPt && hoPt.status === "QUEUED") { await rebalanceQueuedTasks(companyId, { warehouseId: hoWh.id }); hoPt = await prisma.workflowTask.findUniqueOrThrow({ where: { id: hoPt.id } }); }
+  if (!hoPt || hoPt.assignedUserId !== hoA) throw new Error(`CI handoff: PICK не назначен hoA (${hoPt?.status}/${hoPt?.assignedUserId})`);
+  if (hoPt.status === "ASSIGNED") { const r = await startWorkflowTask(hoA, companyId, hoPt.id); if (r.error) throw new Error(`CI handoff start: ${r.error}`); }
+  const hoAToken = await mkToken(hoA, "PICKER");
+  const hoBToken = await mkToken(hoB, "PICKER");
 
   // ── Задача M (Этап 2): фикстура контролёра — компактный CONTROL_ORDER. Отдельный контролёр
   //    controlE2E (свой склад ctl2Wh) без остатков: A «в работе» (IN_PROGRESS, ещё НЕ отсканирован →
@@ -861,6 +897,17 @@ async function main() {
     startLoadToken,                  // погрузчик без смены (старт → /warehouse/tasks)
     startPickToken,                  // сборщик без смены (старт → /warehouse/tasks)
     startCtrlToken,                  // контролёр без смены (старт → /warehouse/tasks)
+    // P3C-FIX-1: передача задачи (изолированный PICK_ORDER «в работе», два PICKER одной роли/склада)
+    hoAToken,                        // исполнитель (ранняя смена) — отправитель передачи
+    hoBToken,                        // коллега той же роли/склада — получатель
+    hoAName: "CI Передача A",        // имя исходного исполнителя
+    hoBName: "CI Передача B",        // имя получателя (в выпадающем списке «Кому передать»)
+    hoWhId: hoWh.id,                 // склад фикстуры передачи (фильтр монитора)
+    hoOrderExt: HO_ORDER_EXT,        // № заказа (компактная карточка «Собрать заказ»)
+    hoOrderId: impHo.orderId,        // id заказа (DB-инварианты: резерв/движения)
+    hoTaskId: hoPt.id,               // id PICK_ORDER (DB: статус/assignee/startedAt)
+    hoItemName: HO_ITEM_NAME,        // товар (для проверки компактной карточки)
+    // (izLoaderToken уже отдаётся выше — representative LOADER: ISSUE_ORDER «в работе», теперь с коллегой izMate)
   }));
   process.exit(0);
 }

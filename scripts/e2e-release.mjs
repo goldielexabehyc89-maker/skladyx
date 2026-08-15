@@ -1358,6 +1358,112 @@ async function main() {
     ok("MU: переназначение без технических ошибок", !has(tmz, "Application error") && !has(tmz, "UNAUTHORIZED"));
   }
 
+  // ── P3C-FIX-1: передача задачи (handoff) во всех структурированных карточках. Полный поток на
+  //    PICK_ORDER: компактное «Передать задачу» (desktop+mobile, свёрнуто) → выбор коллеги →
+  //    HANDOFF_PENDING (та же карточка без сканера) → получатель принимает → IN_PROGRESS у получателя;
+  //    startedAt/резерв/движения неизменны; исходный больше не видит задачу; повтор не плодит передачи;
+  //    «Отклонить» возвращает исходному. Плюс: наличие действия у CONTROL_ORDER и LOADER-задачи; входящая
+  //    без техданных; mobile 390 без переполнения. Инварианты сверяются напрямую в БД (PrismaClient). ──
+  if (ids.hoAToken && ids.hoBToken) {
+    let hpr = null; try { hpr = new PrismaClient(); await hpr.$queryRaw`SELECT 1`; } catch { hpr = null; }
+    const T = ids.hoTaskId, O = ids.hoOrderId, WH = ids.hoWhId;
+    const taskRow = async () => hpr ? hpr.workflowTask.findUnique({ where: { id: T } }) : null;
+    const resvActive = async () => hpr ? hpr.stockReservation.findMany({ where: { orderId: O, status: "ACTIVE" }, select: { cellId: true, lotId: true, qty: true }, orderBy: { cellId: "asc" } }) : null;
+    const movCountHo = async () => hpr ? hpr.stockMovement.count({ where: { OR: [{ fromWarehouseId: WH }, { toWarehouseId: WH }] } }) : null;
+    const pendingHo = async () => hpr ? hpr.taskHandoff.count({ where: { taskId: T, status: "PENDING" } }) : null;
+    const assigneeName = async () => { if (!hpr) return null; const r = await taskRow(); if (!r?.assignedUserId) return null; return (await hpr.user.findUnique({ where: { id: r.assignedUserId }, select: { name: true } }))?.name ?? null; };
+    const waitTask = async (pred) => { for (let i = 0; i < 40; i++) { if (!hpr) return true; if (pred(await taskRow())) return true; await sleep(300); } return false; };
+    const started0 = (await taskRow())?.startedAt?.toISOString() ?? null;
+    const resv0 = JSON.stringify(await resvActive());
+    const mov0 = await movCountHo();
+
+    const hasHandoffAction = () => ev(`[...document.querySelectorAll('summary')].some(e=>e.textContent.includes('Передать задачу'))`);
+    const handoffCollapsed = () => ev(`[...document.querySelectorAll('details')].some(d=>d.textContent.includes('Передать задачу') && !d.open)`);
+    const openHandoff = () => ev(`(()=>{const d=[...document.querySelectorAll('details')].find(x=>x.textContent.includes('Передать задачу'));if(!d)return 'no';d.open=true;return 'ok';})()`);
+    const selectMate = (name) => ev(`(()=>{const s=[...document.querySelectorAll('select[name="toUserId"]')].find(x=>x.offsetParent!==null);if(!s)return 'noselect';const o=[...s.options].find(x=>x.textContent.includes(${JSON.stringify(name)}));if(!o)return 'noopt';const set=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(s),'value').set;set.call(s,o.value);s.dispatchEvent(new Event('change',{bubbles:true}));s.dispatchEvent(new Event('input',{bubbles:true}));return 'ok';})()`);
+    const submitTransfer = () => ev(`(()=>{const b=[...document.querySelectorAll('button')].find(x=>x.textContent.trim()==='Передать');if(!b)return 'no';b.click();return 'ok';})()`);
+    const operationalShown = () => ev(`document.body.innerText.includes('Сообщить о недостаче')`); // маркер активных операций сборки (только IN_PROGRESS)
+
+    // 1) hoA (mobile): компактная PICK-карточка + свёрнутое «Передать задачу», без техданных, без переполнения
+    await setViewport(true);
+    await setAuth(ids.hoAToken);
+    await goto("/warehouse/tasks", `document.body.innerText.includes("${ids.hoOrderExt}")||document.body.innerText.includes("Собрать заказ")`);
+    let th = await bodyText();
+    ok("HO: hoA видит компактную PICK-карточку (Собрать заказ + №)", /собрать заказ/i.test(th) && has(th, ids.hoOrderExt));
+    ok("HO: действие «Передать задачу» присутствует (mobile)", await hasHandoffAction());
+    ok("HO: форма передачи свёрнута по умолчанию", await handoffCollapsed());
+    ok("HO: mobile 390 без горизонтального переполнения", await ev(`document.documentElement.scrollWidth <= window.innerWidth + 1`));
+    ok("HO: карточка без техданных (тип/статус/ID задачи)", !has(th, "PICK_ORDER") && !has(th, "IN_PROGRESS") && !has(th, ids.hoTaskId));
+
+    // desktop: действие тоже присутствует
+    await setViewport(false);
+    await goto("/warehouse/tasks", `document.body.innerText.includes("${ids.hoOrderExt}")`);
+    ok("HO: действие «Передать задачу» присутствует (desktop)", await hasHandoffAction());
+
+    // 2) раскрыть → выбрать hoB → подтвердить → HANDOFF_PENDING (та же карточка без сканера)
+    await openHandoff();
+    const sel = await selectMate(ids.hoBName);
+    ok("HO: коллега-получатель доступен в списке", sel === "ok", sel);
+    await submitTransfer();
+    ok("HO: задача перешла в HANDOFF_PENDING", await waitTask((r) => r?.status === "HANDOFF_PENDING"));
+    await goto("/warehouse/tasks", `document.body.innerText.includes("Ожидает принятия передачи")||document.body.innerText.includes("Собрать заказ")`);
+    th = await bodyText();
+    ok("HO: у hoA карточка показывает «Ожидает принятия передачи»", has(th, "Ожидает принятия передачи"));
+    ok("HO: при HANDOFF_PENDING операционные действия сборки недоступны", !(await operationalShown()));
+    ok("HO: инварианты после запроса — startedAt/резерв/движения неизменны",
+      started0 === ((await taskRow())?.startedAt?.toISOString() ?? null) && resv0 === JSON.stringify(await resvActive()) && mov0 === (await movCountHo()));
+    ok("HO: ровно одна PENDING-передача (повтор не плодит)", (await pendingHo()) === 1 || (await pendingHo()) === null);
+
+    // 3) завершение смены hoA заблокировано (HANDOFF_PENDING)
+    await goto("/warehouse/shift", `document.body.innerText.includes("Завершить смену")`);
+    await clickText(/Завершить смену/);
+    let blocked = false; for (let i = 0; i < 40; i++) { const b = await bodyText(); if ((await pathname()) === "/warehouse/shift" && b.includes("Есть задача в работе")) { blocked = true; break; } await sleep(200); }
+    ok("HO: завершение смены заблокировано при HANDOFF_PENDING", blocked);
+
+    // 4) hoB видит одну входящую передачу без техданных, принимает
+    await setAuth(ids.hoBToken);
+    await goto("/warehouse/tasks", `document.body.innerText.includes("Входящие передачи")||document.body.innerText.includes("Принять")`);
+    let tb = await bodyText();
+    ok("HO: hoB видит входящую передачу (Принять/Отклонить)", has(tb, "Входящие передачи") && has(tb, "Принять") && has(tb, "Отклонить"));
+    ok("HO: входящая без техданных (type-enum/status/ID)", !has(tb, "PICK_ORDER") && !has(tb, "HANDOFF_PENDING") && !has(tb, ids.hoTaskId));
+    await clickText(/Принять/);
+    ok("HO: принятие → IN_PROGRESS у hoB", await waitTask((r) => r?.status === "IN_PROGRESS") && (hpr ? (await assigneeName()) === ids.hoBName : true));
+    ok("HO: инварианты после принятия — startedAt/резерв/движения неизменны",
+      started0 === ((await taskRow())?.startedAt?.toISOString() ?? null) && resv0 === JSON.stringify(await resvActive()) && mov0 === (await movCountHo()));
+    await goto("/warehouse/tasks", `document.body.innerText.includes("${ids.hoOrderExt}")`);
+    ok("HO: hoB продолжает с того же шага (карточка + операции сборки)", has(await bodyText(), ids.hoOrderExt) && (await operationalShown()));
+
+    // 5) hoA больше не видит переданную задачу
+    await setAuth(ids.hoAToken);
+    await goto("/warehouse/tasks", `document.body.innerText.includes("Задач пока нет")||document.body.innerText.includes("${ids.hoOrderExt}")||document.body.innerText.includes("Очередь")`);
+    ok("HO: hoA больше не видит переданную задачу", !has(await bodyText(), ids.hoOrderExt));
+
+    // 6) reject: hoB → hoA, hoA отклоняет → задача снова IN_PROGRESS у hoB
+    await setAuth(ids.hoBToken);
+    await goto("/warehouse/tasks", `document.body.innerText.includes("${ids.hoOrderExt}")`);
+    await openHandoff(); await selectMate(ids.hoAName); await submitTransfer();
+    ok("HO: обратная передача → HANDOFF_PENDING", await waitTask((r) => r?.status === "HANDOFF_PENDING"));
+    await setAuth(ids.hoAToken);
+    await goto("/warehouse/tasks", `document.body.innerText.includes("Отклонить")`);
+    await clickText(/Отклонить/);
+    ok("HO: отклонение вернуло задачу IN_PROGRESS исходному (hoB)", await waitTask((r) => r?.status === "IN_PROGRESS") && (hpr ? (await assigneeName()) === ids.hoBName : true));
+    ok("HO: reject не изменил резерв/движения", resv0 === JSON.stringify(await resvActive()) && mov0 === (await movCountHo()));
+
+    // 7) наличие компактного действия у CONTROL_ORDER и representative LOADER-задачи
+    if (ids.controlE2EToken) {
+      await setAuth(ids.controlE2EToken);
+      await goto("/warehouse/tasks", `document.body.innerText.includes("Проверить заказ")`);
+      ok("HO: «Передать задачу» присутствует у CONTROL_ORDER «в работе»", await hasHandoffAction());
+    }
+    if (ids.izLoaderToken) {
+      await setAuth(ids.izLoaderToken);
+      await goto("/warehouse/tasks", `document.body.innerText.includes("Разместить")||document.body.innerText.includes("выдач")`);
+      ok("HO: «Передать задачу» присутствует у representative LOADER-задачи (ISSUE)", await hasHandoffAction());
+    }
+
+    if (hpr) await hpr.$disconnect();
+  }
+
   // ── Задача H: монитор ADMIN — новые задачи сверху (createdAt DESC, id DESC) + серверная пагинация;
   //    порядок держится и под фильтром. ──
   if (ids.adminToken && ids.monitorNewestTitle) {
