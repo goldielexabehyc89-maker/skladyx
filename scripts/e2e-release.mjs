@@ -10,6 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import http from "node:http";
 import { PrismaClient } from "@prisma/client";
+import { readBarcodesFromImageFile } from "zxing-wasm/reader";
 
 const HOST = process.env.VERIFY_HOST || "rostagro.skladyx.ru";
 const PORT = Number(process.env.APP_PORT || 3000);
@@ -1462,6 +1463,80 @@ async function main() {
     }
 
     if (hpr) await hpr.$disconnect();
+  }
+
+  // ── Задача Q (ITEM-EAN-001): сканируемые EAN-штрихкоды в карточке товара. ADMIN видит каждый активный
+  //    EAN активного товара как настоящий линейный штрихкод (SVG), крупный/печатный вид и скачивание PNG;
+  //    PNG реально декодируется обратно в исходный EAN (ZXing); неактивный/чужой EAN и не-ADMIN → нет
+  //    доступа (404/403); повторный GET не создаёт записей; mobile 390 без переполнения. ──
+  if (ids.eanItemId && ids.eanActive13 && ids.eanActive8 && ids.adminToken) {
+    let qpr = null; try { qpr = new PrismaClient(); await qpr.$queryRaw`SELECT 1`; } catch { qpr = null; }
+    // GET файла через node:http (Host-заголовок → tenant-резолв), с cookie-сессией; возвращает {status,headers,body}
+    const httpGet = (path, token) => new Promise((resolve) => {
+      const req = http.request({ host: "127.0.0.1", port: PORT, path, method: "GET", headers: { Host: HOST, ...(token ? { Cookie: `skx_session=${token}` } : {}) } }, (res) => {
+        const chunks = []; res.on("data", (c) => chunks.push(c)); res.on("end", () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }));
+      });
+      req.on("error", () => resolve({ status: 0, headers: {}, body: Buffer.alloc(0) })); req.end();
+    });
+    const decode = async (buf) => { const r = await readBarcodesFromImageFile(new Blob([new Uint8Array(buf)]), { formats: ["EAN-13", "EAN-8"], tryHarder: true }); return r[0]?.text ?? ""; };
+    const card = `/warehouse/items/${ids.eanItemId}`;
+
+    // 1) карточка ADMIN: оба активных EAN со штрихкодом (SVG) + число + тип; неактивный EAN без штрихкода
+    await setViewport(false);
+    await setAuth(ids.adminToken);
+    await goto(card, `document.body.innerText.includes("Штрихкоды EAN")`);
+    let t = await bodyText();
+    ok("EAN: карточка показывает активные EAN-13 и EAN-8 (числа)", has(t, ids.eanActive13) && has(t, ids.eanActive8));
+    ok("EAN: показаны типы EAN-13 и EAN-8", has(t, "EAN-13") && has(t, "EAN-8"));
+    ok("EAN: ровно 2 сканируемых штрихкода (по активным EAN)", (await ev(`document.querySelectorAll('[aria-label^="Штрихкод"]').length`)) === 2);
+    ok("EAN: каждый штрихкод — непустой SVG", (await ev(`[...document.querySelectorAll('[aria-label^="Штрихкод"]')].every(d=>!!d.querySelector('svg'))`)) === true);
+    ok("EAN: неактивный EAN — текст + «откл»", has(t, ids.eanInactive) && has(t, "откл"));
+    ok("EAN: у неактивного EAN штрихкода нет", (await ev(`[...document.querySelectorAll('[aria-label^="Штрихкод"]')].some(d=>d.getAttribute('aria-label').includes(${JSON.stringify(ids.eanInactive)}))`)) === false);
+
+    // mobile 390 без переполнения
+    await setViewport(true);
+    await goto(card, `document.body.innerText.includes("Штрихкоды EAN")`);
+    ok("EAN: карточка mobile 390 без горизонтального переполнения", await ev(`document.documentElement.scrollWidth <= window.innerWidth + 1`));
+    await setViewport(false);
+
+    // 2) «Открыть крупно» / печатный вид: только название, EAN, тип, штрихкод; без внутренних ID
+    await goto(`/warehouse/items/${ids.eanItemId}/barcode/${ids.eanActive13}`, `document.body.innerText.includes("${ids.eanActive13}")`);
+    t = await bodyText();
+    ok("EAN: крупный вид — название товара, EAN и тип", has(t, ids.eanItemName) && has(t, ids.eanActive13) && has(t, "EAN-13"));
+    ok("EAN: крупный вид — есть SVG-штрихкод", (await ev(`document.querySelectorAll('svg').length>0`)) === true);
+    ok("EAN: крупный вид — без внутреннего ID товара", !has(t, ids.eanItemId));
+
+    // 3) endpoint изображения: 200 image/png, filename*, round-trip декод === исходный EAN
+    const img13 = await httpGet(`/warehouse/items/${ids.eanItemId}/barcode/${ids.eanActive13}/image`, ids.adminToken);
+    ok("EAN: image route 200 image/png, непустой", img13.status === 200 && String(img13.headers["content-type"] || "").includes("image/png") && img13.body.length > 0, `${img13.status} len=${img13.body.length}`);
+    ok("EAN: Content-Disposition filename*=UTF-8'' задан", String(img13.headers["content-disposition"] || "").includes("filename*=UTF-8''"));
+    ok("EAN: PNG EAN-13 декодируется обратно в исходный код (ZXing)", (await decode(img13.body)) === ids.eanActive13);
+    const img8 = await httpGet(`/warehouse/items/${ids.eanItemId}/barcode/${ids.eanActive8}/image`, ids.adminToken);
+    ok("EAN: PNG EAN-8 декодируется обратно в исходный код (ZXing)", img8.status === 200 && (await decode(img8.body)) === ids.eanActive8, `${img8.status}`);
+
+    // 4) неактивный EAN → 404
+    ok("EAN: неактивный EAN → image 404", (await httpGet(`/warehouse/items/${ids.eanItemId}/barcode/${ids.eanInactive}/image`, ids.adminToken)).status === 404);
+
+    // 5) чужая организация (подмена URL) → 404
+    if (ids.eanForeignItemId && ids.eanForeignCode) {
+      ok("EAN: чужой (cross-tenant) EAN → image 404", (await httpGet(`/warehouse/items/${ids.eanForeignItemId}/barcode/${ids.eanForeignCode}/image`, ids.adminToken)).status === 404);
+    }
+
+    // 6) не-ADMIN не получает доступ
+    if (ids.loaderToken) {
+      ok("EAN: не-ADMIN не получает штрихкод (не 200)", (await httpGet(`/warehouse/items/${ids.eanItemId}/barcode/${ids.eanActive13}/image`, ids.loaderToken)).status !== 200);
+    }
+
+    // 7) повторный GET не создаёт записей
+    if (qpr) {
+      const counts = async () => `bc=${await qpr.itemBarcode.count()} qr=${await qpr.qrCode.count()} ev=${await qpr.event.count()} sm=${await qpr.stockMovement.count()}`;
+      const before = await counts();
+      await httpGet(`/warehouse/items/${ids.eanItemId}/barcode/${ids.eanActive13}/image`, ids.adminToken);
+      await httpGet(`/warehouse/items/${ids.eanItemId}/barcode/${ids.eanActive8}/image`, ids.adminToken);
+      const after = await counts();
+      ok("EAN: повторный GET не создаёт записей (ItemBarcode/QrCode/Event/StockMovement)", before === after, `${before} -> ${after}`);
+      await qpr.$disconnect();
+    }
   }
 
   // ── Задача H: монитор ADMIN — новые задачи сверху (createdAt DESC, id DESC) + серверная пагинация;

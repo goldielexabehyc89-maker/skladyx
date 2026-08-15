@@ -474,6 +474,24 @@ async function main() {
   const hoAToken = await mkToken(hoA, "PICKER");
   const hoBToken = await mkToken(hoB, "PICKER");
 
+  // ── Задача Q (ITEM-EAN-001): фикстура сканируемых EAN-штрихкодов. Товар с активными EAN-13 и EAN-8,
+  //    один НЕАКТИВНЫЙ EAN (этикетка не показывается), и ЧУЖАЯ организация с активным EAN — для проверки
+  //    tenant-изоляции endpoint (подмена URL → 404). ean13() универсален: тело 12 цифр → EAN-13, 7 → EAN-8.
+  const EAN_ITEM_NAME = "CI EAN-товар";
+  const eanItem = await prisma.item.create({ data: { companyId, name: EAN_ITEM_NAME, uomId: uom.id, tracking: "LOT", isActive: true } });
+  const EAN_Q13 = ean13("460000009511"); // активный EAN-13
+  const EAN_Q8 = ean13("4600096");        // активный EAN-8 (7-значное тело → 8 знаков)
+  const EAN_QOFF = ean13("460000009522"); // неактивный EAN-13
+  await prisma.itemBarcode.create({ data: { companyId, itemId: eanItem.id, code: EAN_Q13, symbology: "EAN13", source: "MANUAL", isActive: true } });
+  await prisma.itemBarcode.create({ data: { companyId, itemId: eanItem.id, code: EAN_Q8, symbology: "EAN8", source: "MANUAL", isActive: true } });
+  await prisma.itemBarcode.create({ data: { companyId, itemId: eanItem.id, code: EAN_QOFF, symbology: "EAN13", source: "MANUAL", isActive: false } });
+  // чужая организация: товар + активный EAN, доступа к которым у rostagro-ADMIN быть не должно
+  const eanDemo = await prisma.company.upsert({ where: { slug: "q-ean-demo" }, update: {}, create: { name: "Q EAN Demo", slug: "q-ean-demo", settings: {} } });
+  const eanDemoUom = (await prisma.uom.findFirst({ where: { companyId: eanDemo.id, name: "шт" } })) ?? (await prisma.uom.create({ data: { companyId: eanDemo.id, name: "шт" } }));
+  const eanForeignItem = await prisma.item.create({ data: { companyId: eanDemo.id, name: "Чужой EAN-товар", uomId: eanDemoUom.id, tracking: "LOT", isActive: true } });
+  const EAN_FOREIGN = ean13("460000009599");
+  await prisma.itemBarcode.create({ data: { companyId: eanDemo.id, itemId: eanForeignItem.id, code: EAN_FOREIGN, symbology: "EAN13", source: "MANUAL", isActive: true } });
+
   // ── Задача M (Этап 2): фикстура контролёра — компактный CONTROL_ORDER. Отдельный контролёр
   //    controlE2E (свой склад ctl2Wh) без остатков: A «в работе» (IN_PROGRESS, ещё НЕ отсканирован →
   //    первый шаг = скан QR заказа), B «до начала» (ASSIGNED, очередь). Заказы засеяны прямо в IN_CONTROL
@@ -907,6 +925,14 @@ async function main() {
     hoOrderId: impHo.orderId,        // id заказа (DB-инварианты: резерв/движения)
     hoTaskId: hoPt.id,               // id PICK_ORDER (DB: статус/assignee/startedAt)
     hoItemName: HO_ITEM_NAME,        // товар (для проверки компактной карточки)
+    // Задача Q (ITEM-EAN-001): сканируемые EAN-штрихкоды в карточке товара
+    eanItemId: eanItem.id,           // товар с активными EAN-13 + EAN-8 и одним неактивным EAN
+    eanItemName: EAN_ITEM_NAME,      // название (крупный/печатный вид)
+    eanActive13: EAN_Q13,            // активный EAN-13
+    eanActive8: EAN_Q8,              // активный EAN-8
+    eanInactive: EAN_QOFF,           // неактивный EAN (этикетки/действий нет; endpoint → 404)
+    eanForeignItemId: eanForeignItem.id, // товар чужой организации (tenant-изоляция endpoint → 404)
+    eanForeignCode: EAN_FOREIGN,     // активный EAN чужой организации
     // (izLoaderToken уже отдаётся выше — representative LOADER: ISSUE_ORDER «в работе», теперь с коллегой izMate)
   }));
   process.exit(0);

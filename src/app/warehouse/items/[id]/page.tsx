@@ -7,6 +7,8 @@ import { ActionForm } from "@/components/action-form";
 import { Card, CardTitle, Field, Badge } from "@/components/ui";
 import { PageShell } from "@/components/page-shell";
 import { ItemBarcodes } from "../item-barcodes";
+import { parseEan } from "@/lib/ean";
+import { eanBarcodeSvg, eanFileName } from "@/lib/ean-barcode";
 
 // Пакет 9B: карточка EAN-центрична — название, EAN, источник, внешний идентификатор, статус.
 // Товар source=API полностью read-only (правка/удаление/перепривязка EAN недоступны — блокируется
@@ -24,6 +26,22 @@ export default async function ItemPage({ params }: { params: Promise<{ id: strin
   const apiItem = item.source === "API";
   const activeEans = barcodes.filter((b) => b.isActive).map((b) => b.code);
   const eanText = activeEans.length ? activeEans.join(", ") : "нет EAN";
+
+  // ITEM-EAN-001: сканируемые SVG-штрихкоды генерируем на сервере (read-only, без записей) ТОЛЬКО для
+  // активного EAN активного товара. Архивный товар / неактивный EAN этикетки не получают.
+  const svgByCode: Record<string, string> = {};
+  const fileNameByCode: Record<string, string> = {};
+  if (item.isActive) {
+    for (const b of barcodes) {
+      if (!b.isActive || !parseEan(b.code)) continue;
+      try {
+        svgByCode[b.code] = eanBarcodeSvg(b.code);
+        fileNameByCode[b.code] = eanFileName(item.name, b.code);
+      } catch {
+        /* повреждённый EAN не рендерим как этикетку */
+      }
+    }
+  }
 
   return (
     <div className="mx-auto w-full max-w-2xl">
@@ -70,6 +88,8 @@ export default async function ItemPage({ params }: { params: Promise<{ id: strin
             itemId={item.id}
             readOnly={apiItem}
             barcodes={barcodes.map((b) => ({ id: b.id, code: b.code, symbology: b.symbology, isActive: b.isActive, source: b.source }))}
+            svgByCode={svgByCode}
+            fileNameByCode={fileNameByCode}
           />
         </Card>
 

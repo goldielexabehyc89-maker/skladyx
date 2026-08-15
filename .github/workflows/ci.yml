@@ -73,6 +73,7 @@ jobs:
           set -e
           V="npx tsx --tsconfig scripts/tsconfig.verify.json"
           $V scripts/verify-p9a.ts
+          $V scripts/verify-ean-barcode.ts
           $V scripts/verify-zones.ts
           $V scripts/verify-legacy-guard.ts
           $V scripts/verify-stock-grouped.ts
