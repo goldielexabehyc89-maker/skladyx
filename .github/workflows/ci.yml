@@ -87,6 +87,7 @@ jobs:
           WORKFLOW_TASKS_ENABLED=true EXTERNAL_ORDER_PICKING_ENABLED=true $V scripts/verify-blocked-replanning.ts
           WORKFLOW_TASKS_ENABLED=true $V scripts/verify-scheduler.ts
           $V scripts/verify-launch-readiness.ts
+          WORKFLOW_TASKS_ENABLED=true $V scripts/verify-tenant-isolation.ts
 
       - name: Build
         run: npm run build
@@ -113,6 +114,15 @@ jobs:
           SRV=$!
           for i in $(seq 1 40); do code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/login || echo 000); [ "$code" = "200" ] && break; sleep 2; done
           EXPECT_DUAL_READ=1 VERIFY_BASE=http://localhost:3000 $V scripts/verify-work-shifts.ts || { echo '--- srvHV2 ---'; tail -60 /tmp/srvHV2.log; kill $SRV 2>/dev/null; false; }
+          kill $SRV 2>/dev/null || true; sleep 2
+          # Фаза 3 (R1/TENANT-001, BLOCKING): host/cookie/домен изоляция двух организаций — вход только через
+          # свой домен, чужая cookie/Host → отказ, одинаковый телефон в разных орг. Сервер TENANT_AUTH=true,
+          # минимальные флаги, БАЗОВЫЙ seed (до ci-seed) — как в legacy Phase B, но теперь блокирующе.
+          TENANT_AUTH=true WAREHOUSE_ZONES_ENABLED=false WORKFLOW_TASKS_ENABLED=true \
+            node_modules/.bin/next start -p 3000 >/tmp/srvHV3.log 2>&1 &
+          SRV=$!
+          for i in $(seq 1 40); do code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: rostagro.skladyx.ru' http://localhost:3000/login || echo 000); [ "$code" = "200" ] && break; sleep 2; done
+          VERIFY_BASE=http://localhost:3000 $V scripts/verify-tenant-s3.ts || { echo '--- srvHV3 ---'; tail -60 /tmp/srvHV3.log; kill $SRV 2>/dev/null; false; }
           kill $SRV 2>/dev/null || true
 
       - name: Ensure Chrome for e2e

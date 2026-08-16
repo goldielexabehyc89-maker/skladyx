@@ -54,7 +54,7 @@ export async function GET(req: Request) {
   const bcByCode = new Map<string, PDFImage>();
   for (const l of labels) {
     if (showQr && !qrByCode.has(l.code)) {
-      const png = await QRCode.toBuffer(qrUrl(l.code), { type: "png", margin: 0, errorCorrectionLevel: "M", scale: 8 });
+      const png = await QRCode.toBuffer(await qrUrl(l.code), { type: "png", margin: 0, errorCorrectionLevel: "M", scale: 8 });
       qrByCode.set(l.code, await doc.embedPng(png));
     }
     if (showBc && !bcByCode.has(l.code)) {

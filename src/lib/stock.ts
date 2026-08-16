@@ -55,6 +55,37 @@ function balanceFields(loc: Exclude<Loc, null>) {
   };
 }
 
+// R1/TENANT-001: жёсткая проверка принадлежности всех ссылок организации ДО любых записей. Отклоняет
+// cross-tenant lotId/itemId/unitId/userId и локации (ячейка/склад/зона/сотрудник) без движений и без
+// изменения остатков. Корректные операции (companyId совпадает) не затрагиваются.
+async function assertOwned(
+  tx: Prisma.TransactionClient,
+  companyId: string,
+  refs: { lotId?: string; itemId?: string; unitId?: string; userId?: string; locs?: Loc[] },
+): Promise<void> {
+  const need = async (n: number, what: string) => {
+    if (n !== 1) throw new StockError(`Ссылка другой организации: ${what}`);
+  };
+  if (refs.lotId) await need(await tx.lot.count({ where: { id: refs.lotId, companyId } }), "партия");
+  if (refs.itemId) await need(await tx.item.count({ where: { id: refs.itemId, companyId } }), "товар");
+  if (refs.unitId) await need(await tx.itemUnit.count({ where: { id: refs.unitId, companyId } }), "единица");
+  if (refs.userId) await need(await tx.user.count({ where: { id: refs.userId, companyId } }), "пользователь");
+  for (const loc of refs.locs ?? []) {
+    if (!loc) continue;
+    if (loc.kind === "cell") {
+      await need(await tx.cell.count({ where: { id: loc.cellId, companyId } }), "ячейка");
+      await need(await tx.warehouse.count({ where: { id: loc.warehouseId, companyId } }), "склад");
+    } else if (loc.kind === "zone") {
+      await need(await tx.warehouseZone.count({ where: { id: loc.zoneId, companyId } }), "зона");
+      await need(await tx.warehouse.count({ where: { id: loc.warehouseId, companyId } }), "склад");
+    } else if (loc.kind === "warehouse") {
+      await need(await tx.warehouse.count({ where: { id: loc.warehouseId, companyId } }), "склад");
+    } else if (loc.kind === "employee" || loc.kind === "employeePending") {
+      await need(await tx.user.count({ where: { id: loc.employeeId, companyId } }), "сотрудник");
+    }
+  }
+}
+
 // Движение партионного товара. from=null — приход извне, to=null — расход вовне.
 export async function applyLotMovement(
   tx: Prisma.TransactionClient,
@@ -72,6 +103,7 @@ export async function applyLotMovement(
 ): Promise<void> {
   const qty = new Prisma.Decimal(args.qty);
   if (qty.lte(0)) throw new StockError("Количество должно быть больше нуля");
+  await assertOwned(tx, args.companyId, { lotId: args.lotId, itemId: args.itemId, userId: args.createdById, locs: [args.from, args.to] });
 
   await tx.stockMovement.create({
     data: {
@@ -131,6 +163,7 @@ export async function moveUnit(
   },
 ): Promise<void> {
   const { unit } = args;
+  await assertOwned(tx, args.companyId, { unitId: unit.id, itemId: unit.itemId, userId: args.createdById, locs: [args.to] });
   const from: Loc = unit.employeeId
     ? unit.status === "ISSUE_PENDING"
       ? { kind: "employeePending", employeeId: unit.employeeId }

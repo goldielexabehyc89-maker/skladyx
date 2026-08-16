@@ -54,6 +54,16 @@ export function resolveOrgSlug(host: string | null | undefined, opts: HostResolv
   return { slug: sub };
 }
 
+// R1/TENANT-001: базовый URL организации по её request-host (не глобальный APP_URL) — чтобы QR/ссылки
+// вели на домен конкретной организации. localhost/IPv4/IPv6-литерал → http, иначе https. Чистая функция.
+export function baseUrlFromHost(host: string | null | undefined): string | null {
+  const raw = (host ?? "").trim();
+  if (!raw) return null;
+  const hostname = raw.split(":")[0].toLowerCase();
+  const isLocal = hostname === "localhost" || hostname.endsWith(".localhost") || /^127\./.test(hostname) || hostname === "::1" || hostname === "[::1]" || /^\d{1,3}(\.\d{1,3}){3}$/.test(hostname);
+  return `${isLocal ? "http" : "https"}://${raw}`;
+}
+
 /** Резолвит slug из host по переменным окружения контура. */
 export function orgSlugFromHost(host: string | null | undefined): HostResolveResult {
   return resolveOrgSlug(host, {

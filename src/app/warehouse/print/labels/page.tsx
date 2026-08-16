@@ -45,8 +45,8 @@ export default async function PrintLabelsPage({
   // QR и Code128 кодируют один и тот же payload: QR — URL /q/<code>, Code128 — сам <code>.
   const svgs = showQr
     ? await Promise.all(
-        labels.map((l) =>
-          QRCode.toString(qrUrl(l.code), { type: "svg", margin: 0, errorCorrectionLevel: "M" }),
+        labels.map(async (l) =>
+          QRCode.toString(await qrUrl(l.code), { type: "svg", margin: 0, errorCorrectionLevel: "M" }),
         ),
       )
     : labels.map(() => "");

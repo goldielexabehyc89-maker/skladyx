@@ -1,7 +1,7 @@
 import "server-only";
 import crypto from "node:crypto";
-import { headers } from "next/headers";
 import { prisma } from "@/lib/db";
+import { requestBaseUrl } from "@/lib/request-url";
 
 // Одноразовые ссылки установки/сброса пароля. Выдаёт администратор, почта не нужна.
 
@@ -27,16 +27,9 @@ export async function createPasswordToken(userId: string): Promise<string> {
 
 // S3 tenant-safe: ссылка строится от host организации администратора (текущий запрос),
 // а не от глобального APP_URL — иначе ссылка для второго tenant вела бы на РостАгро.
+// R1: единый источник базового URL организации — requestBaseUrl() (тот же, что у QR).
 export async function passwordLink(token: string): Promise<string> {
-  const host = (await headers()).get("host");
-  let base: string;
-  if (host) {
-    const isLocal = /^(localhost|127\.|\[?::1)/.test(host);
-    base = `${isLocal ? "http" : "https"}://${host}`;
-  } else {
-    base = process.env.APP_URL || "http://localhost:3000";
-  }
-  return `${base}/auth/set/${token}`;
+  return `${await requestBaseUrl()}/auth/set/${token}`;
 }
 
 export async function validateToken(token: string) {

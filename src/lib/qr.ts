@@ -1,15 +1,18 @@
 import "server-only";
 import { customAlphabet } from "nanoid";
 import { prisma } from "@/lib/db";
+import { requestBaseUrl } from "@/lib/request-url";
 import type { Prisma, QrType } from "@prisma/client";
 
-// QR-коды: в этикетку кодируется URL {APP_URL}/q/<code>. Код — 10 символов
+// QR-коды: в этикетку кодируется URL <домен организации>/q/<code>. Код — 10 символов
 // алфавита Крокфорда (без 0/O, 1/I/L и т.п. неоднозначностей при ручном вводе).
 
 const generateCode = customAlphabet("23456789ABCDEFGHJKMNPQRSTVWXYZ", 10);
 
-export function qrUrl(code: string): string {
-  const base = process.env.APP_URL || "http://localhost:3000";
+// R1/TENANT-001: URL строится от домена ТЕКУЩЕЙ организации (request-host), не от глобального APP_URL —
+// чтобы QR второй организации не вёл на РостАгро. Для РостАгро host совпадает с APP_URL → URL не меняется.
+export async function qrUrl(code: string): Promise<string> {
+  const base = await requestBaseUrl();
   return `${base}/q/${code}`;
 }
 

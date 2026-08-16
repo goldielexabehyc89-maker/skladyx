@@ -50,7 +50,7 @@ export default async function ExternalOrderPage({ params }: { params: Promise<{ 
   if (isAdmin) {
     const qr = await prisma.qrCode.findFirst({ where: { companyId: s.companyId, type: "ORDER", refId: order.id }, select: { code: true } });
     if (qr) {
-      const url = qrUrl(qr.code);
+      const url = await qrUrl(qr.code);
       const [svg, png] = await Promise.all([
         QRCode.toString(url, { type: "svg", margin: 1, errorCorrectionLevel: "M" }),
         QRCode.toDataURL(url, { margin: 1, scale: 8, errorCorrectionLevel: "M" }),

@@ -76,6 +76,12 @@ TARGET_APP_URL="$(ssh_ "grep -E '^APP_URL=' '${TARGET_PATH}/.env' | head -1 | cu
   die "маркер контура не совпал: в ${TARGET_PATH}/.env APP_URL='${TARGET_APP_URL}', ожидается '${EXPECTED_APP_URL}'. Похоже, это ДРУГОЙ контур — деплой отменён."
 say "маркер контура OK (APP_URL=${TARGET_APP_URL})"
 
+# ─── GUARD 7b (R1/TENANT-001): tenant-авторизация обязательна на развёрнутом контуре ──
+TARGET_TENANT_AUTH="$(ssh_ "grep -E '^TENANT_AUTH=' '${TARGET_PATH}/.env' | head -1 | cut -d= -f2-")"
+[ "$TARGET_TENANT_AUTH" = "true" ] || \
+  die "TENANT_AUTH в ${TARGET_PATH}/.env = '${TARGET_TENANT_AUTH}', требуется 'true' (изоляция организаций обязательна). Деплой отменён."
+say "tenant-авторизация OK (TENANT_AUTH=true)"
+
 # ─── ВЫКАТКА ───────────────────────────────────────────────────────────────
 say "rsync → ${SERVER_USER}@${SERVER_IP}:${TARGET_PATH}/ (--delete, .env исключён)"
 rsync -az --delete -e "ssh ${SSH_OPTS[*]}" "${RSYNC_EXCLUDES[@]}" \

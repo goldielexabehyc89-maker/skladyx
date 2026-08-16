@@ -31,7 +31,7 @@ services:
       APP_URL: "${APP_URL:-https://rostagro.skladyx.ru}"
       DEFAULT_ORG_SLUG: "${DEFAULT_ORG_SLUG:-rostagro}"
       ROLES_DUAL_READ: "${ROLES_DUAL_READ:-false}"
-      TENANT_AUTH: "${TENANT_AUTH:-false}"
+      TENANT_AUTH: "${TENANT_AUTH:-true}"
       TENANT_BASE_DOMAIN: "${TENANT_BASE_DOMAIN:-skladyx.ru}"
       HOST_ORG_PREFIX: "${HOST_ORG_PREFIX:-}"
       WORKFLOW_TASKS_ENABLED: "${WORKFLOW_TASKS_ENABLED:-false}"
