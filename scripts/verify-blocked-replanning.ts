@@ -20,7 +20,7 @@ const ok = (n: string, c: boolean, e = "") => (c ? console.log(`  ✓ ${n}`) : (
 
 let companyId = "", demoId = "", W = "", DW = "";
 let zStorage = "", zStorageDemo = "";
-let itemA = "", itemB = "", pk = "", lo = "";
+let itemA = "", itemB = "", pk = "", lo = "", loDemo = "";
 const UIDS: string[] = [];
 let seq = 0;
 const now = new Date();
@@ -52,11 +52,13 @@ async function mkUser(id: string, cid: string, phone: string, role: Role, wh: st
 
 async function seedGroup(itemId: string, cid: string, qty: number, createdAt: Date, wh = W): Promise<{ lotId: string; groupId: string }> {
   const number = 950000 + ++seq;
-  const receipt = await prisma.receipt.create({ data: { companyId: wh === W ? companyId : demoId, number, warehouseId: wh, status: "POSTED", postedAt: now, note: "BR seed", createdById: lo } });
-  const line = await prisma.receiptLine.create({ data: { companyId: wh === W ? companyId : demoId, receiptId: receipt.id, itemId, qty } });
-  const lot = await prisma.lot.create({ data: { companyId: wh === W ? companyId : demoId, itemId, receiptLineId: line.id, qtyReceived: qty, createdAt } });
-  await prisma.$transaction((tx) => applyLotMovement(tx, { companyId: wh === W ? companyId : demoId, docType: "RECEIPT", docId: receipt.id, itemId, lotId: lot.id, qty, from: null, to: { kind: "cell", warehouseId: wh, cellId: cid }, createdById: lo }));
-  const group = await prisma.handlingGroup.create({ data: { companyId: wh === W ? companyId : demoId, warehouseId: wh, itemId, lotId: lot.id, qty, temperature: 0, thresholdX: 5, status: "IN_STORAGE", dedupeKey: `br-seed-${seq}`, acceptedById: lo } });
+  const cid2 = wh === W ? companyId : demoId;
+  const by = wh === W ? lo : loDemo; // R1: createdById/acceptedById — пользователь той же организации
+  const receipt = await prisma.receipt.create({ data: { companyId: cid2, number, warehouseId: wh, status: "POSTED", postedAt: now, note: "BR seed", createdById: by } });
+  const line = await prisma.receiptLine.create({ data: { companyId: cid2, receiptId: receipt.id, itemId, qty } });
+  const lot = await prisma.lot.create({ data: { companyId: cid2, itemId, receiptLineId: line.id, qtyReceived: qty, createdAt } });
+  await prisma.$transaction((tx) => applyLotMovement(tx, { companyId: cid2, docType: "RECEIPT", docId: receipt.id, itemId, lotId: lot.id, qty, from: null, to: { kind: "cell", warehouseId: wh, cellId: cid }, createdById: by }));
+  const group = await prisma.handlingGroup.create({ data: { companyId: cid2, warehouseId: wh, itemId, lotId: lot.id, qty, temperature: 0, thresholdX: 5, status: "IN_STORAGE", dedupeKey: `br-seed-${seq}`, acceptedById: by } });
   await prisma.$transaction((tx) => createQrIn(tx, { companyId: wh === W ? companyId : demoId, type: "GROUP", refId: group.id }));
   return { lotId: lot.id, groupId: group.id };
 }
@@ -116,6 +118,9 @@ async function provision() {
   await ensureStandardZones(demoId, DW);
   zStorageDemo = (await prisma.warehouseZone.findFirstOrThrow({ where: { warehouseId: DW, kind: "STORAGE" } })).id;
   await createCellsInZone({ companyId: demoId, warehouseId: DW, zoneId: zStorageDemo, codes: ["DW-U1"], level: 3 });
+  // R1/TENANT-001: сид demo-склада должен использовать пользователя demo-организации (ядро остатков
+  // теперь отклоняет чужой createdById). Раньше сид demo шёл под rostagro-loader (латентный cross-tenant).
+  loDemo = await mkUser("br_lo_demo", demoId, "+79995590003", "LOADER", DW);
 }
 
 async function main() {
